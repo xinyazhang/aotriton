@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_map>
 #include <string_view>
+#include <cstdlib> 
+#include <mutex>
 
 namespace AOTRITON_NS {
 
@@ -99,5 +101,47 @@ template class TensorView<1>;
 template class TensorView<2>;
 template class TensorView<3>;
 template class TensorView<4>;
+
+namespace debug {
+
+bool AOTRITON_API is_tensordump_enabled() {
+  static bool kTensorDumpEnabled = []() -> bool {
+    const char* env_p = std::getenv("AOTRITON_ENABLE_TENSORDUMP");
+    if (!env_p)
+      return false;
+    return std::atoi(env_p);
+  }();
+  return kTensorDumpEnabled;
+}
+
+template<typename Dict, typename Key>
+int register_to_dict(Dict& dic, Key key) {
+  int ret = 0;
+  auto iter = dic.find(key);
+  if (iter != dic.end()) {
+    ret = iter->second;
+  } else {
+    ret = dic.size();
+    dic[key] = ret;
+  }
+  return ret;
+}
+
+std::tuple<int, int>
+tdump_trackcall(hipStream_t stream, std::string_view kernel_name) {
+  int gpu_index = 0;
+  int call_index = 0;
+  static std::mutex mutex;
+  std::unique_lock lock(mutex);
+  static std::unordered_map<hipDevice_t, int> gpu_index_dic;
+  static std::unordered_map<std::string_view, int> call_index_dic;
+  hipDevice_t dev;
+  hipError_t err = hipStreamGetDevice(stream, &dev);
+  gpu_index = register_to_dict(gpu_index_dic, dev);
+  call_index = register_to_dict(call_index_dic, kernel_name);
+  return std::make_tuple(gpu_index, call_index);
+}
+
+} // namespace AOTRITON_NS::debug
 
 } // namespace AOTRITON_NS

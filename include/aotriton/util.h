@@ -10,6 +10,7 @@
 #include <functional>
 #include <stdint.h>
 #include <string_view>
+#include <tuple>
 
 namespace AOTRITON_NS {
 
@@ -205,6 +206,15 @@ extern template class TensorView<4>;
 Gpu AOTRITON_API getGpuFromStream(hipStream_t);
 bool AOTRITON_API isArchExperimentallySupported(hipStream_t);
 int AOTRITON_API getMultiProcessorCount(hipStream_t stream);
+
+namespace debug {
+
+bool AOTRITON_API is_tensordump_enabled();
+
+std::tuple<int, int> AOTRITON_API
+tdump_trackcall(hipStream_t stream, std::string_view kernel_name);
+
+} // namespace AOTRITON_NS::debug
 
 } // namespace AOTRITON_NS
 

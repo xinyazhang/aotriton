@@ -4,6 +4,7 @@
 // clang-format off
 #include "shim.[[shim_kernel_name]].h"
 #include <aotriton/util.h>
+#include <aotriton/_internal/tensordump.h>
 #include <tuple>
 [[includes]]
 
@@ -14,7 +15,10 @@ using AOTRITON_NS::v3::[[shared_iface_family]]::[[param_class_name]];
 #endif
 
 #define CAST(x) const_cast<void*>(static_cast<const void*>(x))
-typedef std::vector<void*>(*PP_FUNC)(const [[param_class_name]]& context, hipDeviceptr_t*);
+typedef std::vector<void*>(*PP_FUNC)(const [[param_class_name]]& context,
+                                     hipDeviceptr_t*,
+                                     std::string_view,
+                                     hipStream_t);
 
 namespace {
 extern PP_FUNC prepare_arguments[ [[pp_func_num]] ];
@@ -48,7 +52,10 @@ hipError_t
 [[context_class_name]]::launch(hipStream_t stream) const {
     constexpr std::string_view triton_kernel_name { "[[triton_kernel_name]]" };
     hipDeviceptr_t global_scratch = 0;
-    auto args = prepare_arguments[pp_args_index](*this->params, &global_scratch);
+    auto args = prepare_arguments[pp_args_index](*this->params,
+                                                 &global_scratch,
+                                                 triton_kernel_name,
+                                                 stream);
     dim3 grid;
     if (custom_grid_calculator) {
         grid = custom_grid_calculator(*this);

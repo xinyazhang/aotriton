@@ -24,6 +24,7 @@ import json
 
 class AutotuneCodeGenerator(BaseTuneCodeGenerator):
     AUTOTUNE_TEMPLATE = get_template('autotune_table_entry.cc')
+    TDUMP_TEMPLATE = get_template('snippet/tdump.cc')
     BIN_INDEX_SUFFIX = '_binned_index'
 
     '''
@@ -232,8 +233,9 @@ class AutotuneCodeGenerator(BaseTuneCodeGenerator):
         hit, findex = pp_registry.contains(assign_skips)
         if hit:
             return findex
-        getter_dict = self.codegen_getter(kdesc)
+        getter_dict, tdump_dict = self.codegen_getter(kdesc)
         stmt = []
+        tdump_statements = []
         for aname in kdesc.KERNEL_DATA_ARGUMENTS:
             bind, tc = bind_dict[aname]
             assign = getter_dict[aname] + f', // {aname}'
@@ -244,15 +246,22 @@ class AutotuneCodeGenerator(BaseTuneCodeGenerator):
                     fmt_val = bind.document_conditional_value()
                 assign = '// ' + assign + f' as constexpr {fmt_val}'
             stmt.append(assign)
+            if aname in tdump_dict:
+                tdump_statements.append(tdump_dict[aname] + f' // {aname}')
         stmt.append('CAST(global_scratch)')
+        d = {
+            'tdump_statements'  : '\n        '.join(tdump_statements),
+        }
+        tdump_src = self.TDUMP_TEMPLATE.format_map(d)
         pfx = '  return { '
         join = '\n' + ' ' * len(pfx)
         sfx = '         };'
-        src = pfx + join.join(stmt) + '\n' + sfx
+        src = tdump_src + pfx + join.join(stmt) + '\n' + sfx
         return pp_registry.register(assign_skips, src)
 
     def codegen_getter(self, kdesc):
         d = {}
+        tdump = {}
         for tensor_aname, (stride_anames, _) in kdesc.TENSOR_STRIDE_INPUTS.items():
             tensor_rank = kdesc.get_tensor_rank(tensor_aname)
             for i in range(tensor_rank):
@@ -263,11 +272,13 @@ class AutotuneCodeGenerator(BaseTuneCodeGenerator):
                 tc = tp.repr_choice.resolve(aname, tc_dict=None)
                 if isinstance(tc, TC.tensor):
                     d[aname] = f'params.{aname}->kparam_data_ptr()'
+                    tdump[aname] = f'tensordump(*params.{aname}, kernel_name_string + ".{aname}", gpu_index, call_index);'
         for aname in kdesc.KERNEL_DATA_ARGUMENTS:  # TODO: make this general
             if aname in d:
                 continue
             d[aname] = f'CAST(&params.{aname})'
-        return d
+            tdump[aname] = f'scalardump(params.{aname}, kernel_name_string + ".{aname}", gpu_index, call_index);'
+        return d, tdump
 
     def codegen_perf_assignment(self):
         kdesc = self._f.meta_object
