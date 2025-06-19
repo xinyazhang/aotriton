@@ -71,8 +71,9 @@ size_t nbytes_tensor(const Tensor& t)
     }
   }
   auto off = sizes[max_i];
-  // can be (off * max_s) but the trailing space may be inaccesible
-  size_t nelements = (off - 1) * max_s + off;
+  // TODO: trailing space may be inaccesible
+  //       but it is more complicated, need prod of the remaining
+  size_t nelements = off * max_s;
   return nelements * sizeof_dtype(t.dtype());
 }
 
