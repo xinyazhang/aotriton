@@ -7,6 +7,7 @@
 #include <string_view>
 #include <cstdlib> 
 #include <mutex>
+#include <iostream>
 
 namespace AOTRITON_NS {
 
@@ -138,7 +139,7 @@ tdump_trackcall(hipStream_t stream, std::string_view kernel_name) {
   hipDevice_t dev;
   hipError_t err = hipStreamGetDevice(stream, &dev);
   gpu_index = register_to_dict(gpu_index_dic, dev);
-  call_index = register_to_dict(call_index_dic, kernel_name);
+  call_index = call_index_dic[kernel_name]++;
   return std::make_tuple(gpu_index, call_index);
 }
 
