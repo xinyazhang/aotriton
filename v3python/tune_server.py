@@ -4,7 +4,10 @@ import os
 import json
 
 WORKDIR = int(os.getenv('AOTRITON_TUNER_WORKDIR', default=None))
-assert WORKDIR is not None, 'Must set environment variable AOTRITON_TUNER_WORKDIR to launch tuner server'
+assert WORKDIR is not None, (
+    'Must set environment variable AOTRITON_TUNER_WORKDIR to launch tuner server.'
+    'AOTRITON_TUNER_WORKDIR should point to a presistent directory for data storage.'
+)
 
 from .tuner import (
     Server,

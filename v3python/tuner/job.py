@@ -4,6 +4,9 @@ from pathlib import Path
 import json
 import uuid
 import sqlite3
+from .util import (
+    get_sql
+)
 
 ''' markdown
 # Table
@@ -45,6 +48,8 @@ class BaseJob(object):
         self._dir = path
 
 class Job(BaseJob):
+    SQL_ATOMIC_ASSIGN = get_sql('atomic_assign')
+
     def __init__(self, path : Path):
         super().__init__(path)
         dbf = self._dir / self.DBFILE
@@ -52,20 +57,14 @@ class Job(BaseJob):
             raise RuntimeError(f"Job database {dbf} does not exist")
         self._con = sqlite3.connect(dbf)
 
-    '''
-    UPDATE Primary SET
-        status = ASSIGNED,
-        assignment = {worker},
-        ip = {remote_addr}
-    WHERE
-        status = IDLE,
-    RETURNING *
-    LIMIT {count}
-    '''
     def assign(*, count, worker, remote_addr):
-        pass
+        con.execute(self.SQL_ATOMIC_ASSIGN, (worker, remote_addr, count))
+        return con.fetchall()
 
 class NewJob(BaseJob):
+    SQL_INIT_TABLE = get_sql('init_table')
+    SQL_ADD_TASKS = get_sql('add_tasks')
+
     def __init__(self,
                  info : dict,
                  workdir : Path):
@@ -75,10 +74,11 @@ class NewJob(BaseJob):
 
     @staticmethod
     def _init_table(con : sqlite3.Connection, info : dict):
+        con.execute(SQL_INIT_TABLE)
         tasks = info['tasks']
         def gen():
             for i, task in enumerate(tasks):
                 yield i, json.dumps(task)
-        values = [ tup for tup in gen() ]
-        con.executemany('UPDATE Primary SET status = ?, assignment = ?', (Status.UNASSIGNED, ''))
-        con.execute('UPDATE Primary SET status = ?, assignment = ?', (Status.UNASSIGNED, ''))
+        rows = [ tup for tup in gen() ]
+        con.executemany('UPDATE Primary SET id = ?, jdesc = ?', rows)
+        con.execute('UPDATE Primary SET status = ?, client = ?, ip = ?', (PrimaryStatus.UNASSIGNED, '', ''))

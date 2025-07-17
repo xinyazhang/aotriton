@@ -6,6 +6,7 @@ from .job import (
     NewJob,
 )
 
+
 class Server(object):
     WORKDIR = None
     CACHE = {}
