@@ -579,3 +579,64 @@ The kernel session aligning `@flyc.jit` and `@flyc.kernel` argument order. Once 
 "the two ABIs are the same" stops being the working assumption recorded above and becomes
 true for the SDPA kernels, so one declaration set genuinely serves both the compile call and
 the Phase-2 kernarg vector.
+
+---
+
+# Why the ABI alignment matters: it closes the descriptor loop
+
+With `@flyc.jit` and `@flyc.kernel` sharing names *and* order, one declaration set does two
+jobs at once:
+
+```
+@ati.tensor('Q', 'T_io', rank=4, ...)     declared against @flyc.kernel (the surviving ABI)
+        │
+        ├─► Phase 2: the kernarg vector, offsets checked against the hsaco metadata
+        │
+        └─► Phase 1: the compiler matches the declaration to the launcher parameter
+                     BY NAME and synthesises FakeTensor(dtype=T_io, rank=4, …)
+```
+
+Without alignment the compiler would need a name map between two lists before it could tell
+which declaration describes which parameter. With alignment the match is the identity, and a
+descriptor with the *correct dtype and rank* falls out of the declarations already written.
+
+That is what makes the `fx.Tensor` row of the table reachable: a future launcher taking
+`fx.Tensor` needs `element_bits`/`shape`/`strides`/`dtype`, and by then the compiler has them
+from the same decorators it already reads — no new declaration, no guessing.
+
+## TODO — `fx.Tensor` and the hsaco ABI are not understood well enough to commit to
+
+Do not implement the `fx.Tensor` row on the strength of the reasoning above. What is
+actually known is narrow, and it comes from one measurement recorded in
+`fmha_common_gfx1201.py:138-146`:
+
+> each `fx.Tensor` argument adds a 40-byte `by_value` memref descriptor *interleaved
+> immediately after its pointer*, growing the kernarg segment from 268 to 428 bytes and
+> shifting the offset of every argument after the first
+
+(For scale: this kernel's current `.kernarg_segment_size` is 292.)
+
+What is **not** known, and must be settled before a tensor-taking launcher is supported:
+
+- **What the 40 bytes contain.** Rank? Sizes? Strides? An offset? A pointer to a static
+  layout? 40 bytes is suggestive but not decisive, and the answer decides whether the
+  explicit `stride_*` arguments become redundant or stay.
+- **Whether the layout is static or dynamic**, which is the same question as whether a
+  descriptor's concrete extents reach the IR type. The pointer element type turned out inert;
+  that is no evidence either way for shapes.
+- **How AOTriton's shim fills it.** The C++ side currently writes a flat kernarg buffer from
+  the params struct. A by-value memref descriptor interleaved after each pointer is a
+  different, more fragile layout to generate, and it is exactly the layout the hsaco metadata
+  would have to be checked against.
+- **Whether we want it at all here.** The SDPA kernels deliberately use raw pointers plus
+  explicit strides *because* the kernarg layout is an AOTriton ABI. That trade was made
+  knowingly and this design should not quietly undo it.
+
+**Position for FlyDSL's early adoption: stay explicit.** Raw pointers with named stride
+arguments, so the kernarg layout is something we write down and can diff against
+`.offset`/`.size` in the artifact's metadata. Implicit descriptors are the sort of thing that
+is fine once the ABI is stable and expensive to debug before then.
+
+So: the compiler keeps a single FakeTensor descriptor and dispatches on the launcher's
+annotation, the `fx.Pointer` row is implemented, and the `fx.Tensor` row raises
+`NotImplementedError` pointing at this section — a loud stop, not a guess.
