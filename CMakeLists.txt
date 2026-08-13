@@ -343,17 +343,11 @@ if(ALL_TRITON_SOS)
 endif(ALL_TRITON_SOS)
 
 # FlyDSL is a pinned wheel, not a submodule: its setup.py needs a prebuilt bundled
-# MLIR (build-fly/python_packages/flydsl/_mlir), so `pip install third_party/flydsl`
-# would not be self-contained the way `pip install third_party/triton` is. Installed
-# beside triton, in the same venv, guarded the same way on AOTRITON_NOIMAGE_MODE: a
-# C++-shim-only build compiles no kernels and needs no flydsl. No separate
-# AOTRITON_INHERIT_SYSTEM_SITE_FLYDSL switch: AOTRITON_INHERIT_SYSTEM_SITE_TRITON
-# above already decides whether the venv is --system-site-packages, which is what
-# would expose a preinstalled flydsl.
+# MLIR, so `pip install third_party/flydsl` would not be self-contained the way
+# `pip install third_party/triton` is.
 if(NOT AOTRITON_NOIMAGE_MODE)
-  # Sentinel is flydsl/__init__.py, not the bundled-MLIR extension
-  # (libFlyPythonCAPI.so.24.0git) -- that filename carries an LLVM version and would
-  # break on the next flydsl bump, while __init__.py exists for every wheel.
+  # Sentinel is flydsl/__init__.py, not the bundled-MLIR extension -- that
+  # filename carries an LLVM version and would break on the next flydsl bump.
   set(AOTRITON_FLYDSL_STAMP "${VENV_SITE}/flydsl/__init__.py")
   add_custom_command(OUTPUT "${AOTRITON_FLYDSL_STAMP}"
     COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR}
