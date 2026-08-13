@@ -172,7 +172,7 @@ def _load_description_module(path: Path, kernel_name: str):
 
 
 class FakeTensor:
-    """Duck-typed q/k/v/o stand-in for tracing a FlyDSL launch.
+    """A device-less operand descriptor, used to trace a FlyDSL launch.
 
     Not a torch tensor, and the name is load-bearing: FlyDSL's host ABI
     (`fmha_abi_gfx1201.ptr_arg`) special-cases the exact class name
@@ -181,6 +181,52 @@ class FakeTensor:
     `ptr_arg`, `dropout_args`). The shape does not affect the compiled
     artifact -- measured across four shape/layout combinations, byte-identical
     -- so one fixed contiguous BHSD shape covers every functional.
+
+    ---------------------------------------------------------------------
+    Why this class survives, and what it is for next: `fx.Tensor` operands
+    ---------------------------------------------------------------------
+
+    Today every operand of the gfx1201 launcher is an `fx.Pointer`, for which
+    a descriptor is barely needed -- `flyc.from_c_void_p(dtype, 0)` would do,
+    and the pointer element type is provably inert (measured: Uint8 / Float16
+    / Int32 all give a byte-identical hsaco, because it reaches only the host
+    function signature, which is discarded along with the rest of the host
+    module).
+
+    That is NOT true of `fx.Tensor`. `MemRefJitArg.__init__` requires
+    `element_bits`, `shape`, `strides` and `dtype`, none of which is derivable
+    from a parameter annotation -- `fx.Tensor` states the kind, not the rank,
+    extents or element type. So the moment a launcher takes a tensor, the
+    compiler needs a real descriptor, and this is it. Keeping one descriptor
+    type for both annotations is also what lets a kernel promote an operand
+    from pointer to tensor without touching its ATI description: the choice
+    becomes a compiler-side table lookup.
+
+    **`fx.Tensor` is deliberately NOT supported yet** -- see the assertion in
+    `_assert_supported_operands`. What is actually known is one measurement,
+    recorded at `modules/flash/flyc/fmha_common_gfx1201.py:138-146`: each
+    `fx.Tensor` argument adds a **40-byte by-value memref descriptor
+    interleaved immediately after its pointer**, growing that kernel's kernarg
+    segment from 268 to 428 bytes and shifting the offset of every argument
+    after the first. (This kernel's current `.kernarg_segment_size` is 292.)
+
+    What is unknown, and must be settled before the tensor path is written:
+
+    * What those 40 bytes contain -- rank, sizes, strides, offset? The answer
+      decides whether the explicit `stride_*` arguments become redundant.
+    * Whether the memref layout is static or dynamic, i.e. whether a
+      descriptor's concrete extents reach the IR type. The pointer element
+      type turned out inert; that is no evidence either way about shapes.
+    * How the C++ shim fills it. It currently writes a flat kernarg buffer
+      from the params struct; an interleaved by-value descriptor is a
+      different and more fragile layout to generate.
+    * Whether it is wanted here at all. The SDPA kernels use raw pointers plus
+      explicit strides *because* the kernarg layout is an AOTriton ABI. That
+      trade was made knowingly and should not be undone by a compiler feature.
+
+    Position while FlyDSL's ABI settles: stay explicit. Raw pointers with
+    named stride arguments give a layout we write down and can diff against
+    the `.offset` / `.size` entries in the artifact's own AMDGPU metadata.
     """
 
     def __init__(self, shape):
@@ -206,6 +252,45 @@ class FakeTensor:
 # One fixed BHSD shape for every functional: `FakeTensor`'s docstring above
 # explains why the actual numbers do not matter to the compiled artifact.
 _FAKE_SHAPE = (1, 1, 128, 64)
+
+
+_SUPPORTED_OPERAND_ANNOTATIONS = frozenset(
+    {'Pointer', 'Int32', 'Int64', 'Float32', 'Stream'}
+)
+
+
+def _assert_supported_operands(jf):
+    """Refuse a launcher whose signature this driver cannot honestly synthesise.
+
+    A loud stop rather than a guess. `fx.Tensor` is the case that matters and the
+    one to expect: it needs a real operand descriptor (rank, extents, dtype), the
+    tensor kernarg ABI is not pinned down, and silently marshalling something
+    plausible would produce an artifact whose kernarg layout we cannot verify.
+    See `FakeTensor`'s docstring for what is known and what is not.
+    """
+    import inspect
+
+    bad = []
+    for p in inspect.signature(jf.func).parameters.values():
+        name = getattr(p.annotation, '__name__', str(p.annotation))
+        if name not in _SUPPORTED_OPERAND_ANNOTATIONS:
+            bad.append((p.name, name))
+    if not bad:
+        return
+    detail = ', '.join(f'{n}: fx.{a}' for n, a in bad)
+    tensor_note = ''
+    if any(a == 'Tensor' for _, a in bad):
+        tensor_note = (
+            "\n\nfx.Tensor operands are not supported yet -- deliberately, not by "
+            "oversight. Each one adds a 40-byte by-value memref descriptor "
+            "interleaved after its pointer, and the contents of those bytes, the "
+            "static/dynamic layout question, and how the C++ shim fills them are "
+            "all unverified. See FakeTensor's docstring in this file."
+        )
+    raise NotImplementedError(
+        f"{jf.func.__name__}: unsupported operand annotation(s): {detail}."
+        f"{tensor_note}"
+    )
 
 
 def _trace_fmha_launch(built, functional):
@@ -251,6 +336,8 @@ def _trace_fmha_launch(built, functional):
     # allocating a torch tensor, which the build venv must never do
     # (CMakeLists.txt:142) and which this driver has no device for anyway.
     built(q, k, v, o, batch_size, seqlen_q, window=window, philox_seed=None)
+    if 'exe' in cap:
+        _assert_supported_operands(cap['exe'])
     if 'exe' not in cap:
         raise RuntimeError(
             "_trace_fmha_launch: built(...) never reached fmha_abi_gfx1201.run_compiled; "
