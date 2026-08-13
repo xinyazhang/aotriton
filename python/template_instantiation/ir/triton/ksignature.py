@@ -36,9 +36,12 @@ class KernelSignature(object):
         self._functional = f
         self._perfs = perf_struct
         self._copts = list(copt_values)
-        # TODO: Remove when gfx1250 database is created.
-        # gfx1250 falls back to gfx942's tuning database, but with 2x number
-        # of warps to avoid compiler issues.
+        # TRITON-ONLY, TEMPORARY: gfx1250 falls back to gfx942's tuning database,
+        # but with 2x number of warps to avoid compiler issues. This is a Triton
+        # compiler workaround, not a property of the entry-name grammar or any
+        # other language's ksignature.py, so it lives here rather than in ir/lib/
+        # and is not inherited by construction (ir/lib/ is a library, not a base
+        # class). TODO: Remove when gfx1250 database is created.
         if f.arch == 'gfx1250':
             self._copts[COPT_NWARPS_INDEX] *= 2
 
