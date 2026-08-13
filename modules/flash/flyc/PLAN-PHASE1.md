@@ -36,6 +36,7 @@ These were measured, not inferred. Treat them as given; do not re-derive.
 | Env for cross-compile | `ARCH=gfx1201`, `FLYDSL_GPU_ARCH=gfx1201`, `COMPILE_ONLY=1`, `FLYDSL_RUNTIME_ENABLE_CACHE=0` |
 | Expected artifact | ~13.5 KB ELF, `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0` |
 | Build cost | 1.1 s (hd 64) / 1.7 s (hd 128) / 2.7 s (hd 256) |
+| Required env (interim) | `AOTRITON_FLYDSL_ROOT=/home/xinyazha/dockerhome/meff/FlyDSL` — see Task 2; no fallback exists |
 
 Traps that already cost time — do not rediscover them:
 
@@ -365,11 +366,16 @@ Return whether the stub was installed, so callers can print a one-line notice. T
 Also provide **`setup(arch)`** that calls both and sets `ARCH`, `FLYDSL_GPU_ARCH`,
 `COMPILE_ONLY=1`, `FLYDSL_RUNTIME_ENABLE_CACHE=0`.
 
-**If Task 0 landed on the interim** (helpers resolved from the `third_party/flydsl` checkout
-rather than the wheel), `setup()` is also where the checkout root goes on `sys.path` — one
-place, not scattered through the vendored files. Locate it via `AOTRITON_FLYDSL_ROOT` if set,
-else `<repo>/third_party/flydsl`, and raise with the path tried if `kernels/common` is not
-under it. Delete this the day the wheel ships them.
+**If Task 0 landed on the interim** (helpers resolved from a FlyDSL checkout rather than the
+wheel), `setup()` is also where that checkout root goes on `sys.path` — one place, not
+scattered through the vendored files.
+
+**`AOTRITON_FLYDSL_ROOT` is required, with no useful fallback.** An earlier draft said "else
+`<repo>/third_party/flydsl`", but Task 2.5 settled on a pinned wheel rather than a submodule,
+so that directory never exists. Read the env var, and if it is unset or lacks
+`kernels/common/`, raise naming the variable and what was looked for. Every invocation of
+`flyc_compile` needs it set until Task 0a lands upstream, at which point the whole interim
+and this variable disappear.
 
 ### Gate 2
 
@@ -712,7 +718,13 @@ llvm-readelf -h --symbols /tmp/g3.hsaco | grep -E "Machine|Flags|FUNC"
 ```
 Expect `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, `flash_attn_func_aiw_kernel_0`, ~13.5 KB.
 Then sweep `BLOCK_DMODEL in {32,64,128}` x `CAUSAL_TYPE in {0,3}` x `Q in {*fp16:16,*bf16:16}`
-and confirm all 12 succeed. Also confirm the driver contains no `import fmha_tuning_gfx1201`
+and confirm all 12 succeed.
+
+`CAUSAL_TYPE=3` (generalized sliding window) needs the trace call to pass an explicit
+`window=`; without one `abi.resolve_window` raises `ValueError`, since type 3 carries no
+sentinel. Any valid bound will do — `window_left`/`window_right` are runtime kernel
+arguments, so the value cannot reach the binary. Verified: `window=(512,0)` and
+`window=(1024,7)` produce a byte-identical artifact. Also confirm the driver contains no `import fmha_tuning_gfx1201`
 and no occurrence of `attn_fwd` outside a docstring.
 
 **Files.**
@@ -767,7 +779,7 @@ Copy the shape of the affine backend; it is the closest precedent.
 | NEW | `python/template_instantiation/specs/flyc.py` (`FlycDecl`, `collect_flyc_decl`) |
 | NEW | `python/template_instantiation/ir/flyc/kdesc.py` (`KernelDescription`, an `Interface`) |
 | NEW | `python/template_instantiation/ir/flyc/ksignature.py` (`KernelSignature`, calling `ir/lib/`) |
-| MOD | `python/codegen/linker.py` (build the flyc kdesc from its `FlycDecl`, as it does for affine at :148) |
+| — | `python/codegen/linker.py` — **not in Task 4.** A bare `FlycDecl` has no discovery path yet: `compiled.affines` is filled only by `FamilyCompiler.visit_affine`, reached only for a decl listed as an `@ati.operator` backend, and 5a deliberately does not register flyc as one. `ir/flyc/kdesc.py` therefore lands unwired; Task 5 gives it a route. |
 | MOD | `python/template_instantiation/specs/finalize.py` (one dispatch branch at :255) |
 | MOD | `python/template_instantiation/decorators/__init__.py` (re-export) |
 | MOD | `python/template_instantiation/__init__.py` (`flyc`, `context_helper` in `__all__`) |
