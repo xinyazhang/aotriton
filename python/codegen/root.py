@@ -313,6 +313,29 @@ class RootGenerator(object):
         rules = d.get("rules", [])
         self._altwheels = {}
         self._venvpython = {}
+        # TODO(flyc Phase 1, PLAN-PHASE1.md Task 2.5c): today `value` must be a YAML
+        # scalar -- either "python:<interpreter>" (use it, install nothing) or a wheel
+        # path, and either way `self._altwheels[name] = Path(value)`. This means a venv
+        # maps to exactly one thing, so a per-arch flydsl pin (e.g. gfx1201 wanting a
+        # different flydsl version than another arch) is not expressible; every venv
+        # gets the same third_party/flydsl.txt pin instead.
+        #
+        # A backward-compatible extension is specified but NOT implemented here: branch
+        # on the YAML node type. The scalar branch is unchanged and stays *wheels-only*
+        # (a non-"python:" scalar must end in ".whl"; anything else must raise, pointing
+        # at the sequence form below -- do not silently accept it, since CMake's
+        # verbatim `pip install ${WHEEL}` would otherwise install a stray requirement
+        # like "flydsl==0.3.1" by accident and let the two forms drift). A *sequence*
+        # value is new: several pip requirement lines (wheel paths, version pins, or
+        # PEP 508 direct references) installed into that venv in order -- `[value]` is
+        # not a safe stand-in since the validation differs per branch. See
+        # `docs/AltWheelExample.yaml` for the two forms side by side and
+        # `modules/flash/flyc/PLAN-PHASE1.md` Task 2.5c for the full rule.
+        #
+        # `CMakeLists.txt:301-303` parses this same file with an inline Python
+        # one-liner that assumes one wheel per venv (`list(POP_FRONT)` over alternating
+        # name/wheel pairs); it needs a matching update in lockstep or a list value will
+        # silently corrupt that 2-periodic alternation (2.5c has the details).
         for name, value in venvs.items():
             if value.startswith("python:"):
                 # Use the provided Python executable directly
