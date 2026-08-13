@@ -48,7 +48,7 @@ Three consequences, each handled below:
    description's real payload.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 
 import aotriton.template_instantiation as ati
 from ._common import flash_disabled, check_value
@@ -271,8 +271,15 @@ def flyc_attn_fwd(f, hints):
     """Build one hsaco for functional `f`, optimized for `hints`.
 
     Executed by `aotriton.flyc_compile` at build time, in a venv that has flydsl —
-    never by the generator, which only reads the decorators above. Returns whatever
-    the builder returns; the driver drives it to a code object.
+    never by the generator, which only reads the decorators above. Returns
+    `(built, sidecar)`: `built` is whatever the builder returns (the driver drives
+    it to a code object), and `sidecar` is a JSON-serialisable dict of whatever
+    this description wants recorded alongside the hsaco. Here that is
+    `asdict(knobs)` — `resolve_knobs` is the only place `block_m` (and everything
+    else `flyc_compile`'s Task 3d output needs bar `block_size`, which the driver
+    recovers itself from the compiled IR's `known_block_size`) is known, and it
+    would otherwise go out of scope on return: `built` is the `_launch` closure,
+    which exposes only `compile` and the `varlen_*` helpers, not `knobs`.
 
     TWO objects, because they are two kinds of fact (PLAN.md 6.9):
 
@@ -326,4 +333,5 @@ def flyc_attn_fwd(f, hints):
     ))
     assert not knobs.strides_constexpr, \
         'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
-    return build_flash_attn_func_aiw_module_primary(meta, knobs)
+    built = build_flash_attn_func_aiw_module_primary(meta, knobs)
+    return built, asdict(knobs)
