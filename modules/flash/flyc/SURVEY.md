@@ -98,9 +98,10 @@ $ ROCM_PATH=/tmp/minirocm_sc python probe_fmha.py binary fmha
 RESULT fmha/binary: OK 13240 bytes magic=b'\x7fELF'
 ```
 
-143 MB against 1.4 GB for `_rocm_sdk_core` and 2.6 GB for `_rocm_sdk_devel` (which is an
-unexpanded tar requiring `rocm-sdk init`, and whose `rocm-sdk path --root` therefore points
-somewhere useless for us).
+143 MB against 1.4 GB for `_rocm_sdk_core`. Note `_rocm_sdk_devel` (the expanded tree that
+`rocm-sdk path --root` returns) also carries a usable `llvm/bin/ld.lld`; it is the
+`rocm_sdk_devel` *Python package* whose 2.6 GB `_devel.tar` stays unexpanded until
+`rocm-sdk init` runs. Two directories, one underscore apart — see §4.
 
 **Any sufficiently recent `ld.lld` should do.** MLIR's invocation is generic ELF linking
 (`-shared`, no AMDGPU-specific flags), so a stock upstream lld is expected to work and AMD's
