@@ -419,3 +419,80 @@ Two consequences worth stating in the contract:
   ever reads it".
 - It must be JSON-serialisable. A frozen dataclass is not; `asdict()` of one is. The compiler
   should fail loudly on a non-serialisable value rather than dropping it.
+
+---
+
+# Which ABI do the decorators describe? (resolved)
+
+## `@flyc.jit` is host code, and we strip it
+
+The compiled module's host half — the `llvm.func` with `emit_c_interface` that the `@flyc.jit`
+launcher lowers to — is discarded. We keep only `gpu.binary`. AOTriton loads the hsaco and
+launches the kernel symbol with a kernarg buffer it fills itself, so the ABI that survives
+into the artifact is the **`@flyc.kernel`** one. Decorators describe that.
+
+An earlier draft argued for pointing them at `@flyc.jit` because that is the signature the
+compiler calls. That conflates two jobs:
+
+| job | source of truth | needs decorators? |
+|---|---|---|
+| drive the compile (which args to pass) | `inspect.signature(jf.func)` — the launcher | **no**, fully automated |
+| describe the kernarg layout (Phase 2 shim) | the `@flyc.kernel` signature | yes |
+
+The launcher never needs declaring because it is introspected at the moment it is used.
+
+## The two ABIs are not the same, and we are choosing to assume they are
+
+Measured over 52 single-kernel/single-jit builders in `../FlyDSL/kernels/`: names coincide
+exactly in only **21**. The differences are systematic, not random:
+
+- launcher-only launch-geometry args — `batch_size`, `m_in`, `grid`, `grid_blocks`,
+  `num_tokens` — consumed to compute `grid=`, never passed to the kernel
+- kernel-only trace-time args — `tiled_mma`, `tiled_copy_g2s`, `_Pad0`
+- `_ptr`-suffix renames — `bt` → `block_tables_ptr` (whole files at shared=0 for this reason)
+
+For gfx1201 specifically: 43 vs 43 params, 41 shared, differing by `batch_size`/`num_seqlens`
+and `sm_scale_v`/`sm_scale_arg`, plus `stream`, plus a swap at indices 10/11.
+
+**Working assumption: for the SDPA kernels we control, treat the two as the same.** That is a
+choice, not a discovered truth — record it so nobody later reads it as a FlyDSL guarantee. If
+a future flyc kernel breaks it, the fix is a per-description name map, not a general one.
+
+## BLOCK_SIZE: use the declared value, not the ELF bound
+
+`.max_flat_workgroup_size: 512` in the hsaco metadata is **not** logically BLOCK_SIZE. It is a
+*bound*, and `.reqd_workgroup_size` is emitted **empty**, so the exact launch geometry is not
+in the artifact at all. It coincides here only because flydsl derives
+`rocdl.flat_work_group_size = "512,512"` (min == max) from `known_block_size`; omit that
+decorator argument and the bound falls back to a default while the real launch block does not.
+
+The concrete clue is the declared value, read off the `KernelFunction`:
+
+```python
+kf._known_block_size      # [512, 1, 1] at hd 64;  [256, 1, 1] at hd 128
+```
+
+reachable from the `JitFunction`'s closure (**not** from the builder's returned wrapper — the
+`KernelFunction` is not in `built.compile`'s closure, only in `jf.func`'s). flydsl validates
+the actual launch against it in `KernelLauncher._check_block_vs_known`, so it is authoritative
+rather than advisory.
+
+This also retires the `_source_ir` re-parse: no MLIR text scraping for `known_block_size`,
+just an attribute read.
+
+## What the hsaco metadata IS good for
+
+Even though it cannot give BLOCK_SIZE, the AMDGPU note carries the full kernarg layout —
+43 entries of `.offset` / `.size` / `.value_kind` / `.address_space`, plus
+`.kernarg_segment_size: 292` and `.group_segment_fixed_size: 8960` (the LDS figure already in
+the sidecar). Per-argument *names* are absent (one `.name:`, the kernel's own), so operand →
+slot identity still comes from the kernel signature. Phase 2 can therefore validate its
+generated kernarg vector against the artifact rather than trusting the declarations — worth
+doing, since the declarations in this very file were wrong until an AST diff caught them.
+
+## Correction: `flyc.compile` cannot be called
+
+Targeting the jit *layer* is right; that particular entry point is not available.
+`_compile_impl` ends in `artifact._get_func_exe()`, which builds an ExecutionEngine and needs
+HIP. `COMPILE_ONLY` short-circuits `JitFunction.__call__`, not the `flyc.compile` wrapper. So
+the driver calls the `JitFunction` directly.
