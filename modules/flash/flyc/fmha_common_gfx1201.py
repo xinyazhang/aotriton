@@ -70,8 +70,13 @@ own warning.
 
 from dataclasses import dataclass
 
-from gfx1201_standalone import kernels_common
-from gfx1201_standalone import utils as common_utils
+# Task 0 interim (PLAN-PHASE1.md Task 0a): kernels/common is not yet in the
+# flydsl wheel, so flyc_bootstrap.setup() puts the FlyDSL checkout root on
+# sys.path and this resolves verbatim as `kernels.common`. Once the packaging
+# change lands, this becomes `from flydsl.kernels.common import ...` (see
+# UPSTREAM.md).
+from kernels.common import kernels_common
+from kernels.common import utils as common_utils
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
