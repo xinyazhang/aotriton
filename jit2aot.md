@@ -203,3 +203,130 @@ separate problem.
   `known_block_size` is currently recovered by re-parsing `_source_ir`.
 - Does anything else need the pre-lowering IR? If not, and FlyDSL exposed BLOCK_SIZE, the
   driver would only ever touch `_ir_text`.
+
+---
+
+# Plan: make the compiler kernel-agnostic
+
+Supersedes §6-§7 above on two points, both raised in review.
+
+## Correction 1 — FakeTensor is structural, not a workaround
+
+§7 claimed FakeTensor could be deleted. Wrong, and the reason is worth pinning down.
+
+`MemRefJitArg.__init__` (`jit_argument.py:258-268`) requires `element_bits`, `shape`,
+`strides`, `dtype`. None of those is derivable from a parameter's annotation — `fx.Tensor`
+tells you the *kind*, not the rank, extents or element type. So the moment a `@flyc.jit`
+launcher takes an `fx.Tensor`, the compiler needs a descriptor object, and that is exactly
+what FakeTensor is.
+
+Today's gfx1201 launcher is all `fx.Pointer` (14 of them), which is why annotation-derived
+zeros happen to suffice and why the measurement in §4 held. That is a property of *this*
+kernel, not of the design. FakeTensor stays.
+
+What was genuinely wrong is *where* it was used: as a prop for the `_launch` host-marshalling
+layer, which is what dragged in `_prep`, `resolve_window`, `philox_seed=None` and the rest.
+It should exist as the compiler's tensor-argument descriptor instead.
+
+Open, for when `fx.Tensor` arrives: rank and dtype certainly reach the memref IR type;
+whether concrete extents/strides do depends on whether the layout is static. Measure before
+assuming a descriptor's numbers are as inert as a pointer's value.
+
+## Correction 2 — the body takes `choices`, not a `Functional`
+
+`flyc_compile` has only `--signature` text. A `Functional` cannot be rebuilt from it: it
+carries `arch`, `arch_number`, `godel_number`, a `meta_object` back-reference and the axis
+table, all of which come from the linked IR the driver does not have. The current
+`_FunctionalStandIn` (`flyc_compile.py:100`) fabricates `.arch` + `.choices.<NAME>` and
+nothing else — a stand-in that will drift the moment a description touches anything else on
+`f`, and drift silently.
+
+So pass the thing that genuinely round-trips through text:
+
+```python
+def flyc_attn_fwd(choices, hints):
+    tile = choices['BLOCK_DMODEL']
+    ...
+```
+
+`choices` is `parse_kv(args.signature, sep=' ')` — `{name: literal}`, values via
+`ast.literal_eval`. Nothing else, no fabricated object.
+
+**Arch is not needed by the body.** Verified: the only `f.arch` reader is
+`_flyc_fwd_disabled`, and disable predicates run **generator-side**, where a real `Functional`
+exists. The asymmetry is honest and worth stating in the contract:
+
+| callback | phase | receives |
+|---|---|---|
+| `@ati.disable(when=…)` | generator (has the linked IR) | a real `Functional` |
+| the `@ati.flyc.kernel` body | driver (has only text) | `choices`, `hints` |
+
+If a body ever does need arch, add it as an explicit third parameter from `--target` rather
+than smuggling it into `choices` — `choices` should mean "the functional's axis values" and
+nothing more.
+
+Spelling: a plain `dict` is the most honest representation of "parsed from text". If
+`choices.BLOCK_DMODEL` reads better than `choices['BLOCK_DMODEL']`, a thin frozen mapping
+supporting both is fine — but it must not grow into a `Functional` impersonation again.
+
+## The contract
+
+```python
+# description
+def flyc_attn_fwd(choices: Mapping[str, object], hints: FlycFwdHints):
+    """-> (built, sidecar_dict)"""
+
+# compiler, kernel-agnostic from here on
+jf   = jit_function_of(built)          # the seam -- see below
+args = synthesise_args(jf)             # table-driven from inspect.signature
+jf(*args)                              # COMPILE_ONLY -> returns None
+hsaco, block_size = extract(jf._last_compiled[1])
+```
+
+`synthesise_args` — the whole of the compiler's kernel knowledge:
+
+| annotation | value | needs description input? |
+|---|---|---|
+| `fx.Pointer` | `flyc.from_c_void_p(fx.Uint8, 0)` | no |
+| `fx.Int32` / `fx.Int64` | `0` | no |
+| `fx.Float32` | `0.0` | no |
+| `fx.Stream` | `fx.Stream(None)` | no |
+| `fx.Tensor` | `FakeTensor(shape, strides, dtype)` | **yes** |
+| anything else | raise, naming the parameter and its annotation | — |
+
+## Where a Tensor descriptor's metadata comes from
+
+Not invented by the compiler. The ATI description **already declares it** — the Phase-2 ABI
+block has `@ati.tensor('Q', 'T_io', rank=4, strides='stride_q_*')`, i.e. rank, dtype variable
+and stride names per operand. When `fx.Tensor` support lands, `synthesise_args` reads those
+declarations off the `FlycDecl` rather than taking shapes from anywhere new.
+
+Until then the `fx.Tensor` row raises `NotImplementedError` naming the parameter and pointing
+at this mechanism. That is deliberate: per §6's rule — automate what fails loudly, keep in the
+description what fails quietly — a missing descriptor must stop the build, not guess a shape.
+
+## Steps
+
+1. **Contract change.** `flyc_attn_fwd(choices, hints)`; delete `_FunctionalStandIn` and
+   `_Choices` from `flyc_compile.py`; pass `parse_kv(args.signature, sep=' ')` straight in.
+   Update `modules/flash/aot/flyc_attn_fwd.py`'s body (`f.choices.X` → `choices['X']`).
+   `_flyc_fwd_disabled` is untouched — it keeps taking a `Functional`.
+2. **`jit_function_of(built)`** — one function, the only place that knows how to reach a
+   `JitFunction` from a builder's return. Closure walk today (verified working), one-line
+   swap if FlyDSL exposes `_launch.jit_function`.
+3. **`synthesise_args(jf)`** — the table above, from `inspect.signature(jf.func)`.
+4. **Retire the marshalling path.** Delete `_trace_fmha_launch`, the `abi.run_compiled`
+   monkeypatch, `import fmha_abi_gfx1201`, the `CAUSAL_TYPE=3` window special-case,
+   `philox_seed=None`, and `_FAKE_SHAPE`-as-launch-shape. Keep `FakeTensor` as the descriptor
+   for step 3's Tensor row.
+5. **Tighten the gate.** Gate 3's kernel-agnosticism check greps for `fmha_tuning_gfx1201`
+   and `attn_fwd`; it passed while `import fmha_abi_gfx1201` sat in the driver. Make it
+   `fmha_*`, and add "no `flash`/`attn` module import".
+6. **Re-verify.** hsaco must stay byte-identical (`bc6d0fca66a0c2d9f476` at hd 64 f16
+   non-causal); rerun the 12-combination sweep; suite at 192 passed / 7 skipped.
+
+## Still open
+
+- The `jit_function_of` seam: one line upstream in FlyDSL versus the closure walk.
+- Whether `block_size` keeps needing a `_source_ir` re-parse, or FlyDSL exposes it alongside.
+- Whether a Tensor descriptor's extents affect the artifact (measure when it matters).
