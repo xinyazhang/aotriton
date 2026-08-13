@@ -28,3 +28,6 @@ v3python.retiring/
 ati-code-quality.md
 ati-ccreview-*.md
 agent-files/
+
+# agent scratch worktrees
+.claude/worktrees/

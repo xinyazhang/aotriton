@@ -208,9 +208,15 @@ def _flyc_fwd_disabled(f):
 # pointer, and the forward reports what it drew") + 53334317 ("the philox offset
 # splits into a pointer and an immediate"). These were the two transient mismatches
 # in the previous revision of this file; both are gone, and neither needs a helper.
-@ati.tensor(['philox_seed_ptr', 'philox_offset1',
-             'philox_seed_output', 'philox_offset_output'], 'T_u64', rank=0)
+# Declared one per line, in kernel order, NOT grouped. Grouping the four *u64
+# pointers into one @ati.tensor([...]) reads better but silently reorders:
+# philox_offset2 is a scalar sitting BETWEEN them in the kernel signature, so the
+# grouped form pushed it to the end and the declared kernarg order was wrong.
+@ati.tensor('philox_seed_ptr', 'T_u64', rank=0)
+@ati.tensor('philox_offset1', 'T_u64', rank=0)
 @ati.scalar('philox_offset2', 'u64')
+@ati.tensor('philox_seed_output', 'T_u64', rank=0)
+@ati.tensor('philox_offset_output', 'T_u64', rank=0)
 #
 # --- the two dropout arguments that are not a rename --------------------------
 @ati.scalar('idropout_p',    'i32',  wires_to=ati.context_helper('flyc_idropout_p'))
