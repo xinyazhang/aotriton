@@ -1194,6 +1194,20 @@ require one of these, stop and re-read `PLAN.md` §Phasing — it probably does 
 
 ## Known hazards
 
+- **`aotriton` is editable-installed against a FIXED path** — the main checkout's `python/`,
+  not whatever tree you are standing in. Running `pytest`, `import aotriton...` or
+  `python -m aotriton.flyc_compile` from a git worktree therefore exercises the **main**
+  checkout's code, not your edits: a green result can mean nothing, and a red one can be
+  someone else's. Force resolution first:
+
+  ```bash
+  mkdir -p /tmp/shadow_$$ && ln -sfn <worktree>/python /tmp/shadow_$$/aotriton
+  PYTHONPATH=/tmp/shadow_$$ python -m pytest -q
+  ```
+
+  Confirm with `python -c "import aotriton; print(aotriton.__file__)"` that the path is under
+  your worktree. Do not commit the shadow directory.
+
 - **Do not copy `kernels/common/*` to unblock yourself.** If Task 0 is unresolved, the
   gfx1201 modules will fail to import and copying the six helpers in makes that go away —
   which is exactly the fork this plan exists to avoid. Use the Task 0 interim (`sys.path` to
