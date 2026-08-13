@@ -27,6 +27,8 @@ else in this file depends on it.
 
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -36,12 +38,13 @@ def resolve_rocm_path() -> str:
     """Return a directory ``D`` where ``D/llvm/bin/ld.lld`` exists, and set
     ``os.environ['ROCM_PATH']`` to it.
 
-    Tried in order: an existing ``ROCM_PATH`` (validated, not trusted), the
-    ``_rocm_sdk_core`` package's bundled lib directory, then ``/opt/rocm``.
-    Raises ``RuntimeError`` naming every candidate tried and why each one
-    failed if none validates — the native failure mode this avoids is
-    flydsl's ``error: lld invocation failed``, which carries no further
-    detail about what was wrong with the toolchain.
+    Tried in order: an existing ``ROCM_PATH`` (validated, not trusted),
+    ``rocm-sdk path --root`` (only when ``ROCM_PATH`` is unset and the
+    ``rocm-sdk`` CLI is available), the ``_rocm_sdk_core`` package's bundled
+    lib directory, then ``/opt/rocm``. Raises ``RuntimeError`` naming every
+    candidate tried and why each one failed if none validates — the native
+    failure mode this avoids is flydsl's ``error: lld invocation failed``,
+    which carries no further detail about what was wrong with the toolchain.
     """
     tried = []
 
@@ -58,6 +61,18 @@ def resolve_rocm_path() -> str:
 
     env_candidate = os.environ.get('ROCM_PATH')
     found = _check(env_candidate)
+
+    if found is None and not env_candidate:
+        rocm_sdk = shutil.which('rocm-sdk')
+        if rocm_sdk is not None:
+            try:
+                out = subprocess.run([rocm_sdk, 'path', '--root'],
+                                      capture_output=True, text=True, check=True)
+                found = _check(out.stdout.strip())
+            except subprocess.CalledProcessError as e:
+                tried.append(('<rocm-sdk path --root>', f'command failed: {e}'))
+        else:
+            tried.append(('<rocm-sdk CLI>', 'shutil.which returned None'))
 
     if found is None:
         spec = importlib.util.find_spec('_rocm_sdk_core')
