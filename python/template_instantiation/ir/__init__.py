@@ -11,6 +11,10 @@ from .override import (
     eq, ne, lt, gt, le, ge,
 )
 from .functional import Functional, ChoiceView
+# Per-language IR modules, reachable as ir.triton / ir.affine / ir.flyc
+# (e.g. `ati.ir.triton.KernelDescription`), imported last so every symbol
+# above is already available to them.
+from . import triton, affine, flyc
 
 __all__ = [
     'typed_choice', 'TypedChoice', 'cfield',
@@ -19,4 +23,5 @@ __all__ = [
     'Predicate', 'VarRef', 'ValueFn', 'Override',
     'eq', 'ne', 'lt', 'gt', 'le', 'ge',
     'Functional', 'ChoiceView',
+    'triton', 'affine', 'flyc',
 ]
