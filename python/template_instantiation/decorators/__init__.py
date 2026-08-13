@@ -31,6 +31,13 @@ from .cite import CiteSpec, cite
 from .source import KernelStub, SourceError, source
 from .operator import BackendSpec, backend, OperatorSpec, operator
 from .metro import metro_kernel
+# `flyc` (ati.flyc.* — FlyDSL-compiled kernels) is a decorator-namespace SUBMODULE,
+# like `affine` and `hints`: imported here so `decorators.flyc` resolves, but the
+# public `ati.flyc` binding is set by template_instantiation/__init__.py's
+# `from .decorators import flyc` (same split as affine/hints — neither of those is
+# in __all__ below either, since __all__ here lists individual names, not
+# namespace submodules).
+from . import flyc
 
 __all__ = [
     'ChoiceVar', 'type_var', 'scalar_var',

@@ -25,6 +25,7 @@ from ..introspect import kernel_params, kernel_annotations
 from .kernel import KernelSpec
 from .affine import AffineDecl, collect_affine_decl
 from .operator import OperatorDecl, collect_operator_decl
+from .flyc import FlycDecl, collect_flyc_decl
 
 
 def _build_tune_spec(tune_records):
@@ -243,6 +244,7 @@ def start(jit_fn):
     decorator's spec is always the kind discriminant (O(1), no scan):
       * OperatorSpec     → operator stack → OperatorDecl
       * AffineKernelSpec → affine stack   → AffineDecl
+      * FlycKernelSpec   → flyc stack     → FlycDecl
       * MetroPlan        → metro stack    → fn.__ati_node__ (MetroPlan)
       * anything else    → kernel stack   → KernelSpec via describe()
     """
@@ -255,12 +257,15 @@ def start(jit_fn):
     # Dispatch on the innermost spec (specs[-1]) — the kind discriminant.
     from ..decorators import OperatorSpec
     from ..decorators.affine import AffineKernelSpec
+    from ..decorators.flyc import FlycKernelSpec
     from .metro import MetroPlan
     marker = specs[-1]
     if isinstance(marker, OperatorSpec):
         _finalize_operator(jit_fn, specs)
     elif isinstance(marker, AffineKernelSpec):
         _finalize_affine(jit_fn, specs)
+    elif isinstance(marker, FlycKernelSpec):
+        _finalize_flyc(jit_fn, specs)
     elif isinstance(marker, MetroPlan):
         _finalize_metro(jit_fn, specs)
     else:
@@ -284,6 +289,14 @@ def _finalize_metro(fn, specs):
 def _finalize_affine(placeholder, specs):
     """PASSIVE: attach the AffineDecl to fn.__ati_node__."""
     placeholder.__ati_node__ = collect_affine_decl(specs)
+    return placeholder
+
+
+def _finalize_flyc(placeholder, specs):
+    """PASSIVE: attach the FlycDecl to fn.__ati_node__. NOT routed through
+    describe() — a flyc description has no parsed signature to validate against
+    (see specs/flyc.py)."""
+    placeholder.__ati_node__ = collect_flyc_decl(placeholder, specs)
     return placeholder
 
 
