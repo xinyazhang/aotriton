@@ -208,7 +208,7 @@ class FakeTensor:
 _FAKE_SHAPE = (1, 1, 128, 64)
 
 
-def _trace_fmha_launch(built):
+def _trace_fmha_launch(built, functional):
     """Trace `built` (the FlyDSL-attention launcher) and return `(jf, args)`.
 
     **Not kernel-agnostic** -- the one place in this driver that is not.
@@ -236,16 +236,62 @@ def _trace_fmha_launch(built):
     o = FakeTensor(_FAKE_SHAPE)
     batch_size, seqlen_q = _FAKE_SHAPE[0], _FAKE_SHAPE[2]
 
+    # CAUSAL_TYPE=3 (generalized sliding-window) has no sentinel window
+    # (`fmha_abi_gfx1201.CAUSAL_SENTINEL` only covers 1/2) and
+    # `abi.resolve_window` raises unless the caller supplies an explicit
+    # `window=(left, right)`. window_left/window_right are runtime kernel
+    # arguments (fx.Int32), not baked into the compiled artifact, so any
+    # valid bound traces the same ELF; `(seqlen_q, 0)` -- top-left causal --
+    # is the arbitrary-but-valid choice, matching what the ValueError itself
+    # suggests.
+    causal_type = getattr(functional.choices, 'CAUSAL_TYPE', 0)
+    window = (seqlen_q, 0) if causal_type == 3 else None
+
     # philox_seed=None: `u64_scalar` short-circuits on None rather than
     # allocating a torch tensor, which the build venv must never do
     # (CMakeLists.txt:142) and which this driver has no device for anyway.
-    built(q, k, v, o, batch_size, seqlen_q, philox_seed=None)
+    built(q, k, v, o, batch_size, seqlen_q, window=window, philox_seed=None)
     if 'exe' not in cap:
         raise RuntimeError(
             "_trace_fmha_launch: built(...) never reached fmha_abi_gfx1201.run_compiled; "
             "is this description's builder still the FlyDSL-attention launcher shape?"
         )
     return cap['exe'], cap['args']
+
+
+def _extract_block_size(source_ir: str):
+    """Recover BLOCK_SIZE from the PRE-LOWERING IR's `gpu.func` `known_block_size`
+    attribute (`array<i32: N, 1, 1>`; N is BLOCK_SIZE).
+
+    Not in the knobs: `resolve_knobs` leaves `flat_work_group_size = None` and the
+    builder derives `BLOCK_SIZE = FLAT_WORK_GROUP_SIZE or NUM_WAVES * WARP_SIZE`
+    internally. Not in `_ir_text` either -- `gpu-module-to-binary` has replaced the
+    module body by then. Not in the ELF -- block size is a host launch decision
+    never baked into the binary. `CompiledArtifact._source_ir` is the one place it
+    still exists as MLIR text.
+    """
+    from flydsl._mlir import ir
+
+    def _find(op):
+        if op.operation.name == 'gpu.func':
+            attr = op.operation.attributes.get('known_block_size')
+            if attr is not None:
+                return int(attr[0])
+        for region in op.operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    found = _find(inner)
+                    if found is not None:
+                        return found
+        return None
+
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(source_ir)
+        for op in module.body.operations:
+            found = _find(op)
+            if found is not None:
+                return found
+    return None
 
 
 def _extract_hsaco(jf) -> bytes:
@@ -339,11 +385,17 @@ def do_compile(args):
 
     functional = _FunctionalStandIn(args.target, parse_kv(args.signature, sep=' '))
     hints = _build_hints(node, args.hints)
-    built = fn(functional, hints)
+    # The description body returns (built, sidecar): `built` is the FlyDSL
+    # builder's result (driven to a code object below); `sidecar` is a
+    # JSON-serialisable dict of whatever it wants recorded alongside the hsaco
+    # (for flyc_attn_fwd, asdict(knobs) -- including block_m). The driver stays
+    # kernel-agnostic: it serialises the dict without knowing what is in it.
+    built, sidecar = fn(functional, hints)
 
-    jf, launch_args = _trace_fmha_launch(built)
+    jf, launch_args = _trace_fmha_launch(built, functional)
     jf(*launch_args)  # COMPILE_ONLY=1 -> traces and compiles, returns None, launches nothing
     hsaco = _extract_hsaco(jf)
+    block_size = _extract_block_size(jf._last_compiled[1]._source_ir)
 
     out_path = args.out_path
     with open(out_path.with_suffix('.hsaco'), 'wb') as f:
@@ -364,11 +416,13 @@ def do_compile(args):
         'shared': meta['shared'],
         'signature': args.signature,
         'hints': args.hints,
-        # Neither is carried by the `@ati.flyc.kernel` contract today -- see
-        # UPSTREAM.md / the Task 3 report. `getattr` rather than a hard
-        # requirement so this driver stays usable before that lands.
-        'block_m': getattr(built, 'block_m', None),
-        'block_size': getattr(built, 'block_size', None),
+        'sidecar': sidecar,
+        # block_m rides in the sidecar dict (it is resolved and used by the
+        # builder already; it just needed forwarding -- see flyc_attn_fwd.py).
+        # block_size is NOT in the sidecar/knobs; it is recovered from the
+        # pre-lowering IR above (see _extract_block_size).
+        'block_m': sidecar.get('block_m') if isinstance(sidecar, dict) else None,
+        'block_size': block_size,
     }
     with open(out_path.with_suffix('.json'), 'w') as f:
         json.dump(di, f, indent=2)
