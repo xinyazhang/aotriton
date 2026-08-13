@@ -107,8 +107,14 @@ from fmha_tuning_gfx1201 import (  # noqa: F401
     resolve_shards,
     vo_chunks,
 )
-from gfx1201_standalone import buffer_ops, wmma_ops
-from gfx1201_standalone import utils as common_utils
+# Task 0 interim (PLAN-PHASE1.md Task 0a): kernels/common is not yet in the
+# flydsl wheel, so flyc_bootstrap.setup() puts the FlyDSL checkout root on
+# sys.path and this resolves verbatim as `kernels.common`. Once the packaging
+# change lands, this becomes `from flydsl.kernels.common import buffer_ops` /
+# `from flydsl.kernels.common.mma import wmma_ops` (see UPSTREAM.md).
+from kernels.common import buffer_ops
+from kernels.common.mma import wmma_ops
+from kernels.common import utils as common_utils
 from philox import Philox
 
 import flydsl.compiler as flyc

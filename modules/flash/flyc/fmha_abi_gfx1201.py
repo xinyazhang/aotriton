@@ -30,9 +30,13 @@ import contextlib
 import weakref
 
 import fmha_common_gfx1201 as fmha
-import torch
 from philox import dropout_threshold
-from torch import float32 as torch_f32
+
+# `torch` and `torch.float32` are imported lazily, inside the two functions
+# that need them (`lse_args`, `u64_scalar`), because the build venv must
+# never have torch (CMakeLists.txt:142) and neither use is reached by the
+# AOT compile driver (python/flyc_compile.py), which passes philox_seed=None.
+# See UPSTREAM.md "Torch-lazy rewrites".
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -270,6 +274,8 @@ def lse_args(lse, seq_len, varlen, num_head_q):
     What the host can do instead -- and could not while it was inferring --
     is verify the caller's tensor actually has the declared layout.
     """
+    from torch import float32 as torch_f32  # lazy: build venv has no torch (CMakeLists.txt:142)
+
     if lse is None:
         return NULL_PTR
     if lse.dtype != torch_f32:
@@ -362,6 +368,8 @@ def u64_scalar(value, device, stream=None):
         if value is not None and value.element_size() != 8:
             raise ValueError(f"a philox scalar tensor must be 8 bytes per element, got {value.dtype}")
         return value
+    import torch  # lazy: only reached when the caller passes a plain int seed; the AOT driver passes None
+
     with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
         return torch.tensor([int(value)], dtype=torch.int64, device=device)
 
