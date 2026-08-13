@@ -330,3 +330,92 @@ description what fails quietly — a missing descriptor must stop the build, not
 - The `jit_function_of` seam: one line upstream in FlyDSL versus the closure walk.
 - Whether `block_size` keeps needing a `_source_ir` re-parse, or FlyDSL exposes it alongside.
 - Whether a Tensor descriptor's extents affect the artifact (measure when it matters).
+
+---
+
+# Survey: is `jit_function_of` universally applicable?
+
+AST survey of every module-level builder under `../FlyDSL/kernels/` that contains a nested
+`@flyc.jit`. 60 files carry `@flyc.jit` at all (152 occurrences, 118 of them nested inside a
+builder — so the nested pattern is the norm, not a gfx1201 quirk). 69 module-level builders:
+
+| what the builder returns | count | `jit_function_of`? |
+|---|---|---|
+| the `@flyc.jit` function itself (1 jit in scope) | 38 | identity — `built` *is* the JitFunction |
+| the `@flyc.jit` function itself (2 jits in scope) | 9 | identity |
+| a wrapper closing over exactly **1** jit | 18 | closure walk, unambiguous |
+| a wrapper closing over 2, 3, or 9 jits | 3 | **ambiguous** |
+| no return | 1 | n/a (`p2p_scatter_epilog`, a fragment helper) |
+
+**65 of 69 (94%) are unambiguous**, and the two mechanisms are trivial:
+
+```python
+def jit_function_of(built):
+    if isinstance(built, JitFunction):        # 47 builders
+        return built
+    found = _search(built)                    # closure cells, tuple/list items, dict values
+    if len(found) == 1:                       # 18 builders (incl. gfx1201)
+        return found[0]
+    raise ...                                 # 3 builders -- see below
+```
+
+`_search` needs to look past closures alone: `pa_decode_swa.compile_pa_decode_sw_reduce`
+returns `{'launch': <jit>, 'kernel': <kernel>}` and
+`moe_sorting_kernel._compile_moe_sorting_multiphase` returns a 9-tuple of launches.
+
+## The 6% that cannot work, and why that is fine
+
+The four exceptions are not near-misses — they are **multi-kernel builders**:
+
+- `custom_all_reduce_kernel.make_allreduce_kernels` → dict of 3 launches
+- `moe_sorting_kernel._compile_moe_sorting_multiphase` → tuple of 9 launches
+- `flash_attn_gfx950.build_flash_attn_dualwave_swp_module` → wrapper over 2
+- `mega_moe_stage2.p2p_scatter_epilog` → returns nothing; a fragment, not a builder
+
+For these there is no *one* JitFunction to find, so no amount of cleverness in
+`jit_function_of` helps. One builder produces several kernels, hence several hsacos — which
+in AOTriton's vocabulary is a **metro**, not a single kernel, and is Phase 2+ territory. The
+honest move is to raise, naming how many JitFunctions were found and pointing at the
+multi-kernel case, rather than silently picking the first.
+
+If a multi-kernel FlyDSL backend is ever wanted, the fix is a plural contract
+(`jit_functions_of` → sequence, one hsaco each) — a deliberate extension, not a patch.
+
+## Verdict: the middle design
+
+`jit_function_of` is universal for every single-kernel builder in the tree, which is what a
+`@ati.flyc.kernel` description is. Adopt the **middle** position from §6:
+
+```python
+def flyc_attn_fwd(choices, hints):
+    meta, knobs = ...                              # decision 1: kernel-specific
+    return build_..._primary(meta, knobs), {...}   # decision 2: kernel-specific
+# compiler does the rest: jit_function_of -> synthesise_args -> compile -> extract
+```
+
+The 47 builders that already return their JitFunction make this cheaper than expected — for
+most kernels `jit_function_of` is `isinstance` and nothing more. The closure walk is the
+minority path, and it stays confined to one function that a one-line FlyDSL change would
+retire.
+
+## The sidecar is deliberately opaque
+
+Not `asdict(knobs)` — that is only what *this* description happens to produce. Other builders
+take entirely different arguments (`build_layernorm_module(N, dtype_str, …)`,
+`make_dispatch_jit(...)`, `compile_pa_decode_sw_reduce(...)`), and there is no common shape to
+impose.
+
+So the contract is: **the second return value is a JSON-serialisable dict of whatever the
+description considers necessary to reproduce this build.** The compiler does not read it, does
+not validate its keys, and only writes it into the sidecar. `flyc_attn_fwd` fills it with
+`asdict(knobs)` because that is what reproduces an FMHA build; a GEMM description would put
+its tile shape and split factor there.
+
+Two consequences worth stating in the contract:
+
+- Anything the *build system* needs to consume — `block_m`, `block_size` for
+  `grid_calculator()` — must be lifted to named, top-level sidecar keys by the compiler, not
+  left inside the opaque blob. Opaque means "the compiler does not interpret it", not "nobody
+  ever reads it".
+- It must be JSON-serialisable. A frozen dataclass is not; `asdict()` of one is. The compiler
+  should fail loudly on a non-serialisable value rather than dropping it.
