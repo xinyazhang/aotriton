@@ -25,13 +25,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .axis import assign_godel, TemplateParam
-from .interface import Interface
+from ..axis import assign_godel, TemplateParam
+from ..interface import Interface
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from .axis import Axis
-    from .typed_choice import TypedChoice
+    from ..axis import Axis
+    from ..typed_choice import TypedChoice
 
 
 def _binning_class(selector):
@@ -89,7 +89,7 @@ class KernelDescription(Interface):
         # The synthesized perf struct (the tune schema), in field order. A canonical
         # empty struct stands in when the kernel has no @ati.tune.schema, so the perf
         # paths need no None-guards.
-        from ..specs.tune import EMPTY_PERF_STRUCT
+        from ...specs.tune import EMPTY_PERF_STRUCT
         ts = built.tune
         self._perf_struct = ts.schema if (ts and ts.schema) else EMPTY_PERF_STRUCT
         # Autotune keys from @ati.tune.binning, paired with their Binning class.
@@ -141,7 +141,7 @@ class KernelDescription(Interface):
         PERSISTENT_TYPE -> 2 when CAUSAL_TYPE!=0, NUM_XCDS -> 8 when arch in
         {gfx942,gfx950}. Replaces the legacy PERF_CHOICES default +
         PROGRAMMATIC_PERFS."""
-        from .override import VarRef, ValueFn
+        from ..override import VarRef, ValueFn
         value = self._perf_struct.default_value(name)
         for ov in self._built.perf_overrides:
             if name in ov.targets and ov.fires(f):
@@ -362,7 +362,7 @@ class KernelDescription(Interface):
         """One cfield per non-stride, non-perf argument, in signature order, with
         the axis's representative (rank-specialized) C itype. Overrides never
         change the struct — the ABI is owned by the axis (ati+newbinds §6.2)."""
-        from .cfield import cfield
+        from ..cfield import cfield
         out = []
         for ax in self._axes_all:
             if ax.is_stride:
@@ -455,8 +455,8 @@ class KernelDescription(Interface):
         # firing disables). Orthogonal to tuning: disabling excludes invalid input
         # combinations from generation, which any kernel may need — tunable or not.
         # A kernel with no @ati.disable has an empty `disables` list -> never fires.
-        from .functional import ChoiceVarAbsent
-        from ..builder import DescriptionError
+        from ..functional import ChoiceVarAbsent
+        from ...builder import DescriptionError
         for d in self._built.disables:
             try:
                 if d.holds(functional):
