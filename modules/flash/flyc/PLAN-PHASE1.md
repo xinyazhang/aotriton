@@ -616,8 +616,17 @@ are dtype strings, ints and bools, so none do. Assert it where the generator wri
    - **hints** — the dataclass registered by `@ati.flyc.hints`, constructed from its
      defaults and updated with `--hints`. Reject unknown keys loudly; a typo must not
      silently build the default schedule.
-5. `built = fn(functional, hints)` — the description body does the tuning and returns the
-   builder's result.
+5. `built, sidecar = fn(functional, hints)` — the description body does the tuning and
+   returns **two** things: the builder's result, and a JSON-serialisable dict of whatever it
+   wants recorded in the sidecar. The driver stays kernel-agnostic — it serialises the dict
+   without knowing what is in it. For flyc_attn_fwd that dict is `asdict(knobs)`.
+
+   This is a plumbing gap, not a correctness one. The knobs are applied correctly —
+   `resolve_knobs` sets `block_m`, `build_..._primary` unpacks `BLOCK_M_KNOB = knobs.block_m`,
+   and the kernel is built with that tile. What does not happen is them travelling back
+   *out*: the body's local `knobs` goes out of scope on return, and `built` is the `_launch`
+   closure, which `dir()` shows exposing only `compile` and the five `varlen_*` helpers. The
+   driver has to write the sidecar and cannot see a value consumed two frames down.
 
 ### 3c. Compile and extract
 
@@ -670,8 +679,20 @@ already produces a bare hsaco ELF for the ROCDL target.
 Write `<out_path>.hsaco` and `<out_path>.json`, mirroring `python/compile.py:134-140`. JSON
 must contain `compile_status` (`'Complete'`; the only key `python/codegen/autotune.py:58`
 reads), the kernel symbol read back from the ELF symtab, `arch`, `warp_size` (32), `shared`
-(LDS bytes), the `--signature` and `--hints` strings verbatim, and `block_m` / `block_size`
-— Phase 2's `grid_calculator()` needs those and nothing else carries them.
+(LDS bytes), the `--signature` and `--hints` strings verbatim, the sidecar dict from step 5,
+and `block_m` / `block_size` — Phase 2's `grid_calculator()` needs those and they come from
+two different places:
+
+- **`block_m`** is `knobs.block_m` — resolved and used by the builder already; it just needs
+  forwarding, so it rides in the step-5 dict. Measured 256 at hd 64.
+- **`block_size` is NOT in the knobs** and must not be looked for there. `resolve_knobs`
+  leaves `flat_work_group_size = None`, and the builder derives
+  `BLOCK_SIZE = FLAT_WORK_GROUP_SIZE or NUM_WAVES * WARP_SIZE` internally
+  (`flash_attn_func_gfx1201_aiw.py:404-406`). Recover it from the **pre-lowering** IR, which
+  `CompiledArtifact` keeps as `_source_ir`: the `gpu.func` carries
+  `known_block_size = array<i32: N, 1, 1>`. Measured 512 for hd 64. It is *not* in
+  `_ir_text` — `gpu-module-to-binary` has replaced the module body by then — and not in the
+  ELF either, since block size is a host launch decision never baked into the binary.
 
 On any failure, mirror `compile.py`: write an empty `.hsaco` and a `.json` with the failure
 status so the build does not stall on a missing file. Honour `--timeout` with the same
