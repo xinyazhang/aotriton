@@ -43,8 +43,7 @@ class KernelSignature:
 
     @cached_property
     def hsaco_entry_name(self) -> str:
-        return lib_naming.entry_name(self._functional.unified_signature,
-                                     self._functional.arch,
+        return lib_naming.entry_name(self._functional,
                                      perf=self.perf_section,
                                      copt=self.copt_section)
 
