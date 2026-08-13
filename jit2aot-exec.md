@@ -25,6 +25,26 @@ artifact must not change: the hsaco is byte-identical before and after.
   PYTHONPATH=/tmp/shadow_j2a python -c "import aotriton; print(aotriton.__file__)"   # must be your worktree
   ```
 
+## Caching: what is off, and the one that is not
+
+The byte-identity gate below is only meaningful if each measurement is a real compile.
+Measured:
+
+| cache | state | evidence |
+|---|---|---|
+| flydsl disk cache | **off** | `flyc_bootstrap` sets `FLYDSL_RUNTIME_ENABLE_CACHE=0`; both gates (`jit_function.py:1250`, `:1409`) read `enable_cache or run_only`; `~/.flydsl` is never created |
+| cross-build reuse | **none** | two independent builds of one config: 1.07 s and 1.06 s, same sha |
+| `JitFunction._mem_cache` | **live, per instance** | same `jf` called twice: 1.02 s then **0.00 s** |
+
+`_mem_cache` is populated unconditionally by design ("keep compiled artifacts alive within the
+process even when disk cache is off"). It is harmless in production — `flyc_compile` is one
+process, one build, one fresh `JitFunction` — but it is a trap when verifying:
+
+> **A verification script that builds twice in one process and reuses the same `JitFunction`
+> gets a 0.00 s cache hit on the second, and proves nothing.** Either shell out to the CLI
+> (separate processes, which is what the sweep does), or call `build_..._primary` again to get
+> a fresh `JitFunction`. Treat a sub-0.1 s "compile" as a cache hit, not a fast machine.
+
 ## Verified facts — treat as given, do not re-derive
 
 | fact | value |
@@ -257,5 +277,7 @@ Phase 2's kernarg vector, `ati.context_helper` codegen, C++ shim; the upstream
   broaden the search until it matches something — report it. The fix is upstream.
 - **`jf.func` vs `jf._original_func`.** Use `jf.func`: it is what flydsl binds against. The
   AST rewrite preserves the signature.
-- **Byte-identity is the real gate.** Every step above can "work" while quietly changing the
-  binary. Re-hash after each one, not just at the end.
+- **Byte-identity is the real gate.** Every step above can "work" — produce a valid gfx1201
+  ELF — while quietly changing the binary. After *each* step, re-run the compile and
+  `sha256sum` the emitted `.hsaco` against `bc6d0fca66a0c2d9f476`. Not just at the end: if it
+  drifts you want to know which step did it.
