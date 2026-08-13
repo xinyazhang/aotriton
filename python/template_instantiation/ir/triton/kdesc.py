@@ -35,8 +35,8 @@ from ..functional import ChoiceVarAbsent
 from ..interface import Interface
 from ..override import VarRef, ValueFn
 from .ksignature import KernelSignature, COMPILER_OPTIONS, DEFAULT_COPT
-from ...builder import DescriptionError
-from ...specs.tune import EMPTY_PERF_STRUCT
+from aotriton.template_instantiation.builder import DescriptionError
+from aotriton.template_instantiation.specs.tune import EMPTY_PERF_STRUCT
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

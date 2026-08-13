@@ -342,8 +342,11 @@ Also confirm:
 existing file, and set `os.environ['ROCM_PATH']` to it. Try in order:
 
 1. `os.environ.get('ROCM_PATH')` — validate it, do not trust it
-2. `importlib.util.find_spec('_rocm_sdk_core')` → `Path(spec.origin).parent / 'lib'`
-3. `/opt/rocm`
+2. `rocm-sdk path --root`, when the CLI is on PATH. Returns `<site-packages>/_rocm_sdk_devel`,
+   which does carry `llvm/bin/ld.lld` — do not confuse that expanded tree with the
+   `rocm_sdk_devel` Python package, whose `_devel.tar` stays unexpanded until `rocm-sdk init`
+3. `importlib.util.find_spec('_rocm_sdk_core')` → `Path(spec.origin).parent / 'lib'`
+4. `/opt/rocm`
 
 If none validates, raise a `RuntimeError` listing every candidate tried and why each failed.
 This message is the whole point of the function: the native failure is
