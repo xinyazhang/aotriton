@@ -101,7 +101,7 @@ def _build_kernels(compiled):
     dependency order. Returns {def-name -> KernelDescription}."""
     from aotriton.template_instantiation.ir.ops.cite import resolve_cites
     from aotriton.template_instantiation.builder import build_kernel
-    from aotriton.template_instantiation.ir.kdesc import KernelDescription
+    from aotriton.template_instantiation.ir.triton.kdesc import KernelDescription
 
     built = {}
     specs = {}                # def-name -> the cloned, cite-resolved spec
@@ -146,7 +146,7 @@ def _build_kernels(compiled):
 
 def _build_affines(compiled):
     """Build every AffineKernel from its parsed AffineDecl."""
-    from aotriton.template_instantiation.ir.affine import AffineKernel
+    from aotriton.template_instantiation.ir.affine.kdesc import AffineKernel
     out = {}
     for name, decl in compiled.affines.items():
         out[name] = AffineKernel(
