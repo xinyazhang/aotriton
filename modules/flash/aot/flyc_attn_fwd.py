@@ -130,6 +130,14 @@ def _flyc_fwd_disabled(f):
 # switching these pointers to fx.Tensor would grow the kernarg segment from 268 to
 # 428 bytes and shift the offset of every argument after the first.
 #
+# TODO(fx.Tensor): these declarations are also what the AOT compiler will read to
+# synthesise operand descriptors with the right dtype and rank, which is what would
+# let a future launcher take `fx.Tensor` instead of `fx.Pointer`. Not supported yet
+# and deliberately so -- the tensor kernarg ABI is not pinned down (each fx.Tensor
+# adds a 40-byte by-value memref descriptor interleaved after its pointer, and what
+# those bytes contain is unverified). See jit2aot.md, "fx.Tensor and the hsaco ABI".
+# Raw pointers + explicit strides stay the position while FlyDSL's ABI settles.
+#
 # `rank=4` with only THREE strides is the declaration that the last dimension is
 # unit-stride and has no argument. FlyDSL requires stride(3) == 1 and reads no
 # D-axis stride at all, so unlike the triton kernel (where `stride_qk` exists as a
