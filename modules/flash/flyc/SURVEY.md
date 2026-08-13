@@ -145,13 +145,16 @@ package, no HIP.
 
 1. `$ROCM_PATH` if already set and `$ROCM_PATH/llvm/bin/ld.lld` exists — lets a TheRock or
    `/opt/rocm` user override, and validates rather than trusts.
-2. `importlib.util.find_spec("_rocm_sdk_core")` → `<parent>/lib`. This is the TheRock-compatible
-   path and works with a plain `pip install rocm-sdk-core` into either the build venv or any
-   other venv. Verified:
+2. `rocm-sdk path --root`, when the CLI exists. Verified here: it returns
+   `<site-packages>/_rocm_sdk_devel`, which **does** have `llvm/bin/ld.lld`. (An earlier
+   draft of this document said not to use it, confusing the *expanded* `_rocm_sdk_devel`
+   tree with the `rocm_sdk_devel` Python package, whose 2.6 GB `_devel.tar` is unexpanded
+   until `rocm-sdk init` runs. Two different directories, one underscore apart.)
+3. `importlib.util.find_spec("_rocm_sdk_core")` → `<parent>/lib`. Also TheRock-compatible and
+   works with a plain `pip install rocm-sdk-core`. Verified:
    `/…/site-packages/_rocm_sdk_core/lib` → `llvm/bin/ld.lld` exists.
-   Do **not** use `rocm-sdk path --root`; it returns the unexpanded `_rocm_sdk_devel` tree.
-3. `/opt/rocm`.
-4. Otherwise raise, listing candidates tried — the native failure is
+4. `/opt/rocm`.
+5. Otherwise raise, listing candidates tried — the native failure is
    `error: lld invocation failed` with no lld output, which is unactionable.
 
 **A new CMake knob is implied:** `AOTRITON_FLYDSL_ROCM_PATH` (default: auto-detect as above),
