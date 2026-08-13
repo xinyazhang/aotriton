@@ -496,3 +496,86 @@ Targeting the jit *layer* is right; that particular entry point is not available
 `_compile_impl` ends in `artifact._get_func_exe()`, which builds an ExecutionEngine and needs
 HIP. `COMPILE_ONLY` short-circuits `JitFunction.__call__`, not the `flyc.compile` wrapper. So
 the driver calls the `JitFunction` directly.
+
+---
+
+# One descriptor: FakeTensor everywhere (supersedes the arg table above)
+
+## Why
+
+AOTriton's Interface is tensor-shaped. Every pointer-backed operand in an ATI description is
+an `@ati.tensor`, including the ones that are logically scalars — the philox seed and offsets
+are `@ati.tensor([...], 'T_u64', rank=0)`. So the description already speaks in tensors, and
+making the compiler speak two dialects (FakeTensor for `fx.Tensor`, bare null pointers for
+`fx.Pointer`) means translating between them for no reason.
+
+Let **`fx.Pointer` accept a FakeTensor too**. Then there is exactly one operand descriptor,
+and the description never has to know which annotation the launcher happened to use.
+
+## Safe, because the element type is inert
+
+`fx.Pointer`'s element type reaches only `PointerJitArg.__get_ir_types__` →
+`PointerType.get(ir_type, addr_space, alignment)`, i.e. the *host* function's signature, which
+we discard. Measured — same functional, three element types:
+
+```
+Uint8    bc6d0fca66a0c2d9f476
+Float16  bc6d0fca66a0c2d9f476
+Int32    bc6d0fca66a0c2d9f476     identical
+```
+
+So a descriptor's real dtype can be handed to `from_c_void_p` freely. It cannot change the
+artifact, and it keeps the declaration honest rather than laundering everything through
+`fx.Uint8` the way the JIT host path does (`abi.ptr_arg`).
+
+## The table
+
+| launcher annotation | AOT value | from |
+|---|---|---|
+| `fx.Pointer` | `flyc.from_c_void_p(desc.dtype, 0)` | FakeTensor descriptor |
+| `fx.Tensor` | memref jit arg | the *same* FakeTensor descriptor (`element_bits`, `shape`, `strides`, `dtype`) |
+| `fx.Int32` / `fx.Int64` | `0` | — |
+| `fx.Float32` | `0.0` | — |
+| `fx.Stream` | `fx.Stream(None)` | — |
+| anything else | raise, naming the parameter and its annotation | — |
+
+A rank-0 FakeTensor covers the scalar-pointer operands (philox seed/offset in/out) with no
+special case, exactly as the ATI declaration already spells them.
+
+## The payoff
+
+**The launcher's choice between `fx.Pointer` and `fx.Tensor` becomes a compiler detail.** If a
+future FlyDSL kernel promotes `Q` from a raw pointer to an `fx.Tensor` — which
+`fmha_common_gfx1201.py:137` says was measured and rejected for kernarg-size reasons, but is
+the natural direction elsewhere in the tree — the description does not change. Only the
+compiler's dispatch on the annotation does, and that is already a table lookup.
+
+It also means FakeTensor stops being "the thing the FMHA host wrapper needs" and becomes what
+it should have been from the start: **the compiler's representation of an operand**, one per
+declared tensor, whatever the launcher does with it.
+
+## Where the descriptors come from
+
+The ATI declarations, which already carry rank, dtype variable and stride names:
+
+```python
+@ati.tensor('Q', 'T_io', rank=4, strides='stride_q_*')
+@ati.tensor('philox_seed_ptr', 'T_u64', rank=0)
+```
+
+Phase 1 does not need them — every gfx1201 operand is `fx.Pointer`, and a descriptor with a
+null address and an arbitrary dtype suffices, so the compiler can synthesise one per pointer
+parameter without consulting the description at all. Phase 2 wires the declarations in, at
+which point the descriptors carry real dtypes and ranks and the `fx.Tensor` row lights up.
+
+Concrete extents remain the open question flagged earlier: rank and dtype certainly reach a
+memref IR type; whether the *numbers* do depends on whether the layout is static. Measure when
+the first `fx.Tensor` launcher appears, rather than assuming a descriptor's shape is as inert
+as a pointer's element type turned out to be.
+
+## Depends on
+
+The kernel session aligning `@flyc.jit` and `@flyc.kernel` argument order. Once that lands,
+"the two ABIs are the same" stops being the working assumption recorded above and becomes
+true for the SDPA kernels, so one declaration set genuinely serves both the compile call and
+the Phase-2 kernarg vector.
