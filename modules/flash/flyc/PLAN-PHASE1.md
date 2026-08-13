@@ -193,8 +193,19 @@ there it is a separate task with its own justification.
 | `ir/ksignature.py` | `ir/kdesc.py`, `codegen/autotune.py` |
 | `ir/affine.py` | `codegen/linker.py:149` |
 
+`ir/__init__.py` needs **no** change — it imports only `typed_choice`, `cfield`, `interface`,
+`axis`, `override` and `functional`, none of which move.
+
 Ignore `grep -rl kdesc`'s 32 hits: almost all are the local variable `kdesc = self._iface` in
 `codegen/`, untouched by a move. Tests are extra and mechanical.
+
+**Also fix the moved files' own imports.** Each gains a directory level, so its internal
+`from .x` / `from ..y` become `from ..x` / `from ...y`. Mechanical but easy to miss, and not
+covered by the five-importer table above, which counts only external callers.
+
+`git mv ir/affine.py ir/affine/kdesc.py` needs `mkdir -p ir/affine` first (git will create an
+intermediate directory for a path that does not collide with the source name, but not here,
+where the target directory shares the source file's stem).
 
 **Files (0c).**
 
@@ -204,8 +215,8 @@ Ignore `grep -rl kdesc`'s 32 hits: almost all are the local variable `kdesc = se
 | MOV | `ir/ksignature.py` → `ir/triton/ksignature.py` |
 | MOV | `ir/affine.py` → `ir/affine/kdesc.py` |
 | NEW | `ir/{lib,triton,affine,flyc}/__init__.py` |
-| NEW | `ir/lib/` helper module(s) for the three shared items above |
-| MOD | `ir/operator.py`, `ir/__init__.py`, `codegen/linker.py`, `codegen/autotune.py` |
+| NEW | `ir/lib/naming.py` — the two shared items above |
+| MOD | `ir/operator.py`, `codegen/linker.py`, `codegen/autotune.py` |
 | MOD | `python/test/*` import lines |
 
 ### Gate 0c
