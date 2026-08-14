@@ -150,9 +150,22 @@ env vs driver process), but that is luck, not design.
 **Your pip cache did the job** — 1.2 GB of it, holding the wheels from your earlier
 installs. Reconstructed a wheelhouse (trimmed to 103 MB) at
 `~/.cache/aotriton-wheelhouse`, driven with `PIP_NO_INDEX=1 PIP_FIND_LINKS=...`. All ten
-`requirements.txt` entries plus `flydsl==0.3.1` recovered. `triton` is not in the cache,
-so image *builds* remain blocked — but image-mode *configure* does not need it, which is
-what let Gate 2.5 pass.
+`requirements.txt` entries plus `flydsl==0.3.1` recovered.
+
+**Triton is no longer a blocker either**, with the wheel you supplied at
+`~/triton-3.7.0+gitdb82b800.aotriton0.14-...whl` passed as
+`-DAOTRITON_USE_LOCAL_TRITON_WHEEL`. The build venv now has triton 3.7.0 + flydsl 0.3.1
+and still no torch, ~51k image rules generate, and one Triton kernel builds end to end
+(43,480-byte gfx1201 hsaco, `compile_status: Complete`). So the full
+`.hsaco` → `.aks2` → `aotriton.images/*.zip` chain — exactly Task 7's target shape — is
+exercisable here.
+
+Configure also clones `https://github.com/ROCm/aiter.git` (~140 MB,
+`v3src/CMakeLists.txt:115`). That works: github is reachable from this container even
+though PyPI is not.
+
+Keep the wheel out of the repo root — `.gitignore` does not cover `*.whl`, so `git add -A`
+would sweep 412 MB into a commit.
 
 Also fixed while gating: `flyc_bootstrap`'s dead `<repo>/third_party/flydsl` fallback
 (`1a0b182c`). PLAN-PHASE1.md:376 already said the variable is required with no fallback;
@@ -161,12 +174,24 @@ non-editable install — it advertised `<site-packages>/third_party/flydsl`.
 
 ### Where to continue
 
-Tasks 5 → 6 → 7. Task 5 (generator emits `Fly.compile`) is verifiable here. Tasks 6 and 7
-are now **partly** gateable, which they were not this morning: `cmake` configures in image
-mode, so a generated rule loop can be inspected and the flyc targets built. What still
-cannot run is anything requiring triton — so a full `ninja` of all images stays out of
-reach, and Task 7's aks2/flatzip output can only be checked for the flyc kernels, not for
-a complete `aotriton.images` tree.
+Tasks 5 → 6 → 7, and **all three are now fully gateable in this container** — none of them
+were this morning. Image-mode configure works, triton and flydsl both install into the
+build venv, and the `.hsaco` → `.aks2` → `aotriton.images/*.zip` chain runs.
+
+The environment recipe, needed for every cmake invocation here:
+
+```
+export ROCM_PATH=$(rocm-sdk path --root)
+export PIP_NO_INDEX=1 PIP_FIND_LINKS=~/.cache/aotriton-wheelhouse
+cmake -S . -B <build> -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DAOTRITON_NO_PYTHON=ON -DAOTRITON_TARGET_ARCH=gfx1201 \
+  -DPython3_EXECUTABLE=/home/xinyazha/.venvs/nogpu/bin/python \
+  -DAOTRITON_USE_LOCAL_TRITON_WHEEL=~/triton-3.7.0+gitdb82b800.aotriton0.14-cp313-cp313-linux_x86_64.whl
+```
+
+A configured image-mode build dir is at `/tmp/bld4` (819 MB + aiter + hsacos). It is in
+`/tmp`, so it will not survive a reboot; worth relocating if Tasks 5-7 are going to lean
+on it.
 
 Still outstanding, unchanged:
 
