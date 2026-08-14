@@ -1177,40 +1177,56 @@ The same reasoning is why the `.aks2` step is not skipped when N==1. The archive
 framework's unit of storage, and keeping flyc's layout identical to Triton's is what lets
 the later phases reuse Triton's autotune code generator instead of growing a second one.
 
-### 7b. Generator side — `Fly.cluster` and the flatzip entry
+### 7b. Generator side — reuse `Bare.cluster` and the existing flatzip entry
 
-In the same `out_dir` block as `Bare.cluster` (`root.py:192`), accumulate a
-`flyc_cluster_dict` and reuse `write_cluster` unchanged — it writes both the `.nsv` manifest
-on disk and the `;`-joined line. Then fold the result into the **existing** `flatzip_dict`,
-exactly as the affine loop does at `root.py:225`, so the zip step needs no new bookkeeping:
+**`Fly.compile` is the only new rule file.** An earlier draft added `Fly.cluster` and
+weighed a `Fly.flatzip` too; neither is needed. `write_cluster` (`root.py:313`) is already
+backend-agnostic — it emits `<odp parts>;<paths…>` and knows nothing about how the objects
+were produced — and the affine path already proves the point by sharing `flatzip_dict`.
+Only the *compile* row is backend-shaped: it encodes a Triton invocation
+(`num_warps`/`num_stages`/`waves_per_eu` and `python/compile.py`), and flyc needs a
+different tool with a disjoint flag set, `--hints` included.
+
+Skippability is no longer an argument for splitting either. That is now decided in the
+generator per row (`AOTRITON_DEBUG_SKIP_TRITON_KERNELS`), which is finer-grained than a
+file boundary could ever be — a shared file with Triton rows omitted is exactly a
+flyc-only file.
+
+So: in the same `out_dir` block that fills `cluster_dict` (`root.py:185`), add the flyc
+entries to that **same** dict, and fold into the **existing** `flatzip_dict` as the affine
+loop does at `root.py:225`:
 
 ```python
 fodp = functional.filepack_ondisk_path        # with the flyc description as .NAME
-flyc_cluster_dict.setdefault(fodp, {})[flyc_hsaco_abs] = flyc_inaks2_name(functional)
-...
+cluster_dict.setdefault(fodp, {})[flyc_hsaco_abs] = flyc_inaks2_name(functional)
 aks2_abs = (aks2_dir / fodp).with_suffix('.aks2').absolute().as_posix()
 flatzip_dict.setdefault(fodp.parent, {})[aks2_abs] = functional.filepack_inzip_name
 ```
 
-Add `'Fly.cluster'` to `shard_names` (`root.py:263`) alongside `'Fly.compile'` — same silent
-failure mode as 5e if missed. `Bare.flatzip` needs no new entry in that list; it is already
-there and now carries the flyc rows too.
+`shard_names` gains `'Fly.compile'` and nothing else — `Bare.cluster` and `Bare.flatzip`
+are already in the list and now carry the flyc rows too.
 
-### 7c. CMake side — two more loops
+### 7c. CMake side — nothing
 
-`Fly.cluster` gets an aks2 loop mirroring `ADD_FROM_CLUSTER_RULES` (`v3src/CMakeLists.txt`
-:236-266). Two differences:
+Once 7b puts the flyc rows in `Bare.cluster` and `Bare.flatzip`, the existing
+`ADD_FROM_CLUSTER_RULES` loop and the flatzip loop pick them up verbatim. No new aks2 loop,
+no new flatzip loop, no additions to `ALL_AKS2`. The `--ignore_json` question disappears
+with the separate loop: flyc rows go through the plain Bare-style invocation, which is what
+they want anyway since `flyc_compile` writes a real `<out>.json` (Task 3d) — unlike affine's
+prebuilt `.co` files, which is why *that* loop passes the flag.
 
-- `DEPENDS aotriton_v3_flyc_compile`, not `aotriton_v2_compile`.
-- **No `--ignore_json`.** Affine passes it because prebuilt `.co` files have no sidecar;
-  `flyc_compile` writes a real `<out>.json` (Task 3d), so the plain Bare-style invocation is
-  correct and the metadata rides along.
+**One thing Task 6 must get right for this to hold.** `ADD_FROM_CLUSTER_RULES` gives every
+aks2 `DEPENDS aotriton_v2_compile`, so the flyc hsaco outputs have to be reachable from that
+target or a flyc `.aks2` will be built before its hsaco exists. Task 6 should append the flyc
+outputs to the same `AOTRITON_HSACO_RECORD` (`Bare.targets`) the Triton loop writes, so the
+existing `add_custom_target(aotriton_v2_compile ALL DEPENDS ${ALL_HSACOS})` at
+`v3src/CMakeLists.txt:226` covers both backends. That also means a flyc aks2 inherits the
+blanket dependency described in Gate 7 — irrelevant under
+`AOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON`, where that target has no Triton inputs at all,
+which is precisely the configuration Phase 1 closes in.
 
-Append the resulting `.aks2` paths to `ALL_AKS2` so they join the existing
-`aotriton_v3_aks2` target. The flatzip loop at :311 then needs **no change at all** — the
-flyc rows are already in `Bare.flatzip` from 7b, and `aotriton_kernel_storage_v3` picks them
-up. Confirm the `__signature__` copy still fires once per arch dir (:335) rather than once
-per zip.
+Still confirm the `__signature__` copy fires once per arch dir (:335) rather than once per
+zip.
 
 ### 7d. Install
 
@@ -1223,12 +1239,13 @@ release tarball.
 
 | | path |
 |---|---|
-| MOD | `python/codegen/root.py` (`Fly.cluster` `LazyFile`, fold into `flatzip_dict`, `shard_names`) |
+| MOD | `python/codegen/root.py` (flyc rows into the existing `cluster_dict` + `flatzip_dict`) |
 | — | `python/codegen/common.py` — **no change**; `hsaco_inaks2_name` reads `ksig.hsaco_entry_name` |
-| MOD | `v3src/CMakeLists.txt` (aks2 loop for `Fly.cluster`; append to `ALL_AKS2`) |
+| — | `v3src/CMakeLists.txt` — **no change**; the existing cluster and flatzip loops already cover the flyc rows |
 
-`python/aks2.py` and `python/flatzip.py` need **no change** — flyc uses the plain Bare-style
-invocation, and the flatzip loop already consumes the rows 7b folds into `Bare.flatzip`.
+`python/aks2.py` and `python/flatzip.py` need **no change** either — flyc uses the plain
+Bare-style invocation, and both loops already consume the rows 7b folds in. Task 7 is
+generator-only.
 
 ### Gate 7
 
@@ -1276,12 +1293,14 @@ so it validates that flyc rules are *emitted and run*, not that a shippable
 `aotriton.images` tree was produced. Gate 7 proper still needs one full build with the
 option off.
 
-**Design input for 7b/7c from this:** the option can only be this clean while every
-`Bare.*` file is Triton-only. Task 7 currently plans to fold flyc rows *into*
-`Bare.flatzip`, which would make the Triton and flyc pipelines inseparable — skipping
-Triton would then also skip flyc zips, i.e. exactly the thing this option exists to keep
-working. Prefer a separate `Fly.flatzip` alongside `Fly.cluster`, matching how
-`Affine.cluster` already stays separate.
+**This is also why 7b needs no new rule files.** An earlier draft of this note argued the
+opposite — that sharing `Bare.flatzip` would weld the pipelines together, so flyc needed its
+own `Fly.flatzip`. That was true only of the first implementation of this option, which
+gated the `Bare.*` reads in CMake and therefore could only skip at file granularity. The
+option now omits rows *in the generator*, so a shared file with the Triton rows left out is
+already a flyc-only file, and the split buys nothing. `Fly.compile` remains the sole new
+file, because its row encodes a Triton compiler invocation and flyc's is a different tool
+with a disjoint flag set.
 
 ## Definition of done
 
@@ -1300,8 +1319,9 @@ working. Prefer a separate `Fly.flatzip` alongside `Fly.cluster`, matching how
    it, because `aotriton_v3_flyc_compile` is an `ALL` target. `ninja install` therefore
    exercises the flyc compile path — which is the only way an unbuildable kernel gets
    noticed.
-5. `Fly.compile` and `Fly.cluster` survive a sharded configure (both in `shard_names`) and
-   are absent under `-DAOTRITON_NOIMAGE_MODE=ON`.
+5. `Fly.compile` — the only new rule file — survives a sharded configure (it is in
+   `shard_names`) and is absent under `-DAOTRITON_NOIMAGE_MODE=ON`. The flyc cluster and
+   flatzip rows ride in `Bare.cluster` / `Bare.flatzip`, which are already sharded.
 6. **The deliverable exists**: `aotriton.images/<arch>/flash/flyc_attn_fwd.zip` is built by
    `ninja`, contains one entry per surviving functional, and is installed by `ninja install`.
 7. `import torch` still **fails** in the build venv while all of the above succeeds.
