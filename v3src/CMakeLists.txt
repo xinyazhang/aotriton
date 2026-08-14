@@ -97,6 +97,19 @@ else()
   set(AOTRITON_ENABLE_FP32 0)
 endif()
 
+# Normalise ON/OFF to 1/0 here, as AOTRITON_ENABLE_FP32 above does: the generator reads
+# this with the codebase's bool(int(os.getenv(...))) idiom, which does not accept ON/OFF.
+if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
+  set(AOTRITON_DEBUG_SKIP_TRITON_KERNELS_ENV 1)
+  message(WARNING
+    "[AOTriton] AOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON: the generator will emit no Triton "
+    "image rules, so aotriton.images is INCOMPLETE and the resulting library cannot serve "
+    "any Triton-backed operator at runtime. Debugging aid for iterating on other backends; "
+    "never ship the result.")
+else()
+  set(AOTRITON_DEBUG_SKIP_TRITON_KERNELS_ENV 0)
+endif()
+
 if(NOT AOTRITON_NOIMAGE_MODE)
   find_package(Git REQUIRED)
   ## Handle aiter.txt
@@ -144,10 +157,16 @@ if(NOT AOTRITON_NOIMAGE_MODE)
 endif()
 
 ## Generate Bare.* files and shim files
+# AOTRITON_DEBUG_SKIP_TRITON_KERNELS is passed to the generator rather than acted on
+# here: it makes the generator omit Triton image rules from Bare.compile/Bare.cluster,
+# so the rule files this build reads below are simply empty and every loop over them
+# does nothing. No build-system special-casing, and the flatzip stage keeps working for
+# whatever non-Triton backends did emit rules.
 execute_process(
 COMMAND ${CMAKE_COMMAND}
 -E env VIRTUAL_ENV=${VENV_DIR}
 AOTRITON_ENABLE_FP32=${AOTRITON_ENABLE_FP32}
+AOTRITON_DEBUG_SKIP_TRITON_KERNELS=${AOTRITON_DEBUG_SKIP_TRITON_KERNELS_ENV}
 "${VENV_BIN_PYTHON}" -X utf8 -m aotriton.generate
 --target_gpus ${EFFECTIVE_TARGET_GPUS}
 --build_dir "${AOTRITON_V2_BUILD_DIR}"
@@ -177,28 +196,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   message("Bare.compile: ${AOTRITON_V2_BUILD_DIR}/Bare.compile")
   message("Bare.cluster: ${AOTRITON_V2_BUILD_DIR}/Bare.cluster")
   set(AOTRITON_HSACO_RECORD "${AOTRITON_V2_BUILD_DIR}/Bare.targets")
-
-  # Read one Bare.* rule file, or yield nothing when the Triton image pipeline is
-  # switched off for debugging. Applied at all three Bare.* reads (compile, cluster,
-  # flatzip) so the aggregate targets below end up with no Triton inputs rather than
-  # with rules whose hsacos were never built.
-  macro(READ_TRITON_RULES VAR RULE_FILE)
-    if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
-      set(${VAR} "")
-    else()
-      file(STRINGS "${RULE_FILE}" ${VAR} ENCODING UTF-8)
-    endif()
-  endmacro()
-
-  if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
-    message(WARNING
-      "[AOTriton] AOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON: no Triton kernel images "
-      "will be built, so aotriton.images is INCOMPLETE and the resulting library "
-      "cannot serve any Triton-backed operator at runtime. Debugging aid for "
-      "iterating on other backends; never ship the result.")
-  endif()
-
-  READ_TRITON_RULES(HSACO_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.compile")
+  file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.compile" HSACO_RULES ENCODING UTF-8)
   list(LENGTH HSACO_RULES NUM_HSACO_RULES)
   message("Bare.compile ${NUM_HSACO_RULES} rules read")
 
@@ -286,7 +284,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
       list(APPEND ALL_AKS2 "${AKS2}")
     endforeach(RULE)
   endmacro()
-  READ_TRITON_RULES(CLUSTER_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.cluster")
+  file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.cluster" CLUSTER_RULES ENCODING UTF-8)
   set(AKS2_OPTIONS "")
   ADD_FROM_CLUSTER_RULES()
   # Affine kernels: emit AKS2 blobs to the intermediate aks2/ tree (same as Bare),
@@ -330,7 +328,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   # ZIP is STORED (no compression) so entries are readable via lseek+read at fixed offsets.
   set(ALL_ZIPS "")
   if(EXISTS "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip")
-    READ_TRITON_RULES(FLATZIP_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip")
+    file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip" FLATZIP_RULES ENCODING UTF-8)
     foreach(RULE IN LISTS FLATZIP_RULES)
       list(POP_FRONT RULE DIR_ARCH)
       list(POP_FRONT RULE DIR_FAMILY)
@@ -375,6 +373,7 @@ if(AOTRITON_BUILD_FOR_TUNING)
     COMMAND ${CMAKE_COMMAND}
     -E env VIRTUAL_ENV=${VENV_DIR}
     AOTRITON_ENABLE_FP32=${AOTRITON_ENABLE_FP32}
+    AOTRITON_DEBUG_SKIP_TRITON_KERNELS=${AOTRITON_DEBUG_SKIP_TRITON_KERNELS_ENV}
     "${VENV_BIN_PYTHON}" -m aotriton.generate
     --target_gpus ${EFFECTIVE_TARGET_GPUS}
     --build_dir "${AOTRITON_V2_BUILD_DIR}"
