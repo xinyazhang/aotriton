@@ -170,41 +170,29 @@ def _flyc_fwd_disabled(f):
 # `varlen_bits` is FlyDSL's layout descriptor; AOTriton has no such operand, and
 # this is also where the MODE half of `Num_seqlens` lands.
 @ati.scalar('varlen_bits', 'i32', wires_to=ati.context_helper('flyc_varlen_bits'))
-# `num_seqlens` is a false friend: same name, different job.
+# `batch_size` and `num_seqlens` are a PAIR, and neither is a rename.
 #
-#   AOTriton   Num_seqlens is overloaded as MODE + COUNT, three-way:
-#                > 0  varlen, compact/stacked; the value is the sequence count
-#                = 0  dense
-#                < 0  varlen, BHSD layout, S padded to Max_seqlen_q
-#              (kernel/fwd_kernel.py:247/267 branch on exactly this)
-#   FlyDSL     num_seqlens is a plain COUNT. Every mode bit lives in `varlen_bits`
-#              instead, and the launcher simply passes `batch_size` into the slot.
+# FlyDSL's contract (fmha_abi_gfx1201.varlen_args docstring): `batch_size` is
+# q.size(0) always, whatever the layout; `num_seqlens` is how many sequences are
+# packed into a 1HTD tensor, and 0 when nothing is packed. Dense is (B, 0);
+# packed with N sequences is (1, N). The kernel then branches on the pair:
+#     nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)
 #
-# FlyDSL's varlen support is a superset, and it got there by factoring the mode out
-# of the count — so this cannot be a rename. `flyc_varlen_bits` consumes the same
-# sign to build the mode bits; this helper recovers the count.
+# AOTriton spells the same information differently: a `Batch` operand plus a
+# SIGNED three-way `Num_seqlens` (>0 packed count, 0 dense, <0 BHSD-padded
+# varlen). So:
 #
-# IMPLEMENTATION: an integer abs(). Verified against the kernel, case by case:
+#   batch_size   <- params.Q->size(0), NOT params.Batch. Under packed varlen Q
+#                   is 1HTD, so q.size(0) is 1 while Batch is not.
+#   num_seqlens  <- max(Num_seqlens, 0). A negative Num_seqlens is padded, not
+#                   packed, so FlyDSL wants 0 and the layout rides in
+#                   varlen_bits. VERIFY against flyc_varlen_bits: the two
+#                   helpers must agree on how the padded case is encoded.
 #
-#   Num_seqlens > 0   varlen compact/stacked      abs(n) == n, the sequence count
-#   Num_seqlens < 0   varlen BHSD, S padded       abs(-n) == n, likewise
-#   Num_seqlens == 0  dense                       abs(0) == 0 — and DEAD
-#
-# The dense row is the one that looks wrong and is not. `num_seqlens` reaches only
-# two callees, and neither reads it outside a stacked layout:
-#   * decode_addressing()  takes the parameter and never references it in the body
-#     (fmha_common_gfx1201.py:1088 — dead argument, worth deleting upstream)
-#   * lse_token_pitch()    reads it in three places, ALL inside the `stacked` arm of
-#     the outer ssel; the non-stacked arm returns `max_seqlen` outright
-#
-# TRANSIENT: the kernel is being changed to take `Batch` directly (separate work),
-# after which this collapses to `wires_to='Batch'`. The two are NOT interchangeable
-# — abs(Num_seqlens) is 0 for the dense case where `Batch` is the batch count — so
-# the switch must land in the same change as the kernel API, not before or after.
-# Check at that point whether abs(Num_seqlens) == Batch holds for varlen too.
-#
-# The `num_seqlens` spelling is a leftover from when varlen was the primary variant
-# of attn_fwd; non-varlen is the better base case.
+# Getting this pair wrong fails SILENTLY -- FlyDSL's own docstring: "it launches
+# N programs over a tensor whose batch axis is 1, and every one of them
+# addresses a plausible row." Assert in the shim, do not rely on the helper.
+@ati.scalar('batch_size', 'i32', wires_to=ati.context_helper('flyc_batch_size'))
 @ati.scalar('num_seqlens', 'i32', wires_to=ati.context_helper('flyc_num_seqlens'))
 #
 # --- plain renames ------------------------------------------------------------
