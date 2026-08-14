@@ -36,7 +36,7 @@ These were measured, not inferred. Treat them as given; do not re-derive.
 | Env for cross-compile | `ARCH=gfx1201`, `FLYDSL_GPU_ARCH=gfx1201`, `COMPILE_ONLY=1`, `FLYDSL_RUNTIME_ENABLE_CACHE=0` |
 | Expected artifact | ~13.5 KB ELF, `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0` |
 | Build cost | 1.1 s (hd 64) / 1.7 s (hd 128) / 2.7 s (hd 256) |
-| Required env (interim) | `AOTRITON_FLYDSL_ROOT=/home/xinyazha/dockerhome/meff/FlyDSL` — see Task 2; no fallback exists |
+| Required env | `AOTRITON_FLYDSL_KERNEL_ROOT=<FlyDSL source root>`; no fallback exists. CMake sets it to the `third_party/flydsl-kernel.txt` clone; set it by hand for a direct `flyc_compile` run |
 
 Traps that already cost time — do not rediscover them:
 
@@ -54,11 +54,36 @@ Three preconditions for the real work: where the shared FlyDSL helpers come from
 ones that exist only on the feature branch (0b), and reshaping `ir/` so flyc has somewhere to
 live (0c). None produces an hsaco; all have to be settled first.
 
-### 0a. BLOCKER: the shared kernel helpers must come from the package
+### 0a. RESOLVED: the shared kernel helpers come from a pinned source clone
 
-The gfx1201 kernel needs six shared FlyDSL helpers — `buffer_ops`, `kernels_common`,
-`layout_utils`, `mem_ops`, `utils`, `mma/wmma_ops`. **They must not be copied into this
-repo**; they are FlyDSL's, not the flash kernel's, and a copy is a fork.
+**Settled, not blocked.** The wheel still does not ship them, but nothing waits on that
+now. Two independent FlyDSL pins:
+
+| file | pins | supplies |
+|---|---|---|
+| `third_party/flydsl-compiler.txt` | `flydsl==0.3.1` | the pip wheel — the compiler |
+| `third_party/flydsl-kernel.txt` | `v0.3.1` | a shallow git clone — `kernels/common` |
+
+`CMakeLists.txt` clones the tag exactly as the `third_party/aiter.txt` block does, and
+exports `AOTRITON_FLYDSL_KERNEL_ROOT` (a cache `PATH`, so pointing it at an existing
+checkout skips the clone and builds against local kernel work). 9.6 MB shallow.
+
+The released tag cannot supply all six: **`v0.3.1` has no `mma/wmma_ops.py`** — its `mma/`
+carries MFMA (CDNA) helpers only, and this is a WMMA (RDNA) kernel. The gfx1201 WMMA work
+sits on `xinyazhang/sdpa-gfx1201-feature`, which forked at `v0.3.0` and is contained in no
+tag. So the four `utils` helpers and the one `wmma_ops` helper come from
+`flyc_polyfill.py` instead; `buffer_ops` and `kernels_common` still come from the clone,
+where they exist. See UPSTREAM.md "Import rewrites".
+
+Verified byte-identical against both trees, so the polyfill bodies match the branch
+originals. The section below is kept for the packaging endgame: once the wheel ships
+`flydsl.kernels.common`, the clone, the env var and the polyfill all disappear together.
+
+The original constraint stands and is why the polyfill exists rather than a copy: the
+shared helpers — `buffer_ops`, `kernels_common`, `layout_utils`, `mem_ops`, `utils`,
+`mma/wmma_ops` — **must not be copied into this repo**; they are FlyDSL's, not the flash
+kernel's, and a copy is a fork. `flyc_polyfill.py` is authored, prefers the packaged
+definition when one exists, and empties itself out as helpers land upstream.
 
 They are also **not in the flydsl 0.3.1 wheel**, so this is a real dependency, not a
 preference. Verified:
