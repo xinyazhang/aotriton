@@ -29,6 +29,17 @@ import yaml
 # DO NOT USE Path.absolute(), which does not resolve '..' in the path
 REL_PYTHON = Path(os.path.abspath(sys.executable)).relative_to(Path(sys.exec_prefix))
 
+# DEBUG ONLY. Omit every Triton image rule from the generated Bare.* files, so a build can
+# iterate on another backend without paying for tens of thousands of Triton compiles. The
+# C++ shims are still generated, so the library still builds -- it just cannot serve any
+# Triton-backed operator, which is why this must never be used for a shipped build.
+#
+# Set by v3src/CMakeLists.txt from -DAOTRITON_DEBUG_SKIP_TRITON_KERNELS, normalised there
+# to 1/0 for the bool(int(...)) idiom this codebase uses (see utils/log.py). It is read
+# from the environment rather than taken as a flag so that the worker subprocesses
+# launch_workers() spawns inherit it without threading it through argv.
+AOTRITON_DEBUG_SKIP_TRITON_KERNELS = bool(int(os.getenv('AOTRITON_DEBUG_SKIP_TRITON_KERNELS', default='0')))
+
 def _shard_path(selective: str) -> Path:
     # --selective may be a glob pattern such as flash/affine/*; keep glob
     # metacharacters out of host filesystem paths used only for worker shards.
@@ -135,9 +146,17 @@ class RootGenerator(object):
         for k in kerns:
             ksg = KernelShimGenerator(self._args, k, parent_repo=None)
             ksg.generate()
+            shims += ksg.shim_files
+            # AOTRITON_DEBUG_SKIP_TRITON_KERNELS: emit the C++ shim but no image rules.
+            # Leaving this kernel out of hsaco_for_kernels is the whole mechanism -- it
+            # is the sole feed for Bare.compile and for the Triton entries of
+            # cluster_dict/flatzip_dict, so all three come out without Triton rows and
+            # every CMake loop over them simply iterates zero times. The shim must still
+            # be generated or the library will not compile.
+            if AOTRITON_DEBUG_SKIP_TRITON_KERNELS:
+                continue
             hsacos = ksg.this_repo.get_data('hsaco')
             hsaco_for_kernels.append((k, hsacos))
-            shims += ksg.shim_files
 
         # TODO: Fix this for Windows
         # On Windows, you get "KeyError: 'validator_function'"
@@ -262,9 +281,16 @@ class RootGenerator(object):
 
         shard_names = ['Bare.shim', 'Bare.compile', 'Bare.cluster', 'Affine.cluster', 'Bare.flatzip']
         out_files = {name: args.build_dir / name for name in shard_names}
-        # Truncate output files before appending
+        # Truncate output files before appending. `touch()` matters: a rule file with no
+        # rows must exist and be EMPTY, not be absent. LazyFile only writes when the
+        # content changed, so a shard that produced nothing leaves no file to copy here,
+        # and `file(STRINGS)` in v3src/CMakeLists.txt is a hard error on a missing path
+        # (Bare.compile and Bare.cluster are read unguarded). That case is reachable
+        # whenever a backend contributes no rules -- AOTRITON_DEBUG_SKIP_TRITON_KERNELS
+        # makes it reachable for every Triton kernel at once.
         for path in out_files.values():
             path.unlink(missing_ok=True)
+            path.touch()
         for item in items:
             shard_dir = args.build_dir / 'Bare.shards' / _shard_path(item)
             for name, out_path in out_files.items():
