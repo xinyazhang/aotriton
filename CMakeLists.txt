@@ -118,7 +118,7 @@ option(AOTRITON_BUILD_FOR_TUNING "Build all GPU kernels and set -DAOTRITON_BUILD
 set(AOTRITON_BUILD_FOR_TUNING_BUT_SKIP_KERNEL "" CACHE STRING "Use tuning database for certain kernels when AOTRITON_BUILD_FOR_TUNING=ON")
 option(AOTRITON_ENABLE_FP32_INPUTS "Enable FP32 support." ON)
 option(AOTRITON_NOIMAGE_MODE "Only build C++ Shim part. Kernel image builds are disabled" OFF)
-option(AOTRITON_DEBUG_SKIP_TRITON_KERNELS "DEBUG ONLY. Skip the Triton kernel image pipeline (Bare.compile/cluster/flatzip) so other backends can be iterated on without paying for tens of thousands of Triton compiles. The Triton wheel is still installed. Produces an INCOMPLETE image set: do not ship the result." OFF)
+option(AOTRITON_DEBUG_SKIP_TRITON_KERNELS "DEBUG ONLY. Make the code generator emit no Triton image rules, so other backends can be iterated on without paying for tens of thousands of Triton compiles. C++ shims and the Triton wheel install are unaffected; other backends still reach aotriton.images normally. Produces an INCOMPLETE image set: do not ship the result." OFF)
 option(AOTRITON_INHERIT_SYSTEM_SITE_TRITON "Use system site packages and verify triton availability instead of building from source" OFF)
 # No plan to support network based pip install
 set(AOTRITON_USE_LOCAL_TRITON_WHEEL "" CACHE STRING "Substitute install from third_party/triton with install from local pip wheel package.")
