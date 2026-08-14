@@ -343,9 +343,15 @@ if(ALL_TRITON_SOS)
   add_custom_target(aotriton_venv_triton ALL DEPENDS "${ALL_TRITON_SOS}")
 endif(ALL_TRITON_SOS)
 
-# FlyDSL is a pinned wheel, not a submodule: its setup.py needs a prebuilt bundled
-# MLIR, so `pip install third_party/flydsl` would not be self-contained the way
+# The FlyDSL COMPILER is a pinned wheel, not a submodule: its setup.py needs a prebuilt
+# bundled MLIR, so `pip install third_party/flydsl` would not be self-contained the way
 # `pip install third_party/triton` is.
+#
+# The FlyDSL SOURCE TREE is pinned separately by third_party/flydsl-kernel.txt and
+# shallow-cloned like aiter, because the wheel does not ship `kernels/common`, which the
+# vendored kernels in modules/flash/flyc/ import. Two pins, deliberately independent: the
+# compiler is a released artifact, the kernel sources track the branch the vendored files
+# were synced from.
 if(NOT AOTRITON_NOIMAGE_MODE)
   # Sentinel is flydsl/__init__.py, not the bundled-MLIR extension -- that
   # filename carries an LLVM version and would break on the next flydsl bump.
@@ -353,7 +359,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   add_custom_command(OUTPUT "${AOTRITON_FLYDSL_STAMP}"
     COMMAND ${CMAKE_COMMAND} -E env VIRTUAL_ENV=${VENV_DIR}
     "${VENV_BIN_PYTHON}" -m pip install -r
-    "${CMAKE_CURRENT_LIST_DIR}/third_party/flydsl.txt"
+    "${CMAKE_CURRENT_LIST_DIR}/third_party/flydsl-compiler.txt"
     VERBATIM)
   add_custom_target(aotriton_venv_flydsl ALL DEPENDS "${AOTRITON_FLYDSL_STAMP}")
 endif()
