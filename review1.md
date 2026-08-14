@@ -24,7 +24,7 @@
 | 1 vendor the kernel | done, merged. The 2 verbatim files are byte-identical to upstream; the other 3 differ only by the documented import rewrites. |
 | 2 `flyc_bootstrap.py` | done, merged |
 | 2.5 flydsl in the build venv | done, merged. **Gate partly unverified** — `cmake` dies at `CMakeLists.txt:101` `find_package(hip REQUIRED)`; no HIP toolchain in this container. |
-| 3 `flyc_compile.py` | done, merged |
+| 3 `flyc_compile.py` | done, merged. Then **rewritten** by `jit2aot-exec.md` steps 1-6 (`4731404`..`1ea44e5`) — see below. |
 | 4 `ati.flyc.*` + `ir/flyc/` | done, merged. **Gate 3 verified independently**: 13496-byte ELF, `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0`, sidecar `block_m=256` / `block_size=512`; 12/12 sweep. |
 | 5 generator emits `Fly.compile` | **not started** |
 | 6 CMake rule loop | **not started** — gate needs a working configure, so it will be structurally complete but unverified here |
@@ -86,9 +86,52 @@ is the clean fix, and is the minimal form of PLAN.md open question 2. Either:
   fallback died when 2.5 chose a pinned wheel over a submodule).
 - No HIP toolchain here, so Tasks 6 and 7 cannot be gate-verified in this container.
 
+### jit2aot steps 1-6: done and merged
+
+Item 8 was resolved as **(b)** — closure walk as a documented interim — and the whole of
+`jit2aot-exec.md` is now implemented, six commits `4731404`..`1ea44e5`, merged
+fast-forward. The driver enters at the `JitFunction` and never touches host code.
+
+Deleted, all of it symptom rather than cause: `_trace_fmha_launch`, the
+`abi.run_compiled` monkeypatch, `import fmha_abi_gfx1201`, `_FAKE_SHAPE`, the
+`CAUSAL_TYPE=3` window fix, `_Choices`/`_FunctionalStandIn`, and
+`_extract_block_size` (which parsed pre-lowering MLIR; `block_size` now comes from the
+declared `_known_block_size`, retiring the last use of `_source_ir`).
+
+`FakeTensor` survives on purpose — unused by the pointer path, kept as the descriptor the
+`fx.Tensor` row of `_operand_for` will need, with the open questions written into its
+docstring.
+
+**Verified independently, not taken on report** — worktree shadowed via `PYTHONPATH` so
+the editable install could not serve the main tree:
+
+- reference artifact `1821491bae4d1ca3c2f1`, 13496 bytes, 1.39 s (a real compile, not a
+  `_mem_cache` hit)
+- 12/12 sweep `Complete`, **12 distinct sha256** across 12 fresh subprocesses — which is
+  also the proof there is no cross-process cache reuse
+- `CAUSAL_TYPE=3` passes at all three head dims with **no window code anywhere** in the
+  driver
+- 45 launcher params (14 Pointer / 12 Int32 / 16 Int64 / 2 Float32 / 1 Stream);
+  launcher-minus-`stream` equals the kernel's 44 names **in order** — your ABI alignment
+  request landed and is now load-bearing
+- `_known_block_size` `[512,1,1]` at hd 64, sidecar `block_size` 512, `block_m` 256
+- suite 192 passed / 7 skipped
+
+Two stale numbers in `jit2aot-exec.md` were found by the agent and corrected in `5cc0e51`
+(a `44` that should have been `45`, and an ambiguous `block_m`/`block_size` shorthand).
+
 ### Where to continue
 
-1. Decide item 8 (a) or (b) above. It changes the `@ati.flyc.kernel` contract, so the plan
-   gets revised before implementing, and it deletes a chunk of Task 3.
-2. Tasks 5 → 6 → 7. Task 5 is verifiable here; 6 and 7 need a machine that can `cmake`
-   configure (this container has no HIP toolchain).
+Tasks 5 → 6 → 7. Task 5 (generator emits `Fly.compile`) is verifiable here; 6 and 7 need
+a machine that can `cmake` configure — this container dies at `find_package(hip REQUIRED)`,
+so they can be written but not gated.
+
+Still outstanding, unchanged:
+
+- **0a** — needs FlyDSL to ship `kernels/common` in the wheel. Until then every
+  `flyc_compile` run needs `AOTRITON_FLYDSL_ROOT`.
+- the `num_seqlens`/`batch_size` context helpers want checking against `flyc_varlen_bits`
+  for the `<0` padded case.
+- `jit_function_of`'s closure walk is the documented interim. One line upstream
+  (`_launch.jit_function = launch_flash_attn_aiw`) retires it; the driver raises rather
+  than broadening the search if it ever stops finding exactly one.
