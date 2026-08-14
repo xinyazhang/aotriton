@@ -32,12 +32,6 @@ import weakref
 import fmha_common_gfx1201 as fmha
 from philox import dropout_threshold
 
-# `torch` and `torch.float32` are imported lazily, inside the two functions
-# that need them (`lse_args`, `u64_scalar`), because the build venv must
-# never have torch (CMakeLists.txt:142) and neither use is reached by the
-# AOT compile driver (python/flyc_compile.py), which passes philox_seed=None.
-# See UPSTREAM.md "Torch-lazy rewrites".
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -274,7 +268,7 @@ def lse_args(lse, seq_len, varlen, num_head_q):
     What the host can do instead -- and could not while it was inferring --
     is verify the caller's tensor actually has the declared layout.
     """
-    from torch import float32 as torch_f32  # lazy: build venv has no torch (CMakeLists.txt:142)
+    from torch import float32 as torch_f32  # lazy: the build venv has no torch
 
     if lse is None:
         return NULL_PTR
@@ -368,7 +362,7 @@ def u64_scalar(value, device, stream=None):
         if value is not None and value.element_size() != 8:
             raise ValueError(f"a philox scalar tensor must be 8 bytes per element, got {value.dtype}")
         return value
-    import torch  # lazy: only reached when the caller passes a plain int seed; the AOT driver passes None
+    import torch  # lazy: only reached for a plain int seed; AOT passes None
 
     with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
         return torch.tensor([int(value)], dtype=torch.int64, device=device)
@@ -433,15 +427,37 @@ def dropout_args(enable_dropout, dropout_p, seed, offset1, offset2, device=None,
     )
 
 
-def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):
-    """(bits, q0, q1, k0, k1, max_q, max_k) in launch order.
+def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k, q, batch_size, num_seqlens):
+    """(bits, q0, q1, k0, k1, max_q, max_k) in launch order, plus two checks.
 
     `varlen` is None for the dense case, else a dict with `bits` and
     whichever `seqinfo_*` tensors that configuration reads. Unread slots
     stay **null**, which is safe because the kernel's decode branches
     rather than selects -- see the prologue.
+
+    **`batch_size` and `num_seqlens` are different quantities and never share
+    a variable on the host.** `batch_size` is `q.size(0)`, always, whatever the
+    layout. `num_seqlens` is how many sequences are packed into a 1HTD tensor,
+    and is 0 when nothing is packed. For a dense BHSD call they are `(B, 0)`;
+    for a packed `(1, H, T, D)` call holding N sequences they are `(1, N)` --
+    genuinely different numbers, which is why one variable cannot serve.
+
+    Neither is returned: both are already the caller's, and this function's job
+    for them is to *check*, because each has a second, independent source of
+    truth. `batch_size` must be `q.size(0)`, and a packed `num_seqlens` must be
+    `len(cu_seqlens_q) - 1`. Passing N where `batch_size` belongs is the
+    specific mistake -- it launches N programs over a tensor whose batch axis
+    is 1, and every one of them addresses a plausible row.
     """
+    if int(batch_size) != int(q.shape[0]):
+        raise ValueError(
+            f"batch_size={int(batch_size)} but q.size(0)={int(q.shape[0])}. batch_size is the "
+            f"tensor's batch extent whatever the layout; a packed 1HTD tensor has 1, and its "
+            f"sequence count goes in num_seqlens."
+        )
     if varlen is None:
+        if int(num_seqlens):
+            raise ValueError(f"num_seqlens={int(num_seqlens)} without varlen=; a dense call packs no sequences")
         return (0, NULL_PTR, NULL_PTR, NULL_PTR, NULL_PTR, int(seqlen_q), int(seqlen_k))
     if strides_constexpr:
         raise ValueError(
@@ -453,6 +469,22 @@ def varlen_args(strides_constexpr, varlen, seqlen_q, seqlen_k):
     # `varlen_bits` rejects the combinations that are not *meaningful*
     # (reserved codes, REUSE without cumulative lengths).
     bits = int(varlen["bits"])
+    # A STACKED Q side is the packed one, and the only one the kernel reads
+    # `num_seqlens` for (`lse_token_pitch`, to reach slot [N] of the array
+    # holding the batch total). A non-stacked varlen side -- `varlen_padded`,
+    # BHSD tensors with short sequences -- has a real batch axis and packs
+    # nothing, so its count is 0 like the dense case.
+    if bits & VARLEN_STACKED:
+        if varlen.get("seqinfo_q0") is None:
+            raise ValueError("a STACKED Q side needs seqinfo_q0 (cu_seqlens_q) to count its sequences")
+        packed = int(varlen["seqinfo_q0"].numel()) - 1
+        if int(num_seqlens) != packed:
+            raise ValueError(f"num_seqlens={int(num_seqlens)} but cu_seqlens_q describes {packed} packed sequences")
+    elif int(num_seqlens):
+        raise ValueError(
+            f"num_seqlens={int(num_seqlens)} but the Q side is not STACKED, so nothing is packed "
+            f"and the batch axis is real; this configuration wants num_seqlens=0"
+        )
     got = tuple(
         ptr_arg(varlen[k]) if varlen.get(k) is not None else NULL_PTR
         for k in ("seqinfo_q0", "seqinfo_q1", "seqinfo_k0", "seqinfo_k1")

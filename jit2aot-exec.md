@@ -52,10 +52,12 @@ process, one build, one fresh `JitFunction` — but it is a trap when verifying:
 | python | `/home/xinyazha/.venvs/nogpu/bin/python` |
 | required env | `AOTRITON_FLYDSL_ROOT=/home/xinyazha/dockerhome/meff/FlyDSL` (no fallback exists) |
 | pytest baseline | **192 passed, 7 skipped** |
-| reference artifact | hd 64 / f16 / non-causal → **13496 bytes**, sha256 prefix `bc6d0fca66a0c2d9f476` |
+| reference artifact | hd 64 / f16 / non-causal → **13496 bytes**, sha256 prefix `1821491bae4d1ca3c2f1` |
 | ELF | `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0`, `shared` 8960 |
 | block_m / block_size | 256 / 512 at hd 64; **512 → 256** at hd 128 |
-| launcher | `launch_flash_attn_aiw`, 44 params: 14 Pointer, 11 Int32, 16 Int64, 2 Float32, 1 Stream |
+| launcher | `launch_flash_attn_aiw`, **45** params: 14 Pointer, 12 Int32, 16 Int64, 2 Float32, 1 Stream |
+| kernel | `flash_attn_func_aiw_kernel`, **44** params — the launcher minus `stream`, **same names, same order** |
+| kernarg | `.kernarg_segment_size: 300` |
 
 Measured and relied on below:
 
@@ -64,6 +66,26 @@ Measured and relied on below:
 - The `fx.Pointer` **element type** is inert — `Uint8`/`Float16`/`Int32` all identical.
 - `flyc.compile()` is unusable: `_compile_impl` ends in `artifact._get_func_exe()`, which
   builds an ExecutionEngine and needs HIP. Call the `JitFunction` directly.
+
+---
+
+## Step 0 — DONE: re-vendor against the aligned FlyDSL
+
+FlyDSL `44462bf0` / `f79182b7` / `1d231767` aligned the launcher with the kernel and split
+`batch_size` from `num_seqlens`. The five vendored files under `modules/flash/flyc/` were
+re-synced from FlyDSL `1d231767` with the `UPSTREAM.md` rewrites reapplied, and the reference
+artifact re-measured (the old `bc6d0fca66a0c2d9f476` is dead).
+
+Consequences already folded into the facts table above: 45 launcher params (was 44), kernarg
+300 bytes (was 292), new reference sha. `block_m` 256 / `block_size` 512 / `shared` 8960 are
+unchanged.
+
+**Not done, and not part of this plan:** the ATI description is missing the new `batch_size`
+operand (declared order still matches for the 28 it does declare), and the `num_seqlens`
+wiring rationale is stale — the kernel now does
+`nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)`, so the two are separate
+concepts rather than one slot doing double duty. That is Phase 2 territory; see the note at
+the end of this file.
 
 ---
 
@@ -91,7 +113,8 @@ were found.
 1. `isinstance(built, JitFunction)` → return it. **This is the common case** — 47 of 69
    builders in the FlyDSL tree return their `@flyc.jit` directly.
 2. else `_find_unique(built, JitFunction)` — 18 builders, gfx1201 among them. For gfx1201 the
-   JitFunction is in `built.compile`'s closure.
+   JitFunction is in `built.compile`'s closure — the `_launch` host wrapper still exists
+   after the ABI alignment, so this path is still the one gfx1201 takes.
 3. zero or several → raise. Several means a **multi-kernel builder** (3 in the tree); that is
    out of scope and needs a plural contract, not a guess. Say so in the message.
 
@@ -141,7 +164,7 @@ places that enumerate annotations — but keep the wording, especially the `fx.T
 |---|---|
 | MOD | `python/flyc_compile.py` |
 
-**Verify**: `jf(*synthesise_args(jf))` then extract → sha256 prefix `bc6d0fca66a0c2d9f476`,
+**Verify**: `jf(*synthesise_args(jf))` then extract → sha256 prefix `1821491bae4d1ca3c2f1`,
 13496 bytes. The guard still fires on a synthetic `fx.Tensor` launcher.
 
 ---
@@ -255,7 +278,7 @@ module import in `python/flyc_compile.py`, and record the new check in
    special-casing, no `Functional` stand-in.
 2. `FakeTensor` and its docstring remain, unused by the pointer path, as the descriptor the
    `fx.Tensor` row will need.
-3. The artifact is unchanged: **13496 bytes, sha256 `bc6d0fca66a0c2d9f476`** at hd 64 / f16 /
+3. The artifact is unchanged: **13496 bytes, sha256 `1821491bae4d1ca3c2f1`** at hd 64 / f16 /
    non-causal. This is the single most important check — a kernel-agnostic driver that emits
    a different binary has failed.
 4. 12-combination sweep passes, `CAUSAL_TYPE=3` included, with no window handling anywhere.
@@ -279,5 +302,26 @@ Phase 2's kernarg vector, `ati.context_helper` codegen, C++ shim; the upstream
   AST rewrite preserves the signature.
 - **Byte-identity is the real gate.** Every step above can "work" — produce a valid gfx1201
   ELF — while quietly changing the binary. After *each* step, re-run the compile and
-  `sha256sum` the emitted `.hsaco` against `bc6d0fca66a0c2d9f476`. Not just at the end: if it
+  `sha256sum` the emitted `.hsaco` against `1821491bae4d1ca3c2f1`. Not just at the end: if it
   drifts you want to know which step did it.
+
+
+---
+
+## Follow-up, NOT in this plan: the ATI declarations after the ABI alignment
+
+Recorded here so it is not lost. The re-vendor in Step 0 changed the kernel ABI:
+
+- **`batch_size` is a new operand** and is not declared in `modules/flash/aot/flyc_attn_fwd.py`.
+  It looks like a plain `wires_to='Batch'` rename now that it no longer shares a slot.
+- **`num_seqlens` is no longer a "false friend".** The old design gave it a
+  `flyc_num_seqlens` context helper implementing `abs()`, because the launcher's `batch_size`
+  was passed into the kernel's `num_seqlens` slot. They are now separate arguments and the
+  kernel resolves the fallback itself. Re-derive the mapping against AOTriton's three-way
+  `Num_seqlens` before touching the helper — it may collapse to a plain rename for the `>= 0`
+  cases, leaving only the negative (BHSD-padded varlen) case to handle.
+- The 28 currently-declared operands still match kernel order exactly (checked by AST), so
+  only the insertion of `batch_size` is outstanding.
+
+None of this blocks the kernel-agnostic refactor: Phase 1 synthesises arguments from the
+launcher signature and never reads the declarations.

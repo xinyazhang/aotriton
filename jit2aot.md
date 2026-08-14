@@ -454,9 +454,16 @@ exactly in only **21**. The differences are systematic, not random:
 For gfx1201 specifically: 43 vs 43 params, 41 shared, differing by `batch_size`/`num_seqlens`
 and `sm_scale_v`/`sm_scale_arg`, plus `stream`, plus a swap at indices 10/11.
 
-**Working assumption: for the SDPA kernels we control, treat the two as the same.** That is a
-choice, not a discovered truth — record it so nobody later reads it as a FlyDSL guarantee. If
-a future flyc kernel breaks it, the fix is a per-description name map, not a general one.
+**UPDATE — no longer an assumption for gfx1201.** FlyDSL `44462bf0` ("the launcher and the
+kernel take the same arguments"), `f79182b7` and `1d231767` aligned them: the launcher is now
+the kernel's 44 parameters plus `stream`, with **zero positional divergences** — same names,
+same order. `batch_size` and `num_seqlens` also stopped sharing a variable and are now
+separate arguments (`nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)`), which is
+why the kernel grew 43 → 44 params and the kernarg segment 292 → 300 bytes.
+
+This holds for the SDPA kernels because we control them. It is still **not** a FlyDSL-wide
+guarantee — the tree-wide survey below stands, and a future flyc kernel from elsewhere may
+diverge again. The fix then is a per-description name map, not a general one.
 
 ## BLOCK_SIZE: use the declared value, not the ELF bound
 
