@@ -54,7 +54,7 @@ process, one build, one fresh `JitFunction` — but it is a trap when verifying:
 | pytest baseline | **192 passed, 7 skipped** |
 | reference artifact | hd 64 / f16 / non-causal → **13496 bytes**, sha256 prefix `1821491bae4d1ca3c2f1` |
 | ELF | `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0`, `shared` 8960 |
-| block_m / block_size | 256 / 512 at hd 64; **512 → 256** at hd 128 |
+| block_m / block_size | **256 / 512** at hd 64; **128 / 256** at hd 128 (and at hd 32) |
 | launcher | `launch_flash_attn_aiw`, **45** params: 14 Pointer, 12 Int32, 16 Int64, 2 Float32, 1 Stream |
 | kernel | `flash_attn_func_aiw_kernel`, **44** params — the launcher minus `stream`, **same names, same order** |
 | kernarg | `.kernarg_segment_size: 300` |
@@ -129,7 +129,7 @@ launcher's closure, **not** from `built.compile`'s.
 
 **Verify** — against the real builder, not a mock:
 ```python
-jf = jit_function_of(built);  len(_launcher_signature(jf).parameters) == 44
+jf = jit_function_of(built);  len(_launcher_signature(jf).parameters) == 45
 kernel_function_of(jf)._known_block_size == [512, 1, 1]     # hd 64
 ```
 and `[256, 1, 1]` at hd 128. Suite still 192/7.
