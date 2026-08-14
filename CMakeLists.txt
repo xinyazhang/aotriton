@@ -350,8 +350,8 @@ endif(ALL_TRITON_SOS)
 # The FlyDSL SOURCE TREE is pinned separately by third_party/flydsl-kernel.txt and
 # shallow-cloned like aiter, because the wheel does not ship `kernels/common`, which the
 # vendored kernels in modules/flash/flyc/ import. Two pins, deliberately independent: the
-# compiler is a released artifact, the kernel sources track the branch the vendored files
-# were synced from.
+# compiler is a released artifact and the kernel sources are a source checkout, and they
+# are allowed to name different versions.
 if(NOT AOTRITON_NOIMAGE_MODE)
   # Sentinel is flydsl/__init__.py, not the bundled-MLIR extension -- that
   # filename carries an LLVM version and would break on the next flydsl bump.
@@ -362,6 +362,52 @@ if(NOT AOTRITON_NOIMAGE_MODE)
     "${CMAKE_CURRENT_LIST_DIR}/third_party/flydsl-compiler.txt"
     VERBATIM)
   add_custom_target(aotriton_venv_flydsl ALL DEPENDS "${AOTRITON_FLYDSL_STAMP}")
+
+  ## Handle flydsl-kernel.txt -- same shape as third_party/aiter.txt, see
+  ## v3src/CMakeLists.txt. Only kernels/common is consumed; the vendored attention
+  ## kernels themselves live in modules/flash/flyc/ and are NOT taken from here.
+  find_package(Git REQUIRED)
+  file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/third_party/flydsl-kernel.txt" FLYDSL_GIT_TAG
+       LIMIT_COUNT 1 ENCODING UTF-8)
+  set(AOTRITON_FLYDSL_KERNEL_ROOT "${CMAKE_CURRENT_BINARY_DIR}/flydsl" CACHE PATH
+      "Root of a FlyDSL source tree supplying kernels/common. Defaults to a shallow clone at the third_party/flydsl-kernel.txt tag; point it at an existing checkout to build against local kernel changes.")
+  if(AOTRITON_FLYDSL_KERNEL_ROOT STREQUAL "${CMAKE_CURRENT_BINARY_DIR}/flydsl")
+    # CAVEAT: MUST USE GIT TAG OTHERWISE --depth 1 --branch WILL NOT WORK
+    if(NOT EXISTS "${AOTRITON_FLYDSL_KERNEL_ROOT}/.git")
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${FLYDSL_GIT_TAG}
+        https://github.com/ROCm/FlyDSL.git flydsl
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    else()
+      # Check current HEAD tag to avoid unnecessary network fetches on every configure
+      execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --exact-match HEAD
+        WORKING_DIRECTORY "${AOTRITON_FLYDSL_KERNEL_ROOT}"
+        RESULT_VARIABLE FLYDSL_DESCRIBE_RESULT
+        OUTPUT_VARIABLE FLYDSL_CURRENT_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+      if(NOT FLYDSL_DESCRIBE_RESULT EQUAL 0 OR NOT FLYDSL_CURRENT_TAG STREQUAL "${FLYDSL_GIT_TAG}")
+        execute_process(
+          COMMAND ${GIT_EXECUTABLE} fetch origin --depth 1 "tag" "${FLYDSL_GIT_TAG}"
+          WORKING_DIRECTORY "${AOTRITON_FLYDSL_KERNEL_ROOT}"
+          COMMAND_ERROR_IS_FATAL ANY)
+        execute_process(
+          COMMAND ${GIT_EXECUTABLE} checkout ${FLYDSL_GIT_TAG}
+          WORKING_DIRECTORY "${AOTRITON_FLYDSL_KERNEL_ROOT}"
+          COMMAND_ERROR_IS_FATAL ANY)
+      endif()
+    endif()
+  else()
+    message(STATUS "[AOTriton] Using existing FlyDSL source tree ${AOTRITON_FLYDSL_KERNEL_ROOT} "
+                   "instead of cloning ${FLYDSL_GIT_TAG}")
+  endif()
+  if(NOT EXISTS "${AOTRITON_FLYDSL_KERNEL_ROOT}/kernels/common")
+    message(FATAL_ERROR "[AOTriton] AOTRITON_FLYDSL_KERNEL_ROOT=${AOTRITON_FLYDSL_KERNEL_ROOT} "
+                        "has no kernels/common. It must be the ROOT of a FlyDSL source tree.")
+  endif()
+  message(STATUS "AOTRITON_FLYDSL_KERNEL_ROOT ${AOTRITON_FLYDSL_KERNEL_ROOT}")
 endif()
 
 add_subdirectory(v3src)
