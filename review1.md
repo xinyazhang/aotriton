@@ -18,7 +18,7 @@
 
 | task | state |
 |---|---|
-| 0a shared helpers from the package | **blocked on you** — needs FlyDSL to ship `kernels/common` in the wheel. Running on the interim: `AOTRITON_FLYDSL_ROOT` points `sys.path` at the FlyDSL checkout. |
+| 0a shared helpers | **RESOLVED.** Two pins: `flydsl-compiler.txt` (wheel) and `flydsl-kernel.txt` (git tag `v0.3.1`, shallow-cloned by CMake). WMMA helpers, absent from the tag, come from `flyc_polyfill.py`. |
 | 0b `flyc_polyfill.py` | done, merged |
 | 0c `ir/` reorganised by language | done, merged. Gate green: 192 passed / 7 skipped both before (`8d24bd8`) and after. |
 | 1 vendor the kernel | done, merged. The 2 verbatim files are byte-identical to upstream; the other 3 differ only by the documented import rewrites. |
@@ -81,9 +81,10 @@ is the clean fix, and is the minimal form of PLAN.md open question 2. Either:
 - `pytest` + an **editable** `aotriton` are installed. The editable install points at the
   main checkout, so anything run from a git worktree silently tests the *main* tree unless
   `PYTHONPATH` is shadowed. This nearly produced a false green twice.
-- `AOTRITON_FLYDSL_ROOT=/home/xinyazha/dockerhome/meff/FlyDSL` must be set for every
-  `flyc_compile` run until 0a lands. There is no fallback (the old `third_party/flydsl`
-  fallback died when 2.5 chose a pinned wheel over a submodule).
+- `AOTRITON_FLYDSL_KERNEL_ROOT=<FlyDSL source root>` must be set for every
+  `flyc_compile` run. CMake sets it to the `third_party/flydsl-kernel.txt` clone; set it
+  by hand for a direct run. There is no fallback (the old `third_party/flydsl` fallback
+  died when 2.5 chose a pinned wheel over a submodule).
 - ~~No HIP toolchain here~~ — wrong diagnosis, see "CMake unblocked" above. ROCm was
   installed and fine; the block was `/opt/rocm` hardcoded in the pre-#207 `CMakeLists.txt`.
 - Every cmake invocation here needs three things set:
@@ -203,8 +204,13 @@ an edit-rebuild loop. Details and a suggested fix are in PLAN-PHASE1.md's Gate 7
 
 Still outstanding, unchanged:
 
-- **0a** — needs FlyDSL to ship `kernels/common` in the wheel. Until then every
-  `flyc_compile` run needs `AOTRITON_FLYDSL_ROOT`.
+- **0a is done.** `third_party/flydsl-kernel.txt` pins `v0.3.1` and CMake shallow-clones
+  it (9.6 MB); `AOTRITON_FLYDSL_KERNEL_ROOT` is a cache PATH, so pointing it at a checkout
+  skips the clone. The tag has no `mma/wmma_ops.py` — it is MFMA-only, this is a WMMA
+  kernel — so those helpers come from `flyc_polyfill.py`, which already held exactly the
+  six fallbacks and was dead code until now. Byte-identical against both the released tag
+  and the feature branch. Everything still collapses the day the wheel ships
+  `flydsl.kernels.common`.
 - the `num_seqlens`/`batch_size` context helpers want checking against `flyc_varlen_bits`
   for the `<0` padded case.
 - `jit_function_of`'s closure walk is the documented interim. One line upstream
