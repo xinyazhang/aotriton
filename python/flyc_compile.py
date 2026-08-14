@@ -16,7 +16,7 @@ Invoked as `python -m aotriton.flyc_compile`:
 
 **Kernel-agnostic by construction.** This module drives *any*
 `@ati.flyc.kernel` description through `fn.__ati_node__` (`module_path`,
-`hints()`) and the plain `fn(functional, hints) -> built` call — it does not
+`hints()`) and the plain `fn(choices, hints) -> built` call — it does not
 import a specific kernel family's tuning module, and nothing here names a
 specific kernel. It enters at the `@flyc.jit` `JitFunction` the description's
 builder produced (`jit_function_of`), synthesises typed dummy arguments from
@@ -83,32 +83,6 @@ def parse():
         help="Skip ELF verification.",
     )
     return parser.parse_args()
-
-
-class _Choices:
-    """Attribute view over the parsed `--signature` dict.
-
-    Mirrors `ir.Functional.choices` well enough for a description body to read
-    `f.choices.NAME` without caring whether `f` is this stand-in or the real
-    linked IR object.
-    """
-
-    def __init__(self, values: dict):
-        self.__dict__.update(values)
-
-
-class _FunctionalStandIn:
-    """Phase 1 stand-in for `ir.Functional`: `.arch` and `.choices.<NAME>` only.
-
-    The driver runs in a separate process from the generator and has no
-    linked IR to hand a description body, so this exposes the same attribute
-    surface a description already reads from the real `ir.Functional` --
-    Phase 2 can pass the genuine object with no change to any description.
-    """
-
-    def __init__(self, arch: str, choices: dict):
-        self.arch = arch
-        self.choices = _Choices(choices)
 
 
 def _build_hints(node, hints_str: str):
@@ -553,14 +527,19 @@ def do_compile(args):
     if kernel_dir not in sys.path:
         sys.path.insert(0, kernel_dir)
 
-    functional = _FunctionalStandIn(args.target, parse_kv(args.signature, sep=' '))
+    # `choices` is the plain dict parsed from `--signature`: `{name: literal}`,
+    # nothing else, no fabricated `Functional`. The driver runs in a separate
+    # process from the generator and has no linked IR to hand the body, and a
+    # stand-in exposing `.arch` / `.choices.<NAME>` would drift silently the
+    # moment a description reads a third attribute -- a plain dict cannot.
+    choices = parse_kv(args.signature, sep=' ')
     hints = _build_hints(node, args.hints)
     # The description body returns (built, sidecar): `built` is the FlyDSL
     # builder's result (driven to a code object below); `sidecar` is a
     # JSON-serialisable dict of whatever it wants recorded alongside the hsaco
     # (for flyc_attn_fwd, asdict(knobs) -- including block_m). The driver stays
     # kernel-agnostic: it serialises the dict without knowing what is in it.
-    built, sidecar = fn(functional, hints)
+    built, sidecar = fn(choices, hints)
 
     jf = jit_function_of(built)
     launch_args = synthesise_args(jf)

@@ -36,10 +36,11 @@ Three consequences, each handled below:
 
 2. **No functional axes are declared here.** They belong to the operator (owned by
    the default triton backend); this backend inherits them and narrows with
-   `@ati.disable`, exactly as `aiter_fwd.py` does. `flyc_build` then reads
-   `f.choices.*` — the OPERATOR's choices — and maps them to builder knobs. This is
-   also why the axes cannot be re-declared as `@ati.scalar`: they are not arguments
-   of the flyc kernel at all, they are build-time Python values.
+   `@ati.disable`, exactly as `aiter_fwd.py` does. `flyc_attn_fwd` then reads
+   `choices['NAME']` — the OPERATOR's choices, parsed from `--signature` text by
+   the driver — and maps them to builder knobs. This is also why the axes cannot
+   be re-declared as `@ati.scalar`: they are not arguments of the flyc kernel at
+   all, they are build-time Python values.
 
 3. **The kernarg list is declared, because nothing else can supply it.** aiter hands
    the params struct to a C++ cookie and never names a kernarg; triton gets its list
@@ -269,8 +270,9 @@ def _flyc_fwd_disabled(f):
 # the JSON sidecar folded into the compiled-in metadata is the obvious candidate.
 @ati.flyc.hints(FlycFwdHints)
 @ati.flyc.kernel('../flyc/flash_attn_func_gfx1201_aiw.py')
-def flyc_attn_fwd(f, hints):
-    """Build one hsaco for functional `f`, optimized for `hints`.
+def flyc_attn_fwd(choices, hints):
+    """Build one hsaco for the functional described by `choices`, optimized
+    for `hints`.
 
     Executed by `aotriton.flyc_compile` at build time, in a venv that has flydsl —
     never by the generator, which only reads the decorators above. Returns
@@ -285,13 +287,27 @@ def flyc_attn_fwd(f, hints):
 
     TWO objects, because they are two kinds of fact (PLAN.md 6.9):
 
-      f      what the kernel must SUPPORT. The compile-time identity: enumerable,
-             godel-keyed, arch-aware. Everything here is an ATI axis.
-      hints  what the kernel should be OPTIMIZED FOR. Declared by
-             `@ati.flyc.hints` above. Not axes, and deliberately so — `seqlen_q` is a
-             tune BINNING dimension (`@ati.tune.binning(Max_seqlen_q=...)`), and
-             promoting it to an axis would multiply the functional space and the
-             godel numbering for every backend in order to serve one.
+      choices  what the kernel must SUPPORT: `{name: literal}`, parsed straight
+               from `--signature` text. The compile-time identity, in the one
+               vocabulary that genuinely round-trips through the driver, which
+               runs in a separate process from the generator and has no linked
+               IR to hand this function a real `ir.Functional`. Everything
+               here is an ATI axis; nothing else -- see `jit2aot.md`
+               "Correction 2" for why this is a plain dict rather than a
+               `Functional` stand-in.
+      hints    what the kernel should be OPTIMIZED FOR. Declared by
+               `@ati.flyc.hints` above. Not axes, and deliberately so —
+               `seqlen_q` is a tune BINNING dimension
+               (`@ati.tune.binning(Max_seqlen_q=...)`), and promoting it to an
+               axis would multiply the functional space and the godel
+               numbering for every backend in order to serve one.
+
+    Deliberate asymmetry with `_flyc_fwd_disabled` above, which takes a real
+    `ir.Functional` and reads `f.arch`: disable predicates run
+    GENERATOR-side, where the linked IR exists; this function runs DRIVER-side,
+    where only `--signature` text exists. `choices` is not a `Functional` and
+    must not grow into one -- if a build body ever needs arch, it arrives as an
+    explicit third parameter from `--target`, not smuggled into `choices`.
 
     Today `resolve_knobs` reads no field of `hints` — FlyDSL's tuner is currently
     seqlen-independent, so the count stays at one per functional and every field sits
@@ -307,7 +323,7 @@ def flyc_attn_fwd(f, hints):
     from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
     from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
 
-    tile = f.choices.BLOCK_DMODEL
+    tile = choices['BLOCK_DMODEL']
     meta = FmhaInputMetadata(
         # `num_heads` reaches the emitted kernel ONLY through STRIDE_TOKEN, which is
         # read exclusively under STRIDES_CONSTEXPR — a dense-only diagnostic arm the
@@ -319,16 +335,16 @@ def flyc_attn_fwd(f, hints):
         # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
         # 2 bottom-right / 3 window), and the kernel only ever emits {0, 3} — the
         # same pair the operator's CAUSAL_TYPE axis offers. 1:1, no mapping.
-        causal=f.choices.CAUSAL_TYPE != 0,
-        causal_type=f.choices.CAUSAL_TYPE,
-        dtype_str='bf16' if '*bf16' in f.choices.Q else 'f16',
-        bias=bool(f.choices.BIAS_TYPE),
-        dropout=bool(f.choices.ENABLE_DROPOUT),
+        causal=choices['CAUSAL_TYPE'] != 0,
+        causal_type=choices['CAUSAL_TYPE'],
+        dtype_str='bf16' if '*bf16' in choices['Q'] else 'f16',
+        bias=bool(choices['BIAS_TYPE']),
+        dropout=bool(choices['ENABLE_DROPOUT']),
     )
-    # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with f.BLOCK_DMODEL
+    # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with choices['BLOCK_DMODEL']
     knobs = resolve_knobs(meta, FmhaKnobs(
         block_dmodel=tile,
-        padded_head=f.choices.PADDED_HEAD,
+        padded_head=choices['PADDED_HEAD'],
         # AOT cannot bake strides: one binary must serve every layout. This is also
         # what makes `num_heads` above irrelevant to the emitted code.
         strides_constexpr=False,
