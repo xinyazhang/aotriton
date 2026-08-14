@@ -165,40 +165,48 @@ def ensure_flydsl_importable() -> bool:
 
 
 def _find_flydsl_checkout_root() -> Path:
-    """Locate the FlyDSL checkout that has ``kernels/common`` (Task 0 interim).
+    """Locate the FlyDSL source tree that has ``kernels/common``.
 
-    ``AOTRITON_FLYDSL_ROOT``, which is REQUIRED -- there is no default. Raises
-    ``RuntimeError`` if it is unset, or if ``kernels/common`` is not found
-    under it. This function -- and the ``sys.path`` insertion in ``setup()``
-    that uses it -- goes away the day ``kernels.common`` ships inside the
-    ``flydsl`` wheel; see this module's docstring.
+    ``AOTRITON_FLYDSL_KERNEL_ROOT``, which is REQUIRED -- there is no default.
+    Raises ``RuntimeError`` if it is unset, or if ``kernels/common`` is not
+    found under it.
+
+    FlyDSL enters this build twice, and the two pins are independent:
+
+    * ``third_party/flydsl-compiler.txt`` -- the pip pin for the *compiler*
+      (``flydsl==0.3.1``), installed into the build venv.
+    * ``third_party/flydsl-kernel.txt`` -- the git ref for the *source tree*,
+      shallow-cloned like ``third_party/aiter.txt``, which is what this
+      function points at. The wheel does not ship ``kernels/common``, and the
+      vendored kernels in ``modules/flash/flyc/`` import it verbatim.
 
     There used to be a ``<repo>/third_party/flydsl`` fallback here, from when
-    FlyDSL was expected to be a submodule. Task 2.5 pinned a wheel instead
-    (``third_party/flydsl.txt``), so that directory is never created and the
-    fallback could only ever fail -- and it failed *misleadingly*: with the
-    ``aotriton`` package installed non-editably into the build venv, as CMake
-    installs it, ``__file__`` sits in site-packages, so the message advertised
-    a path like ``<site-packages>/third_party/flydsl`` and invited the reader
-    to go looking for a repo that is not there.
+    FlyDSL was expected to be a submodule. Task 2.5 pinned a wheel instead, so
+    that directory is never created and the fallback could only ever fail --
+    and it failed *misleadingly*: with the ``aotriton`` package installed
+    non-editably into the build venv, as CMake installs it, ``__file__`` sits
+    in site-packages, so the message advertised a path like
+    ``<site-packages>/third_party/flydsl`` and invited the reader to go
+    looking for a repo that is not there.
     """
-    env_root = os.environ.get('AOTRITON_FLYDSL_ROOT')
+    env_root = os.environ.get('AOTRITON_FLYDSL_KERNEL_ROOT')
     if not env_root:
         raise RuntimeError(
-            "_find_flydsl_checkout_root: AOTRITON_FLYDSL_ROOT is not set, and "
-            "there is no default -- FlyDSL is a pinned wheel "
-            "(third_party/flydsl.txt), not a checkout in this tree. The wheel "
-            "does not yet ship 'kernels/common', which the vendored kernels "
-            "import, so point AOTRITON_FLYDSL_ROOT at a FlyDSL checkout that "
-            "has it. This requirement disappears once the wheel ships it."
+            "_find_flydsl_checkout_root: AOTRITON_FLYDSL_KERNEL_ROOT is not "
+            "set, and there is no default. It must point at the root of a "
+            "FlyDSL source tree -- the build clones one per "
+            "third_party/flydsl-kernel.txt. The compiler wheel pinned by "
+            "third_party/flydsl-compiler.txt does not ship 'kernels/common', "
+            "which the vendored kernels import, so the source tree is a "
+            "separate requirement from the wheel."
         )
 
     root = Path(env_root)
     if not (root / 'kernels' / 'common').is_dir():
         raise RuntimeError(
             f"_find_flydsl_checkout_root: 'kernels/common' not found under "
-            f"{root} (from AOTRITON_FLYDSL_ROOT). Point it at a FlyDSL "
-            f"checkout that has it."
+            f"{root} (from AOTRITON_FLYDSL_KERNEL_ROOT). It must be the ROOT "
+            f"of a FlyDSL source tree, not its kernels/ subdirectory."
         )
     return root
 
