@@ -23,7 +23,7 @@
 | 0c `ir/` reorganised by language | done, merged. Gate green: 192 passed / 7 skipped both before (`8d24bd8`) and after. |
 | 1 vendor the kernel | done, merged. The 2 verbatim files are byte-identical to upstream; the other 3 differ only by the documented import rewrites. |
 | 2 `flyc_bootstrap.py` | done, merged |
-| 2.5 flydsl in the build venv | done, merged. **Gate partly unverified** — `cmake` dies at `CMakeLists.txt:101` `find_package(hip REQUIRED)`; no HIP toolchain in this container. |
+| 2.5 flydsl in the build venv | done, merged. **Gate now FULLY verified** — see "CMake unblocked" below. The old `find_package(hip REQUIRED)` failure was upstream #207, fixed by rebasing. |
 | 3 `flyc_compile.py` | done, merged. Then **rewritten** by `jit2aot-exec.md` steps 1-6 (`4731404`..`1ea44e5`) — see below. |
 | 4 `ati.flyc.*` + `ir/flyc/` | done, merged. **Gate 3 verified independently**: 13496-byte ELF, `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0`, sidecar `block_m=256` / `block_size=512`; 12/12 sweep. |
 | 5 generator emits `Fly.compile` | **not started** |
@@ -84,7 +84,11 @@ is the clean fix, and is the minimal form of PLAN.md open question 2. Either:
 - `AOTRITON_FLYDSL_ROOT=/home/xinyazha/dockerhome/meff/FlyDSL` must be set for every
   `flyc_compile` run until 0a lands. There is no fallback (the old `third_party/flydsl`
   fallback died when 2.5 chose a pinned wheel over a submodule).
-- No HIP toolchain here, so Tasks 6 and 7 cannot be gate-verified in this container.
+- ~~No HIP toolchain here~~ — wrong diagnosis, see "CMake unblocked" above. ROCm was
+  installed and fine; the block was `/opt/rocm` hardcoded in the pre-#207 `CMakeLists.txt`.
+- Every cmake invocation here needs three things set:
+  `ROCM_PATH=$(rocm-sdk path --root)`, `PIP_NO_INDEX=1`, and
+  `PIP_FIND_LINKS=~/.cache/aotriton-wheelhouse`.
 
 ### jit2aot steps 1-6: done and merged
 
@@ -120,11 +124,49 @@ the editable install could not serve the main tree:
 Two stale numbers in `jit2aot-exec.md` were found by the agent and corrected in `5cc0e51`
 (a `44` that should have been `45`, and an ambiguous `block_m`/`block_size` shorthand).
 
+### CMake unblocked: rebased onto upstream/main (#207)
+
+`find_package(hip REQUIRED)` was not a missing toolchain and not a missing `ROCM_PATH`
+alone — the old `CMakeLists.txt` hardcoded `/opt/rocm` into `CMAKE_PREFIX_PATH` with no
+override, so your venv ROCm was unreachable whatever the environment said. #207 replaces
+it with `$ENV{ROCM_PATH}/lib/cmake`. Rebased: 52 commits onto `5d3ffed0`, **no
+conflicts**; only `CMakeLists.txt` and `docs/AltWheelExample.yaml` were touched by both
+sides, in disjoint regions. Verified the rebase introduced exactly #207 and nothing else
+by diffing `prerebase-flydsl-backup..HEAD` against `209d484..upstream/main` — identical.
+Backup tag `prerebase-flydsl-backup` still exists; **not pushed** (rebase makes it a
+force-push, your call).
+
+With `ROCM_PATH=$(rocm-sdk path --root)`: hip 7.14.60850 found, configure clean in both
+image and noimage mode, **Gate 2.5 fully passed**, and the CMake-built venv's own python
+emits the byte-identical hsaco. Details and the offline recipe are in PLAN-PHASE1.md's
+Gate 2.5 section rather than here, since they belong with the task.
+
+The one gotcha worth repeating: `rocm-sdk path --root` → `_rocm_sdk_devel` is the only
+directory with **both** `lib/cmake/hip` and `llvm/bin/ld.lld`. `flyc_bootstrap`'s
+candidate 3 (`_rocm_sdk_core/lib`) has the linker but no cmake config, so the two
+resolutions are not interchangeable. They live in different scopes today (configure-time
+env vs driver process), but that is luck, not design.
+
+**Your pip cache did the job** — 1.2 GB of it, holding the wheels from your earlier
+installs. Reconstructed a wheelhouse (trimmed to 103 MB) at
+`~/.cache/aotriton-wheelhouse`, driven with `PIP_NO_INDEX=1 PIP_FIND_LINKS=...`. All ten
+`requirements.txt` entries plus `flydsl==0.3.1` recovered. `triton` is not in the cache,
+so image *builds* remain blocked — but image-mode *configure* does not need it, which is
+what let Gate 2.5 pass.
+
+Also fixed while gating: `flyc_bootstrap`'s dead `<repo>/third_party/flydsl` fallback
+(`1a0b182c`). PLAN-PHASE1.md:376 already said the variable is required with no fallback;
+the code had drifted, and the stale default produced a *misleading* error under a
+non-editable install — it advertised `<site-packages>/third_party/flydsl`.
+
 ### Where to continue
 
-Tasks 5 → 6 → 7. Task 5 (generator emits `Fly.compile`) is verifiable here; 6 and 7 need
-a machine that can `cmake` configure — this container dies at `find_package(hip REQUIRED)`,
-so they can be written but not gated.
+Tasks 5 → 6 → 7. Task 5 (generator emits `Fly.compile`) is verifiable here. Tasks 6 and 7
+are now **partly** gateable, which they were not this morning: `cmake` configures in image
+mode, so a generated rule loop can be inspected and the flyc targets built. What still
+cannot run is anything requiring triton — so a full `ninja` of all images stays out of
+reach, and Task 7's aks2/flatzip output can only be checked for the flyc kernels, not for
+a complete `aotriton.images` tree.
 
 Still outstanding, unchanged:
 

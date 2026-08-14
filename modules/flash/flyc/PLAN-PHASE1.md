@@ -545,6 +545,49 @@ No submodule and no `.gitmodules` change.
 `python -c "import torch"` still fails. Configure with `-DAOTRITON_NOIMAGE_MODE=ON` and
 confirm the target is absent.
 
+**Status: PASSED.** All four assertions verified — configure clean, target builds,
+`flydsl 0.3.1` present, `import torch` still `ModuleNotFoundError`, and the target is
+absent from `ninja -t targets` under `-DAOTRITON_NOIMAGE_MODE=ON`. Rebuilding is a no-op
+(`ninja: no work to do`), so the `flydsl/__init__.py` sentinel works. Beyond the gate: the
+CMake-built venv's own python cross-compiles the kernel to the byte-identical
+13496-byte hsaco (`1821491bae4d1ca3c2f1`), which is the whole Phase 1 chain end to end.
+
+Two environment facts this gate depended on, neither obvious:
+
+1. **`find_package(hip REQUIRED)` needs upstream #207.** Before it, `CMakeLists.txt`
+   hardcoded `list(APPEND CMAKE_PREFIX_PATH "/opt/rocm")` with no override, so a
+   venv-based ROCm was unreachable no matter what `ROCM_PATH` said. #207 uses
+   `$ENV{ROCM_PATH}/lib/cmake` instead. Set `ROCM_PATH=$(rocm-sdk path --root)`, which
+   resolves to `_rocm_sdk_devel` — the one directory carrying **both** `lib/cmake/hip`
+   (for CMake) and `llvm/bin/ld.lld` (for `flyc_bootstrap`). Note `flyc_bootstrap`'s
+   candidate 3, `_rocm_sdk_core/lib`, satisfies the linker but has **no** `lib/cmake`, so
+   the two resolutions are not interchangeable even though both "work".
+2. **Image mode configures without triton.** Triton is an `add_custom_command`, i.e. a
+   build-time rule, so `ninja aotriton_venv_flydsl` can be built on its own without
+   triton present. `-DAOTRITON_NOIMAGE_MODE=ON` is NOT a way to gate this task, since
+   the flydsl target lives under `if(NOT AOTRITON_NOIMAGE_MODE)`.
+
+### Gating this offline (no PyPI route)
+
+`pip install -r requirements.txt` hangs and the `aotriton` install fails with
+`setuptools>=64 (from versions: none)`. `-DAOTRITON_INHERIT_SYSTEM_SITE_TRITON=ON` does not
+help: `python -m venv` bases off the *real* interpreter, so `pyvenv.cfg` reads
+`home = /usr/bin` and the build venv inherits the bare system python's site-packages, not
+those of whatever venv invoked cmake.
+
+What works is pip's own HTTP cache, which holds the wheels from earlier installs.
+Reconstruct a wheelhouse from it (each cached `.body` that is a zip with a
+`*.dist-info/WHEEL` is a wheel; rebuild the filename from the dist-info stem plus the
+`Tag:` lines), then:
+
+```
+ROCM_PATH=$(rocm-sdk path --root) PIP_NO_INDEX=1 PIP_FIND_LINKS=<wheelhouse> cmake ...
+```
+
+All ten `requirements.txt` entries plus `flydsl==0.3.1` are recoverable this way (~103 MB
+trimmed). `triton` is **not** in the cache and is not recoverable — image *builds*, as
+opposed to image-mode configures, stay blocked until it is available.
+
 ## Task 3 — `python/flyc_compile.py`
 
 The FlyDSL analogue of `python/compile.py`, invoked as `python -m aotriton.flyc_compile`.
