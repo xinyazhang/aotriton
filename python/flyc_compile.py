@@ -18,10 +18,10 @@ Invoked as `python -m aotriton.flyc_compile`:
 `@ati.flyc.kernel` description through `fn.__ati_node__` (`module_path`,
 `hints()`) and the plain `fn(functional, hints) -> built` call — it does not
 import a specific kernel family's tuning module, and nothing here names a
-specific kernel. The one deliberate exception is `_trace_fmha_launch`, which
-knows the FlyDSL-attention ABI (`fmha_abi_gfx1201.run_compiled`, the launcher's
-positional argument shape); see its docstring for why that one function is not
-yet generic and what would make it so.
+specific kernel. It enters at the `@flyc.jit` `JitFunction` the description's
+builder produced (`jit_function_of`), synthesises typed dummy arguments from
+the launcher's own signature (`synthesise_args`) and calls it directly — no
+host marshalling, no fabricated tensors, no kernel-specific shapes.
 """
 
 import dataclasses
@@ -249,11 +249,6 @@ class FakeTensor:
         return 0
 
 
-# One fixed BHSD shape for every functional: `FakeTensor`'s docstring above
-# explains why the actual numbers do not matter to the compiled artifact.
-_FAKE_SHAPE = (1, 1, 128, 64)
-
-
 def _operand_for(param, desc=None):
     """The AOT value for one launcher parameter, derived from its annotation
     alone -- the whole of this driver's kernel knowledge.
@@ -434,59 +429,6 @@ def kernel_function_of(jf):
     return _find_unique(jf.func, KernelFunction)
 
 
-def _trace_fmha_launch(built, functional):
-    """Trace `built` (the FlyDSL-attention launcher) and return `(jf, args)`.
-
-    **Not kernel-agnostic** -- the one place in this driver that is not.
-    `built` is a plain Python closure (`_launch` in
-    `flash_attn_func_gfx1201_aiw.py`); nothing about the `@ati.flyc.kernel`
-    contract exposes the compiled `JitFunction` it closes over or the launch
-    argument shape it expects, so this recovers both the FlyDSL-attention way:
-    monkeypatch `fmha_abi_gfx1201.run_compiled` (the function every such
-    launcher calls to dispatch) to record its arguments instead of compiling,
-    then call `built` with `FakeTensor` operands.
-
-    The real fix is an upstream AOT entry point that returns `(jf, args)`
-    directly, not a cleverer driver (`PLAN.md` open question 2). Until then,
-    isolating the FlyDSL-attention specifics here is what keeps everything
-    else in this file usable by a future non-attention `@ati.flyc.kernel`.
-    """
-    import fmha_abi_gfx1201 as abi
-
-    cap = {}
-    abi.run_compiled = lambda cache, exe, *a: cap.update(exe=exe, args=a)
-
-    q = FakeTensor(_FAKE_SHAPE)
-    k = FakeTensor(_FAKE_SHAPE)
-    v = FakeTensor(_FAKE_SHAPE)
-    o = FakeTensor(_FAKE_SHAPE)
-    batch_size, seqlen_q = _FAKE_SHAPE[0], _FAKE_SHAPE[2]
-
-    # CAUSAL_TYPE=3 (generalized sliding-window) has no sentinel window
-    # (`fmha_abi_gfx1201.CAUSAL_SENTINEL` only covers 1/2) and
-    # `abi.resolve_window` raises unless the caller supplies an explicit
-    # `window=(left, right)`. window_left/window_right are runtime kernel
-    # arguments (fx.Int32), not baked into the compiled artifact, so any
-    # valid bound traces the same ELF; `(seqlen_q, 0)` -- top-left causal --
-    # is the arbitrary-but-valid choice, matching what the ValueError itself
-    # suggests.
-    causal_type = getattr(functional.choices, 'CAUSAL_TYPE', 0)
-    window = (seqlen_q, 0) if causal_type == 3 else None
-
-    # philox_seed=None: `u64_scalar` short-circuits on None rather than
-    # allocating a torch tensor, which the build venv must never do
-    # (CMakeLists.txt:142) and which this driver has no device for anyway.
-    built(q, k, v, o, batch_size, seqlen_q, window=window, philox_seed=None)
-    if 'exe' in cap:
-        synthesise_args(cap['exe'])  # raises on an unsupported operand annotation
-    if 'exe' not in cap:
-        raise RuntimeError(
-            "_trace_fmha_launch: built(...) never reached fmha_abi_gfx1201.run_compiled; "
-            "is this description's builder still the FlyDSL-attention launcher shape?"
-        )
-    return cap['exe'], cap['args']
-
-
 def _extract_block_size(source_ir: str):
     """Recover BLOCK_SIZE from the PRE-LOWERING IR's `gpu.func` `known_block_size`
     attribute (`array<i32: N, 1, 1>`; N is BLOCK_SIZE).
@@ -620,7 +562,8 @@ def do_compile(args):
     # kernel-agnostic: it serialises the dict without knowing what is in it.
     built, sidecar = fn(functional, hints)
 
-    jf, launch_args = _trace_fmha_launch(built, functional)
+    jf = jit_function_of(built)
+    launch_args = synthesise_args(jf)
     jf(*launch_args)  # COMPILE_ONLY=1 -> traces and compiles, returns None, launches nothing
     hsaco = _extract_hsaco(jf)
     block_size = _extract_block_size(jf._last_compiled[1]._source_ir)
