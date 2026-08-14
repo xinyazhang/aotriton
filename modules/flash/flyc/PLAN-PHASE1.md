@@ -1263,6 +1263,26 @@ aggregate target, per-cluster rebuilds would cost their ~17 kernels rather than 
 The FIXME at line 224 about `AOTRITON_HSACO_RECORD` being duplicated from `Bare.compile`
 is adjacent to this.
 
+**`-DAOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON` sidesteps the cost while iterating.** It
+empties the three `Bare.*` rule reads (compile, cluster, flatzip) so the Triton image
+pipeline contributes nothing, leaving the flyc rules Tasks 6/7 add as the only image work.
+Measured: 47766/3678/14 hsaco/aks2/zip rules become 0/0/0, and
+`ninja aotriton_v2_compile aotriton_v3_aks2 aotriton_kernel_storage_v3` finishes in
+0.024 s instead of hours. The Triton *wheel* is still installed — that part is cheap once
+the wheel exists, and `aotriton_venv_triton` is untouched.
+
+The result is deliberately an incomplete image set (configure prints a warning saying so),
+so it validates that flyc rules are *emitted and run*, not that a shippable
+`aotriton.images` tree was produced. Gate 7 proper still needs one full build with the
+option off.
+
+**Design input for 7b/7c from this:** the option can only be this clean while every
+`Bare.*` file is Triton-only. Task 7 currently plans to fold flyc rows *into*
+`Bare.flatzip`, which would make the Triton and flyc pipelines inseparable — skipping
+Triton would then also skip flyc zips, i.e. exactly the thing this option exists to keep
+working. Prefer a separate `Fly.flatzip` alongside `Fly.cluster`, matching how
+`Affine.cluster` already stays separate.
+
 ## Definition of done
 
 1. `modules/flash/flyc/` holds exactly 5 vendored `.py` files plus the authored
