@@ -177,7 +177,28 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   message("Bare.compile: ${AOTRITON_V2_BUILD_DIR}/Bare.compile")
   message("Bare.cluster: ${AOTRITON_V2_BUILD_DIR}/Bare.cluster")
   set(AOTRITON_HSACO_RECORD "${AOTRITON_V2_BUILD_DIR}/Bare.targets")
-  file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.compile" HSACO_RULES ENCODING UTF-8)
+
+  # Read one Bare.* rule file, or yield nothing when the Triton image pipeline is
+  # switched off for debugging. Applied at all three Bare.* reads (compile, cluster,
+  # flatzip) so the aggregate targets below end up with no Triton inputs rather than
+  # with rules whose hsacos were never built.
+  macro(READ_TRITON_RULES VAR RULE_FILE)
+    if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
+      set(${VAR} "")
+    else()
+      file(STRINGS "${RULE_FILE}" ${VAR} ENCODING UTF-8)
+    endif()
+  endmacro()
+
+  if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
+    message(WARNING
+      "[AOTriton] AOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON: no Triton kernel images "
+      "will be built, so aotriton.images is INCOMPLETE and the resulting library "
+      "cannot serve any Triton-backed operator at runtime. Debugging aid for "
+      "iterating on other backends; never ship the result.")
+  endif()
+
+  READ_TRITON_RULES(HSACO_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.compile")
   list(LENGTH HSACO_RULES NUM_HSACO_RULES)
   message("Bare.compile ${NUM_HSACO_RULES} rules read")
 
@@ -265,7 +286,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
       list(APPEND ALL_AKS2 "${AKS2}")
     endforeach(RULE)
   endmacro()
-  file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.cluster" CLUSTER_RULES ENCODING UTF-8)
+  READ_TRITON_RULES(CLUSTER_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.cluster")
   set(AKS2_OPTIONS "")
   ADD_FROM_CLUSTER_RULES()
   # Affine kernels: emit AKS2 blobs to the intermediate aks2/ tree (same as Bare),
@@ -309,7 +330,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   # ZIP is STORED (no compression) so entries are readable via lseek+read at fixed offsets.
   set(ALL_ZIPS "")
   if(EXISTS "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip")
-    file(STRINGS "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip" FLATZIP_RULES ENCODING UTF-8)
+    READ_TRITON_RULES(FLATZIP_RULES "${AOTRITON_V2_BUILD_DIR}/Bare.flatzip")
     foreach(RULE IN LISTS FLATZIP_RULES)
       list(POP_FRONT RULE DIR_ARCH)
       list(POP_FRONT RULE DIR_FAMILY)
