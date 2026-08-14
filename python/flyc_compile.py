@@ -293,6 +293,122 @@ def _assert_supported_operands(jf):
     )
 
 
+class _AmbiguousObject(Exception):
+    """Raised by `_find_unique` when a closure/container walk finds zero or
+    several instances of the wanted class instead of exactly one."""
+
+    def __init__(self, obj, cls, found):
+        self.obj = obj
+        self.cls = cls
+        self.found = found
+        super().__init__(
+            f"expected exactly one {cls.__name__}, found {len(found)} while "
+            f"searching {obj!r}"
+        )
+
+
+def _find_unique(obj, cls):
+    """The one search both `jit_function_of` and `kernel_function_of` need:
+    find the single instance of `cls` reachable from `obj`.
+
+    `obj` is either a plain closure (the common shape for a FlyDSL builder's
+    returned wrapper, or a `@flyc.jit` launcher's own function object) or a
+    tuple / list / dict of candidates (`pa_decode_swa.compile_pa_decode_sw_reduce`
+    returns `{'launch': jit, 'kernel': kernel}`; `moe_sorting_kernel` returns a
+    9-tuple of launches). Collect matches by identity and return the single
+    one; raise `_AmbiguousObject` naming how many were found otherwise -- see
+    that exception's callers for what "several" means in each case.
+    """
+    if isinstance(obj, dict):
+        candidates = list(obj.values())
+    elif isinstance(obj, (tuple, list)):
+        candidates = list(obj)
+    elif getattr(obj, '__closure__', None):
+        candidates = [c.cell_contents for c in obj.__closure__]
+    else:
+        candidates = []
+
+    found = []
+    seen_ids = set()
+    for item in candidates:
+        if isinstance(item, cls) and id(item) not in seen_ids:
+            seen_ids.add(id(item))
+            found.append(item)
+
+    if len(found) != 1:
+        raise _AmbiguousObject(obj, cls, found)
+    return found[0]
+
+
+def jit_function_of(built):
+    """Recover the `@flyc.jit` `JitFunction` a description's builder produced.
+
+    1. `built` already IS the `JitFunction` -- the common case, 47 of 69
+       builders in the FlyDSL tree return their `@flyc.jit` directly.
+    2. Otherwise it is a wrapper closing over exactly one `JitFunction` -- the
+       gfx1201 `_launch` host wrapper is this shape, and the ABI alignment
+       (Step 0) did not change that: the `JitFunction` still lives in the
+       closure shared by `_launch` and its `.compile` attribute (both are
+       nested functions of the same builder, so they close over the same
+       cells).
+    3. Zero or several is a multi-kernel builder (3 known in the FlyDSL tree:
+       `custom_all_reduce_kernel.make_allreduce_kernels`,
+       `moe_sorting_kernel._compile_moe_sorting_multiphase`,
+       `flash_attn_gfx950.build_flash_attn_dualwave_swp_module`). One builder,
+       several hsacos, is a plural contract (`jit_functions_of`) this driver
+       does not have -- raise rather than guess which one to pick.
+    """
+    from flydsl.compiler.jit_function import JitFunction
+
+    if isinstance(built, JitFunction):
+        return built
+    try:
+        return _find_unique(built, JitFunction)
+    except _AmbiguousObject as e:
+        if not e.found:
+            raise RuntimeError(
+                f"jit_function_of: no JitFunction reachable from {built!r}. "
+                "The closure walk is the fragile part of this driver (see "
+                "jit2aot-exec.md); do not broaden the search to make this "
+                "pass -- report it, the fix is upstream in FlyDSL."
+            ) from e
+        raise RuntimeError(
+            f"jit_function_of: found {len(e.found)} JitFunctions reachable "
+            f"from {built!r}. That is a multi-kernel builder (one builder, "
+            "several hsacos) -- out of scope for this driver, which drives "
+            "one JitFunction per description. Needs a plural contract "
+            "(jit_functions_of), not a guess at which one to pick."
+        ) from e
+
+
+def _launcher_signature(jf):
+    """The `JitFunction`'s bound signature, resolved the way flydsl itself
+    does -- NOT bare `inspect.signature`.
+
+    `resolve_signature` (`flydsl.compiler.jit_argument`) is
+    `inspect.signature(func, eval_str=True)`, and it is what
+    `JitFunction._ensure_sig` binds against. This matters: four `@flyc.jit`
+    files in the FlyDSL tree use `from __future__ import annotations`, so
+    their annotations are strings at class-definition time -- bare
+    `inspect.signature` would yield the string `'fx.Pointer'`, not the type,
+    and every downstream annotation check would silently misfire.
+    """
+    from flydsl.compiler.jit_argument import resolve_signature
+
+    return resolve_signature(jf.func)
+
+
+def kernel_function_of(jf):
+    """The `@flyc.kernel` `KernelFunction` a `JitFunction`'s launcher closes
+    over -- reachable from `jf.func`'s closure, NOT from the builder's
+    returned wrapper's (`kernel_function_of` walks `jf.func`, unlike
+    `jit_function_of` which walks `built`; the two closures are not the
+    same one)."""
+    from flydsl.compiler.kernel_function import KernelFunction
+
+    return _find_unique(jf.func, KernelFunction)
+
+
 def _trace_fmha_launch(built, functional):
     """Trace `built` (the FlyDSL-attention launcher) and return `(jf, args)`.
 
