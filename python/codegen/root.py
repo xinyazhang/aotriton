@@ -148,11 +148,6 @@ class RootGenerator(object):
             ksg.generate()
             shims += ksg.shim_files
             # AOTRITON_DEBUG_SKIP_TRITON_KERNELS: emit the C++ shim but no image rules.
-            # Leaving this kernel out of hsaco_for_kernels is the whole mechanism -- it
-            # is the sole feed for Bare.compile and for the Triton entries of
-            # cluster_dict/flatzip_dict, so all three come out without Triton rows and
-            # every CMake loop over them simply iterates zero times. The shim must still
-            # be generated or the library will not compile.
             if AOTRITON_DEBUG_SKIP_TRITON_KERNELS:
                 continue
             hsacos = ksg.this_repo.get_data('hsaco')
@@ -281,13 +276,9 @@ class RootGenerator(object):
 
         shard_names = ['Bare.shim', 'Bare.compile', 'Bare.cluster', 'Affine.cluster', 'Bare.flatzip']
         out_files = {name: args.build_dir / name for name in shard_names}
-        # Truncate output files before appending. `touch()` matters: a rule file with no
-        # rows must exist and be EMPTY, not be absent. LazyFile only writes when the
-        # content changed, so a shard that produced nothing leaves no file to copy here,
-        # and `file(STRINGS)` in v3src/CMakeLists.txt is a hard error on a missing path
-        # (Bare.compile and Bare.cluster are read unguarded). That case is reachable
-        # whenever a backend contributes no rules -- AOTRITON_DEBUG_SKIP_TRITON_KERNELS
-        # makes it reachable for every Triton kernel at once.
+        # Truncate output files before appending.
+        # AOTRITON_DEBUG_SKIP_TRITON_KERNELS=1 generates empty files, and touch ensures
+        # the file won't be missing in this case.
         for path in out_files.values():
             path.unlink(missing_ok=True)
             path.touch()
