@@ -202,8 +202,8 @@ class FakeTensor:
     from pointer to tensor without touching its ATI description: the choice
     becomes a compiler-side table lookup.
 
-    **`fx.Tensor` is deliberately NOT supported yet** -- see the assertion in
-    `_assert_supported_operands`. What is actually known is one measurement,
+    **`fx.Tensor` is deliberately NOT supported yet** -- see the raise in
+    `_operand_for`. What is actually known is one measurement,
     recorded at `modules/flash/flyc/fmha_common_gfx1201.py:138-146`: each
     `fx.Tensor` argument adds a **40-byte by-value memref descriptor
     interleaved immediately after its pointer**, growing that kernel's kernarg
@@ -254,32 +254,47 @@ class FakeTensor:
 _FAKE_SHAPE = (1, 1, 128, 64)
 
 
-_SUPPORTED_OPERAND_ANNOTATIONS = frozenset(
-    {'Pointer', 'Int32', 'Int64', 'Float32', 'Stream'}
-)
+def _operand_for(param, desc=None):
+    """The AOT value for one launcher parameter, derived from its annotation
+    alone -- the whole of this driver's kernel knowledge.
 
+    | annotation | value |
+    |---|---|
+    | `Pointer` | `flyc.from_c_void_p(desc.dtype if desc else fx.Uint8, 0)` |
+    | `Int32`, `Int64` | `0` |
+    | `Float32` | `0.0` |
+    | `Stream` | `fx.Stream(None)` |
+    | `Tensor` | raise -- not supported yet, see below |
+    | anything else | raise, naming the parameter and its annotation |
 
-def _assert_supported_operands(jf):
-    """Refuse a launcher whose signature this driver cannot honestly synthesise.
+    `desc` is a `FakeTensor` descriptor, optional and unused in Phase 1 (every
+    gfx1201 operand is `fx.Pointer`, so `flyc.from_c_void_p(fx.Uint8, 0)`
+    suffices -- the pointer element type is provably inert, see `FakeTensor`'s
+    docstring). It exists for the `fx.Tensor` row, which needs `desc.dtype`
+    (and, once implemented, `desc`'s rank/shape/strides) rather than a bare
+    default.
 
-    A loud stop rather than a guess. `fx.Tensor` is the case that matters and the
-    one to expect: it needs a real operand descriptor (rank, extents, dtype), the
-    tensor kernarg ABI is not pinned down, and silently marshalling something
-    plausible would produce an artifact whose kernarg layout we cannot verify.
-    See `FakeTensor`'s docstring for what is known and what is not.
+    This is also the loud-stop this driver owes a launcher it cannot honestly
+    synthesise for -- folded in here rather than kept as a separate
+    enumerate-and-check pass, so there is exactly one place that knows the
+    supported annotation set.
     """
-    import inspect
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
 
-    bad = []
-    for p in inspect.signature(jf.func).parameters.values():
-        name = getattr(p.annotation, '__name__', str(p.annotation))
-        if name not in _SUPPORTED_OPERAND_ANNOTATIONS:
-            bad.append((p.name, name))
-    if not bad:
-        return
-    detail = ', '.join(f'{n}: fx.{a}' for n, a in bad)
+    name = getattr(param.annotation, '__name__', str(param.annotation))
+    if name == 'Pointer':
+        dtype = desc.dtype if desc is not None else fx.Uint8
+        return flyc.from_c_void_p(dtype, 0)
+    if name in ('Int32', 'Int64'):
+        return 0
+    if name == 'Float32':
+        return 0.0
+    if name == 'Stream':
+        return fx.Stream(None)
+
     tensor_note = ''
-    if any(a == 'Tensor' for _, a in bad):
+    if name == 'Tensor':
         tensor_note = (
             "\n\nfx.Tensor operands are not supported yet -- deliberately, not by "
             "oversight. Each one adds a 40-byte by-value memref descriptor "
@@ -288,9 +303,19 @@ def _assert_supported_operands(jf):
             "all unverified. See FakeTensor's docstring in this file."
         )
     raise NotImplementedError(
-        f"{jf.func.__name__}: unsupported operand annotation(s): {detail}."
+        f"unsupported operand annotation for parameter {param.name!r}: fx.{name}."
         f"{tensor_note}"
     )
+
+
+def synthesise_args(jf):
+    """The positional argument list for one traced call of `jf`, built purely
+    from `jf`'s own signature -- no functional, no choices, no shapes. See
+    `_operand_for` for the per-parameter rule; Phase 1 passes `desc=None`
+    everywhere, since every gfx1201 launcher parameter is `fx.Pointer` or a
+    plain scalar/stream.
+    """
+    return [_operand_for(p) for p in _launcher_signature(jf).parameters.values()]
 
 
 class _AmbiguousObject(Exception):
@@ -453,7 +478,7 @@ def _trace_fmha_launch(built, functional):
     # (CMakeLists.txt:142) and which this driver has no device for anyway.
     built(q, k, v, o, batch_size, seqlen_q, window=window, philox_seed=None)
     if 'exe' in cap:
-        _assert_supported_operands(cap['exe'])
+        synthesise_args(cap['exe'])  # raises on an unsupported operand annotation
     if 'exe' not in cap:
         raise RuntimeError(
             "_trace_fmha_launch: built(...) never reached fmha_abi_gfx1201.run_compiled; "
