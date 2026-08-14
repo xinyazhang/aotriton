@@ -312,14 +312,30 @@ Phase 2's kernarg vector, `ati.context_helper` codegen, C++ shim; the upstream
 
 Recorded here so it is not lost. The re-vendor in Step 0 changed the kernel ABI:
 
-- **`batch_size` is a new operand** and is not declared in `modules/flash/aot/flyc_attn_fwd.py`.
-  It looks like a plain `wires_to='Batch'` rename now that it no longer shares a slot.
-- **`num_seqlens` is no longer a "false friend".** The old design gave it a
-  `flyc_num_seqlens` context helper implementing `abs()`, because the launcher's `batch_size`
-  was passed into the kernel's `num_seqlens` slot. They are now separate arguments and the
-  kernel resolves the fallback itself. Re-derive the mapping against AOTriton's three-way
-  `Num_seqlens` before touching the helper — it may collapse to a plain rename for the `>= 0`
-  cases, leaving only the negative (BHSD-padded varlen) case to handle.
+- **`batch_size` is a new operand, and it is NOT a plain `wires_to='Batch'`.** FlyDSL's
+  contract (`fmha_abi_gfx1201.varlen_args` docstring) is explicit: `batch_size` is
+  `q.size(0)` *always, whatever the layout*, and `num_seqlens` is the count packed into a
+  1HTD tensor, 0 when nothing is packed. So a dense call is `(B, 0)` and a packed call
+  holding N sequences is `(1, N)`. AOTriton's `Batch` is not `q.size(0)` under packed
+  varlen, so a rename would feed the wrong number. Wire it to a context helper returning
+  `params.Q->size(0)`.
+
+- **`num_seqlens` still needs its context helper**, for a different reason than before.
+  The old `abs()` rationale is dead — that existed because the launcher's `batch_size` was
+  passed into the kernel's `num_seqlens` slot. What remains is the encoding mismatch:
+  AOTriton's `Num_seqlens` is signed and three-way (`>0` packed count, `0` dense, `<0`
+  BHSD-padded varlen), while FlyDSL reads an unsigned count with 0 meaning "not packed" and
+  branches on it directly (`nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)`).
+  `wires_to='Num_seqlens'` would hand a negative value to that select. Expected mapping is
+  `max(Num_seqlens, 0)` — the `<0` case is padded, not packed, so FlyDSL wants 0 with the
+  layout carried in `varlen_bits` — but **verify that against `flyc_varlen_bits` before
+  implementing**, since the two helpers must agree on how the padded case is encoded.
+
+- **Both failures are silent.** The FlyDSL docstring spells out the consequence of getting
+  this pair wrong: *"it launches N programs over a tensor whose batch axis is 1, and every
+  one of them addresses a plausible row."* No crash, no wrong-arch ELF — just wrong numbers.
+  Worth an assertion in the shim, not only a helper.
+
 - The 28 currently-declared operands still match kernel order exactly (checked by AST), so
   only the insertion of `batch_size` is outstanding.
 
