@@ -723,12 +723,20 @@ Expect `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, `flash_attn_func_aiw_kernel_0`, ~13.
 Then sweep `BLOCK_DMODEL in {32,64,128}` x `CAUSAL_TYPE in {0,3}` x `Q in {*fp16:16,*bf16:16}`
 and confirm all 12 succeed.
 
-`CAUSAL_TYPE=3` (generalized sliding window) needs the trace call to pass an explicit
-`window=`; without one `abi.resolve_window` raises `ValueError`, since type 3 carries no
-sentinel. Any valid bound will do — `window_left`/`window_right` are runtime kernel
-arguments, so the value cannot reach the binary. Verified: `window=(512,0)` and
-`window=(1024,7)` produce a byte-identical artifact. Also confirm the driver contains no `import fmha_tuning_gfx1201`
-and no occurrence of `attn_fwd` outside a docstring.
+`CAUSAL_TYPE=3` (generalized sliding window) needs no window handling in the driver at all:
+`flyc_compile.py` never enters host wrapper code, so there is no `abi.resolve_window` call to
+satisfy and no sentinel to fabricate. The `window_left`/`window_right` values are runtime
+kernel arguments synthesised generically like any other operand (see `synthesise_args`); the
+sweep must pass for `CAUSAL_TYPE=3` with **no window-specific code anywhere** in the driver —
+if a change to make this case pass looks like it needs one, that is a sign the new entry point
+is still going through host code, not a sign the driver needs a window branch.
+
+The agnosticism check itself must also be widened. The original form grepped for the two
+literal strings `fmha_tuning_gfx1201` and `attn_fwd`; it passed for weeks while
+`import fmha_abi_gfx1201` sat in the driver, because that import didn't match either literal.
+Check instead for any `fmha_*`, `flash*`, or `attn*` module import — e.g.
+`grep -nE '^\s*(import|from)\s+(fmha_|flash|attn)' python/flyc_compile.py` should return
+nothing — and confirm no occurrence of `attn_fwd` outside a docstring or comment.
 
 **Files.**
 
