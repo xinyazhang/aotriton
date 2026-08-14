@@ -70,11 +70,6 @@ own warning.
 
 from dataclasses import dataclass
 
-# Task 0 interim (PLAN-PHASE1.md Task 0a): kernels/common is not yet in the
-# flydsl wheel, so flyc_bootstrap.setup() puts the FlyDSL checkout root on
-# sys.path and this resolves verbatim as `kernels.common`. Once the packaging
-# change lands, this becomes `from flydsl.kernels.common import ...` (see
-# UPSTREAM.md).
 from kernels.common import kernels_common
 from kernels.common import utils as common_utils
 
@@ -1194,7 +1189,7 @@ def seqinfo_addr(ptr, index):
     return fx.recast_iter(_i32_global_ptr_ty(), ptr) + fx.Int64(index)
 
 
-def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z, num_seqlens):
+def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z):
     """One side of VarlenBits: where this workgroup's sequence lives.
 
     Returns `(seqlen, row_off, batch)` -- how long this sequence is, which row
