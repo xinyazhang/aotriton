@@ -403,41 +403,6 @@ def kernel_function_of(jf):
     return _find_unique(jf.func, KernelFunction)
 
 
-def _extract_block_size(source_ir: str):
-    """Recover BLOCK_SIZE from the PRE-LOWERING IR's `gpu.func` `known_block_size`
-    attribute (`array<i32: N, 1, 1>`; N is BLOCK_SIZE).
-
-    Not in the knobs: `resolve_knobs` leaves `flat_work_group_size = None` and the
-    builder derives `BLOCK_SIZE = FLAT_WORK_GROUP_SIZE or NUM_WAVES * WARP_SIZE`
-    internally. Not in `_ir_text` either -- `gpu-module-to-binary` has replaced the
-    module body by then. Not in the ELF -- block size is a host launch decision
-    never baked into the binary. `CompiledArtifact._source_ir` is the one place it
-    still exists as MLIR text.
-    """
-    from flydsl._mlir import ir
-
-    def _find(op):
-        if op.operation.name == 'gpu.func':
-            attr = op.operation.attributes.get('known_block_size')
-            if attr is not None:
-                return int(attr[0])
-        for region in op.operation.regions:
-            for block in region.blocks:
-                for inner in block.operations:
-                    found = _find(inner)
-                    if found is not None:
-                        return found
-        return None
-
-    with ir.Context(), ir.Location.unknown():
-        module = ir.Module.parse(source_ir)
-        for op in module.body.operations:
-            found = _find(op)
-            if found is not None:
-                return found
-    return None
-
-
 def _extract_hsaco(jf) -> bytes:
     """Pull the compiled hsaco ELF out of a traced `JitFunction`.
 
@@ -545,7 +510,14 @@ def do_compile(args):
     launch_args = synthesise_args(jf)
     jf(*launch_args)  # COMPILE_ONLY=1 -> traces and compiles, returns None, launches nothing
     hsaco = _extract_hsaco(jf)
-    block_size = _extract_block_size(jf._last_compiled[1]._source_ir)
+    # BLOCK_SIZE is a *declared* value (`@flyc.kernel(known_block_size=...)`),
+    # not something recovered from the artifact: the ELF's
+    # `.max_flat_workgroup_size` is a bound, not the exact value, and
+    # `.reqd_workgroup_size` is emitted empty, so the exact launch geometry
+    # never makes it into the hsaco. flydsl itself validates the real launch
+    # against this same value in `KernelLauncher._check_block_vs_known`, so
+    # `_known_block_size` is the authoritative source, not a guess.
+    block_size = kernel_function_of(jf)._known_block_size[0]
 
     out_path = args.out_path
     with open(out_path.with_suffix('.hsaco'), 'wb') as f:
@@ -569,8 +541,8 @@ def do_compile(args):
         'sidecar': sidecar,
         # block_m rides in the sidecar dict (it is resolved and used by the
         # builder already; it just needed forwarding -- see flyc_attn_fwd.py).
-        # block_size is NOT in the sidecar/knobs; it is recovered from the
-        # pre-lowering IR above (see _extract_block_size).
+        # block_size is NOT in the sidecar/knobs; it is the `@flyc.kernel`'s
+        # declared known_block_size, read off the KernelFunction above.
         'block_m': sidecar.get('block_m') if isinstance(sidecar, dict) else None,
         'block_size': block_size,
     }
