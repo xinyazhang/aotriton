@@ -560,7 +560,8 @@ something ATI lacks:
 | `varlen_bits` | packed layout descriptor with no AOTriton operand; also absorbs the mode half of `Num_seqlens` | permanent |
 | `idropout_p` | fixed-point i32, not `dropout_p`'s fp32 | permanent |
 | `dropout_scale` | `1/(1-p)`, precomputed host-side, no operand at all | permanent |
-| `num_seqlens` | a **false friend** — see below | **transient** |
+| `batch_size` | must be `q.size(0)`, which is not AOTriton's `Batch` under packed varlen | permanent |
+| `num_seqlens` | AOTriton's signed three-way encoding vs FlyDSL's unsigned count | permanent |
 
 The PRNG arguments were on this list and are not any more: FlyDSL `971dce48` ("the philox
 seed becomes a pointer, and the forward reports what it drew") and `53334317` ("the philox
@@ -580,29 +581,37 @@ That is the superset relationship — FlyDSL supports more varlen layouts *becau
 mode out of count. So no rename is right; the helper is where the three-way encoding is
 decoded once, and `flyc_varlen_bits` consumes the same sign to build its mode bits.
 
-**`flyc_num_seqlens` is an integer `abs()`.** Verified case by case against the kernel:
+**UPDATE — the `abs()` design is dead; the pair now needs two helpers.**
 
-| `Num_seqlens` | AOTriton meaning | `abs()` | correct? |
-|---|---|---|---|
-| `> 0` | varlen compact/stacked, value is the count | `n` | yes |
-| `< 0` | varlen BHSD, S padded to `Max_seqlen_q` | `n` | yes |
-| `== 0` | dense | `0` | yes — the value is **dead** |
+That design existed because the launcher passed its `batch_size` into the kernel's
+`num_seqlens` slot, so one helper had to undo the conflation. FlyDSL `f79182b7` / `1d231767`
+split them into separate kernel arguments, which removed that reason and left a different one.
 
-The dense row is the one that looks wrong and is not. `num_seqlens` reaches exactly two
-callees and neither reads it outside a stacked layout: `decode_addressing`
-(`fmha_common_gfx1201.py:1088`) takes the parameter and never references it in the body, and
-`lse_token_pitch` reads it in three places, all inside the `stacked` arm of the outer `ssel`
-— the non-stacked arm returns `max_seqlen` outright. Two things to raise upstream:
-`decode_addressing`'s parameter is dead and should be deleted, and the whole
-"dead in the dense case" property is load-bearing here, so it wants a comment on the kernel
-side rather than being rediscovered.
+FlyDSL's contract (`fmha_abi_gfx1201.varlen_args` docstring): `batch_size` is `q.size(0)`
+*always, whatever the layout*; `num_seqlens` is how many sequences are packed into a 1HTD
+tensor, and 0 when nothing is packed. Dense is `(B, 0)`; packed with N sequences is `(1, N)`.
+The kernel branches on the pair —
+`nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)`.
 
-Transient: the kernel is being changed to take `Batch` directly (separate work), after which
-it collapses to `wires_to='Batch'`. **The two are not interchangeable** — `abs(Num_seqlens)`
-is 0 for dense where `Batch` is the batch count — so the switch must land in the same change
-as the kernel API, not before or after, and `abs(Num_seqlens) == Batch` should be checked for
-the varlen cases at that point. The `num_seqlens` spelling is a leftover from when varlen was
-the primary variant of attn_fwd; non-varlen is the better base case.
+AOTriton spells the same information as a `Batch` operand plus a **signed** three-way
+`Num_seqlens` (`>0` packed count, `0` dense, `<0` BHSD-padded varlen). Hence:
+
+| flyc operand | source | why not a rename |
+|---|---|---|
+| `batch_size` | `params.Q->size(0)` | under packed varlen Q is 1HTD, so `q.size(0)` is 1 while `Batch` is not |
+| `num_seqlens` | `max(Num_seqlens, 0)` | `wires_to='Num_seqlens'` would hand a negative value to a `select` that reads it as a count |
+
+The `<0` case is *padded*, not packed, so FlyDSL wants 0 with the layout carried in
+`varlen_bits` — **verify that against `flyc_varlen_bits` before implementing**, since the two
+helpers must agree on how the padded case is encoded.
+
+Both failures are **silent**, which is the argument for asserting as well as wiring. FlyDSL's
+own docstring on the mistake: *"it launches N programs over a tensor whose batch axis is 1,
+and every one of them addresses a plausible row."* No crash, no wrong-arch ELF, just wrong
+numbers.
+
+Still worth raising upstream, unchanged by the split: `decode_addressing`
+(`fmha_common_gfx1201.py:1088`) takes a `num_seqlens` parameter it never references.
 
 `ir/kdesc.py:71` already anticipates this: *"The apparel value is a plain operand name for
 now; the representation is kept opaque so it can later carry a tuple of operator params or
