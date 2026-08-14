@@ -585,8 +585,27 @@ ROCM_PATH=$(rocm-sdk path --root) PIP_NO_INDEX=1 PIP_FIND_LINKS=<wheelhouse> cma
 ```
 
 All ten `requirements.txt` entries plus `flydsl==0.3.1` are recoverable this way (~103 MB
-trimmed). `triton` is **not** in the cache and is not recoverable — image *builds*, as
-opposed to image-mode configures, stay blocked until it is available.
+trimmed). `triton` is **not** in the cache; supply it as a prebuilt wheel instead:
+
+```
+-DAOTRITON_USE_LOCAL_TRITON_WHEEL=<abs path to triton-*.whl>
+```
+
+With that, image builds work: `ninja aotriton_venv_triton aotriton_venv_flydsl` installs
+both, the venv has triton + flydsl and still **no torch**, and ~51k image rules are
+generated. Verified one Triton kernel end to end — a 43,480-byte gfx1201 hsaco with
+`compile_status: Complete` — so the `.hsaco` → `.aks2` → `aotriton.images/*.zip` chain
+that Task 7 targets is exercisable here.
+
+Two remaining network dependencies at configure time, both of which do work in this
+container even though PyPI does not:
+
+- `v3src/CMakeLists.txt:115` clones `https://github.com/ROCm/aiter.git` (~140 MB) under
+  `if(NOT AOTRITON_NOIMAGE_MODE)`. github is reachable; PyPI is not.
+- git submodule / `git fetch` traffic generally.
+
+Note the wheel must not live in the repo root — it is not covered by `.gitignore`, so a
+`git add -A` would sweep several hundred MB into a commit.
 
 ## Task 3 — `python/flyc_compile.py`
 
