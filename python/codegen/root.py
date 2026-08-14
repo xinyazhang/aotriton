@@ -335,7 +335,7 @@ class RootGenerator(object):
         # path, and either way `self._altwheels[name] = Path(value)`. This means a venv
         # maps to exactly one thing, so a per-arch flydsl pin (e.g. gfx1201 wanting a
         # different flydsl version than another arch) is not expressible; every venv
-        # gets the same third_party/flydsl.txt pin instead.
+        # gets the same third_party/flydsl-compiler.txt pin instead.
         #
         # A backward-compatible extension is specified but NOT implemented here: branch
         # on the YAML node type. The scalar branch is unchanged and stays *wheels-only*
