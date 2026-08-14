@@ -49,12 +49,19 @@ root on `sys.path`; replaced by the interim described below),
 
 `kernels/common` is not in the installed flydsl 0.3.1 wheel (verified:
 `find_spec('kernels')` is `None` in `/home/xinyazha/.venvs/nogpu`). Until an
-upstream packaging change ships it as `flydsl.kernels.common`, this repo's
-`python/flyc_bootstrap.py` puts the FlyDSL checkout root
-(`/home/xinyazha/dockerhome/meff/FlyDSL`, or `$AOTRITON_FLYDSL_ROOT` if set) on
-`sys.path`, so the vendored imports below resolve verbatim as
-`from kernels.common import ...` — exactly what the now-deleted
+upstream packaging change ships it as `flydsl.kernels.common`, the build
+shallow-clones a FlyDSL source tree at the `third_party/flydsl-kernel.txt` tag
+and `python/flyc_bootstrap.py` puts its root — `$AOTRITON_FLYDSL_KERNEL_ROOT`,
+required, no default — on `sys.path`, so the vendored imports below resolve
+verbatim as `from kernels.common import ...`, exactly what the now-deleted
 `gfx1201_standalone.py` did.
+
+Two FlyDSL pins, deliberately independent:
+
+| file | pins | used for |
+|---|---|---|
+| `third_party/flydsl-compiler.txt` | `flydsl==0.3.1` | the pip wheel: the compiler itself |
+| `third_party/flydsl-kernel.txt` | `v0.3.1` | the git tag: a source tree supplying `kernels/common` |
 
 **Do not copy `kernels/common/*` into this repo to unblock an import error.**
 That is the fork this vendoring strategy exists to avoid. If the interim
@@ -74,10 +81,36 @@ table's right column changes.
 
 | file | replace | with (interim) | with (post-packaging) |
 |---|---|---|---|
-| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import buffer_ops, wmma_ops` | `from kernels.common import buffer_ops`<br>`from kernels.common.mma import wmma_ops` | `from flydsl.kernels.common import buffer_ops`<br>`from flydsl.kernels.common.mma import wmma_ops` |
-| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import utils as common_utils` | `from kernels.common import utils as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import buffer_ops, wmma_ops` | `from kernels.common import buffer_ops`<br>`import flyc_polyfill as wmma_ops` | `from flydsl.kernels.common import buffer_ops`<br>`from flydsl.kernels.common.mma import wmma_ops` |
+| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
 | `fmha_common_gfx1201.py` | `from gfx1201_standalone import kernels_common` | `from kernels.common import kernels_common` | `from flydsl.kernels.common import kernels_common` |
-| `fmha_common_gfx1201.py` | `from gfx1201_standalone import utils as common_utils` | `from kernels.common import utils as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+| `fmha_common_gfx1201.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+
+### Why two of those go to `flyc_polyfill` rather than `kernels.common`
+
+The source tree the build clones is the **released** `v0.3.1` tag, and that
+tag has no `kernels/common/mma/wmma_ops.py` at all — its `mma/` holds only
+MFMA (CDNA) helpers, while this is a WMMA (RDNA) kernel. The gfx1201 WMMA work
+lives on `xinyazhang/sdpa-gfx1201-feature`, which forked at `v0.3.0` and is not
+contained in any tag.
+
+Rather than pin a moving branch, the four `utils` helpers and the one
+`wmma_ops` helper come from `flyc_polyfill.py`, which already carried exactly
+these six fallbacks. Every symbol these two files take from those two modules
+is branch-local, so each name aliases the polyfill *wholesale* and no call site
+changes — which keeps the re-sync diff to one import line per file.
+
+`buffer_ops` and `kernels_common` are deliberately NOT rewritten:
+`get_element_ptr`, `_if_then` and `dtype_to_elem_type` are all present in
+`v0.3.1`, so they still come from the clone. The rule below — do not copy
+`kernels/common/*` into this directory — is unchanged and still applies.
+
+Verified: building against the released `v0.3.1` tree and against the feature
+branch produce the **byte-identical** hsaco (`1821491bae4d1ca3c2f1`, 13496
+bytes), and the 12-combination sweep passes against `v0.3.1` with 12 distinct
+artifacts. So the polyfill bodies are equivalent to the branch originals, and
+the `buffer_ops`/`kernels_common` drift between `v0.3.1` and the branch does
+not reach this kernel.
 
 Unchanged and verbatim: `philox.py`, `fmha_tuning_gfx1201.py`. Also verbatim
 within the two edited files: every flat sibling import already present

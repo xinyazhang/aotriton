@@ -108,8 +108,14 @@ from fmha_tuning_gfx1201 import (  # noqa: F401
     vo_chunks,
 )
 from kernels.common import buffer_ops
-from kernels.common.mma import wmma_ops
-from kernels.common import utils as common_utils
+# Import rewrite (see UPSTREAM.md): upstream reads these from
+# `kernels.common.mma.wmma_ops` and `kernels.common.utils`, which only the
+# gfx1201 feature branch has. Every symbol this file takes from the two
+# modules -- wmma_f32_16x16x16, ssel, smax -- is branch-local, so both names
+# alias the polyfill wholesale and no call site below changes. `buffer_ops`
+# above is NOT rewritten: get_element_ptr is in the released tree.
+import flyc_polyfill as wmma_ops
+import flyc_polyfill as common_utils
 from philox import Philox
 
 import flydsl.compiler as flyc
