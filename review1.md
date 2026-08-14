@@ -189,9 +189,17 @@ cmake -S . -B <build> -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DAOTRITON_USE_LOCAL_TRITON_WHEEL=~/triton-3.7.0+gitdb82b800.aotriton0.14-cp313-cp313-linux_x86_64.whl
 ```
 
-A configured image-mode build dir is at `/tmp/bld4` (819 MB + aiter + hsacos). It is in
-`/tmp`, so it will not survive a reboot; worth relocating if Tasks 5-7 are going to lean
-on it.
+A configured image-mode build dir is at `/tmp/bld4`, now **5.6 GB** with aiter and 11,233
+hsacos. It is in `/tmp`, so it will not survive a reboot — worth relocating before Tasks
+5-7 lean on it, because rebuilding it is not cheap:
+
+**Every `.aks2` depends on every hsaco.** `v3src/CMakeLists.txt:262` gives each aks2 rule
+`DEPENDS aotriton_v2_compile`, and line 226 makes that target depend on all `${ALL_HSACOS}`
+— 47,766 for one arch. The real per-cluster list is invisible to ninja: it rides in the
+`.nsv` behind `--hsaco_manifest`, so the build compensates with a blanket dependency. I
+asked for one attn_fwd cluster (nominally ~17 kernels) and got 11,233 hsacos in ~18 min
+before cutting it off at 24%. Task 7's gate therefore needs one deliberate full build, not
+an edit-rebuild loop. Details and a suggested fix are in PLAN-PHASE1.md's Gate 7.
 
 Still outstanding, unchanged:
 
