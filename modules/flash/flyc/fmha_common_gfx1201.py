@@ -71,7 +71,11 @@ own warning.
 from dataclasses import dataclass
 
 from kernels.common import kernels_common
-from kernels.common import utils as common_utils
+# Import rewrite (see UPSTREAM.md): every symbol this file takes from
+# `kernels.common.utils` -- ssel, smin, smax, sdiv_rd_pow2 -- is branch-local,
+# so the name aliases the polyfill wholesale and no call site below changes.
+# `kernels_common` above is NOT rewritten: _if_then is in the released tree.
+import flyc_polyfill as common_utils
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
