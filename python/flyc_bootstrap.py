@@ -167,25 +167,37 @@ def ensure_flydsl_importable() -> bool:
 def _find_flydsl_checkout_root() -> Path:
     """Locate the FlyDSL checkout that has ``kernels/common`` (Task 0 interim).
 
-    ``AOTRITON_FLYDSL_ROOT`` if set, else ``<repo>/third_party/flydsl``. Raises
-    ``RuntimeError`` naming the path tried if ``kernels/common`` is not found
+    ``AOTRITON_FLYDSL_ROOT``, which is REQUIRED -- there is no default. Raises
+    ``RuntimeError`` if it is unset, or if ``kernels/common`` is not found
     under it. This function -- and the ``sys.path`` insertion in ``setup()``
     that uses it -- goes away the day ``kernels.common`` ships inside the
     ``flydsl`` wheel; see this module's docstring.
+
+    There used to be a ``<repo>/third_party/flydsl`` fallback here, from when
+    FlyDSL was expected to be a submodule. Task 2.5 pinned a wheel instead
+    (``third_party/flydsl.txt``), so that directory is never created and the
+    fallback could only ever fail -- and it failed *misleadingly*: with the
+    ``aotriton`` package installed non-editably into the build venv, as CMake
+    installs it, ``__file__`` sits in site-packages, so the message advertised
+    a path like ``<site-packages>/third_party/flydsl`` and invited the reader
+    to go looking for a repo that is not there.
     """
     env_root = os.environ.get('AOTRITON_FLYDSL_ROOT')
-    if env_root:
-        root = Path(env_root)
-        source = 'AOTRITON_FLYDSL_ROOT'
-    else:
-        # <repo>/third_party/flydsl: python/flyc_bootstrap.py -> python/ -> <repo>/
-        root = Path(__file__).resolve().parent.parent / 'third_party' / 'flydsl'
-        source = 'default (<repo>/third_party/flydsl)'
+    if not env_root:
+        raise RuntimeError(
+            "_find_flydsl_checkout_root: AOTRITON_FLYDSL_ROOT is not set, and "
+            "there is no default -- FlyDSL is a pinned wheel "
+            "(third_party/flydsl.txt), not a checkout in this tree. The wheel "
+            "does not yet ship 'kernels/common', which the vendored kernels "
+            "import, so point AOTRITON_FLYDSL_ROOT at a FlyDSL checkout that "
+            "has it. This requirement disappears once the wheel ships it."
+        )
 
+    root = Path(env_root)
     if not (root / 'kernels' / 'common').is_dir():
         raise RuntimeError(
             f"_find_flydsl_checkout_root: 'kernels/common' not found under "
-            f"{root} (from {source}). Set AOTRITON_FLYDSL_ROOT to a FlyDSL "
+            f"{root} (from AOTRITON_FLYDSL_ROOT). Point it at a FlyDSL "
             f"checkout that has it."
         )
     return root
