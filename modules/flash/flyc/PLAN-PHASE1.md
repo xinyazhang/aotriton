@@ -1242,6 +1242,27 @@ Expect one zip entry per surviving functional, named by `unified_signature`. Unp
 `.aks2` and confirm it holds a single hsaco whose ELF is `EM_AMDGPU` / `gfx1201`. Then
 `ninja install` and confirm the zip appears under the install prefix.
 
+**Budget this gate: building ANY single `.aks2` builds EVERY hsaco in the tree — 47,766
+of them for one arch.** Measured, not estimated. `v3src/CMakeLists.txt:262` gives each
+aks2 rule `DEPENDS aotriton_v2_compile`, and line 226 is
+`add_custom_target(aotriton_v2_compile ALL DEPENDS ${ALL_HSACOS})` over the whole
+`Bare.compile` record. The per-cluster hsaco list is real but invisible to ninja: it
+travels in the `.nsv` file behind `--hsaco_manifest`, so the build system substitutes a
+blanket dependency on everything.
+
+Consequence for anyone gating 7: there is no cheap `.aks2`. Asking for one attn_fwd
+cluster (nominally ~17 hsacos, 7240 rules over 432 clusters) compiled 11,233 hsacos in
+~18 min of wall time — about 24% of the way — before being cut off; a complete first
+build is hours, and `/tmp/bld4` was already 5.6 GB at that point. Do the full image build
+once, deliberately, and keep the build directory; do NOT expect to iterate on the
+aks2/flatzip stage the way 7a-7d's edit-rebuild loop implies.
+
+Worth fixing separately (out of Phase 1 scope): if the aks2 rules took `DEPENDS
+${cluster_hsacos}` — the same list already written into the `.nsv` — instead of the
+aggregate target, per-cluster rebuilds would cost their ~17 kernels rather than 47,766.
+The FIXME at line 224 about `AOTRITON_HSACO_RECORD` being duplicated from `Bare.compile`
+is adjacent to this.
+
 ## Definition of done
 
 1. `modules/flash/flyc/` holds exactly 5 vendored `.py` files plus the authored
