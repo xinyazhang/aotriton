@@ -27,11 +27,12 @@ from graphlib import TopologicalSorter, CycleError
 class FamilyArtifacts:
     """The linked output for one family: the lists the codegen consumers iterate."""
 
-    def __init__(self, family, kernels, operators, affine_kernels):
+    def __init__(self, family, kernels, operators, affine_kernels, flyc_kernels):
         self.family = family
         self.kernels = kernels
         self.operators = operators
         self.affine_kernels = affine_kernels
+        self.flyc_kernels = flyc_kernels
 
 
 def _metro_subkernel_names(compiled, op_name, metro_name):
@@ -159,6 +160,28 @@ def _build_affines(compiled):
     return out
 
 
+def _build_flycs(compiled, operators):
+    """Build every flyc KernelDescription from its parsed FlycDecl, resolving
+    `functionals_of` against the already-built operators (PLAN-PHASE1.md Task 5a).
+    Must run AFTER `_build_operators` -- unlike affine kernels (bound to an
+    operator only as a listed backend), a flyc kernel's functional space is
+    resolved by NAME against the finished operators dict."""
+    from aotriton.template_instantiation.ir.flyc import KernelDescription
+    out = {}
+    for name, decl in compiled.flycs.items():
+        op = operators.get(decl.functionals_of)
+        assert op is not None, (
+            f'flyc kernel {name!r} declares functionals_of={decl.functionals_of!r} '
+            f'but no such operator was built in family {compiled.family!r}; '
+            f'operators: {sorted(operators)}')
+        kdesc = KernelDescription(name=name, family=compiled.family,
+                                  module_path=decl.module_path, disable=decl.disable,
+                                  functionals_source=op)
+        kdesc.desc_path = decl.desc_path
+        out[name] = kdesc
+    return out
+
+
 def _build_metros(compiled, built_kernels):
     """Build every MetroKernel, binding its sub-kernels by name to built kdescs."""
     from aotriton.template_instantiation.builder import build_metro
@@ -282,7 +305,8 @@ class Linker:
 
     def link_family(self, aot_module, family):
         """Pass 2 for one family: compile (Pass 1) then resolve + build the final
-        tree. Returns FamilyArtifacts(kernels, operators, affine_kernels)."""
+        tree. Returns FamilyArtifacts(kernels, operators, affine_kernels,
+        flyc_kernels)."""
         from aotriton.template_instantiation.ir.ops.infer import infer_shared_iface
 
         compiled = self.parser.compile_family(aot_module, family)
@@ -295,21 +319,27 @@ class Linker:
         op_list = [operators[n] for n in compiled.op_order]
         infer_shared_iface(op_list)
 
+        # Resolves `functionals_of` against the just-built operators (Task 5a) --
+        # must run after _build_operators, unlike affines (bound as backends).
+        flycs = _build_flycs(compiled, operators)
+
         return FamilyArtifacts(
             family,
             kernels=list(built_kernels.values()),
             operators=op_list,
-            affine_kernels=list(affines.values()))
+            affine_kernels=list(affines.values()),
+            flyc_kernels=list(flycs.values()))
 
     def link_all_families(self):
         """Discover every family under module_dir, link each, and concatenate the
         artifacts the generator consumes. Returns (kernels, operators,
-        affine_kernels)."""
-        kernels, operators, affine_kernels = [], [], []
+        affine_kernels, flyc_kernels)."""
+        kernels, operators, affine_kernels, flyc_kernels = [], [], [], []
         for family in self.parser.discover_families():
             aot = self.parser.load_family_aot(family)
             arts = self.link_family(aot, family)
             kernels.extend(arts.kernels)
             operators.extend(arts.operators)
             affine_kernels.extend(arts.affine_kernels)
-        return kernels, operators, affine_kernels
+            flyc_kernels.extend(arts.flyc_kernels)
+        return kernels, operators, affine_kernels, flyc_kernels

@@ -18,6 +18,7 @@ tensor/scalar specs as an inert list — nothing here is built or validated.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,6 +39,8 @@ class FlycDecl(AtiNode):
 
     name: str                          # the placeholder def's __name__
     module_path: Path                  # resolved vendored-kernel-file path
+    desc_path: Path                    # the DESCRIPTION module's own file (Task 5c's DESC column)
+    functionals_of: str                # operator NAME this kernel's functionals come from (Task 5a)
     hints_cls: type | None             # the @ati.flyc.hints dataclass, or None
     fn: object                         # the placeholder def itself (the builder)
     tensors: list = field(default_factory=list)     # inert list[TensorSpec]
@@ -86,6 +89,16 @@ def collect_flyc_decl(placeholder, specs):
                 f'unexpected spec {s!r} in an @ati.flyc stack; flyc kernels accept '
                 f'@ati.flyc.*, @ati.tensor/@ati.scalar, @ati.cite and @ati.disable only')
     assert marker is not None, '@ati.start flyc path without an @ati.flyc.kernel marker'
+    assert marker.functionals_of is not None, (
+        f'@ati.flyc.kernel on {placeholder.__name__!r} is missing functionals_of=; '
+        f'Phase 1 has no other route to a functional space (flyc declares none of '
+        f'its own and is not an operator backend yet -- PLAN-PHASE1.md Task 5a)')
+    # The DESCRIPTION module's own file (e.g. modules/flash/aot/flyc_attn_fwd.py),
+    # NOT marker.module_path (the vendored kernel file under modules/flash/flyc/).
+    # This is what codegen/root.py's Fly.compile DESC column feeds to
+    # `aotriton.flyc_compile <desc_path> --kernel_name ...` (Task 5c).
+    desc_path = Path(inspect.getfile(placeholder)).resolve()
     return FlycDecl(name=placeholder.__name__, module_path=marker.module_path,
+                    desc_path=desc_path, functionals_of=marker.functionals_of,
                     hints_cls=hints_cls, fn=placeholder, tensors=tensors,
                     scalars=scalars, cite=cite, disable=disable)
