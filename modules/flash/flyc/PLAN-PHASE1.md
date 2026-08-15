@@ -1065,8 +1065,19 @@ cut -d';' -f5 <build>/Fly.compile | sort -u      # must print exactly "gfx1201"
 cut -d';' -f2 <build>/Fly.compile | sort | uniq -d   # must print nothing (no dup outputs)
 ```
 
-Also configure with `-DAOTRITON_NOIMAGE_MODE=ON` and confirm `Fly.compile` is absent, and
-run a sharded configure and confirm the merged file has the sum of the shards' lines.
+Also configure with `-DAOTRITON_NOIMAGE_MODE=ON` and confirm `Fly.compile` is **empty**
+(0 bytes, 0 rows) — not absent. The wording used to say "absent", which is no longer
+achievable: `launch_workers()` now `touch()`es every `shard_names` entry, so all four rule
+files (`Bare.compile`, `Bare.cluster`, `Bare.flatzip`, `Fly.compile`) always exist and are
+empty in noimage mode. That change came from the `AOTRITON_DEBUG_SKIP_TRITON_KERNELS` work,
+which needed `file(STRINGS)` to have a file to read; the behaviour under test — no flyc
+rules in a noimage build — is unchanged.
+
+Then run a sharded configure and confirm the merged file has the sum of the shards' lines.
+
+**Status: PASSED.** 288 rows for gfx1201, field count exactly 7, column 5 exactly
+`gfx1201`, no duplicate outputs; `Fly.compile` 0 bytes under `-DAOTRITON_NOIMAGE_MODE=ON`
+while `Bare.shim` is still generated.
 
 ## Task 6 — CMake side: build the hsacos as part of `all`
 
@@ -1154,6 +1165,32 @@ Every path in `Fly.compile` column 2 exists and is non-empty; spot-check three w
 `llvm-readelf -h` for `EM_AMDGPU` + `gfx1201`; confirm a plain `ninja` (no explicit target)
 also builds them. Then touch one description file and confirm only the affected hsacos
 rebuild.
+
+**Status: PASSED, with one caveat that is not this task's doing.** 288/288 outputs exist,
+3 ELF spot-checks are `EM_AMDGPU` / `Flags: 0x4e, gfx1201`, plain `ninja` builds them.
+
+**`BLOCK_DMODEL=48` is nondeterministic and needs retries.** On a first full pass, 4 of
+288 came out as 0-byte stubs with `"compile_status": "Exception"` — all four
+`BLOCK_DMODEL=48`. The exception is `flyc_compile._extract_hsaco`'s own assertion:
+
+```
+expected every gpu.binary object to be byte-identical, got 2 distinct blob(s) among 2
+```
+
+The module is serialized twice — once per attached target, `#rocdl.target<chip="gfx1201">`
+and the `no_wave64` variant — and at hd 48 the two results differ in **10,178 of 19,512
+bytes**, i.e. genuinely different `.text`, not padding. It is intermittent: 8 repeat runs
+of one hd-48 config gave 7 ok / 1 fail, another sample gave 1 ok / 2 fail, while hd 64 was
+8/8 clean. Deleting the empties and rebuilding converged to 0 after three passes, so every
+configuration *can* build.
+
+This is upstream nondeterminism in FlyDSL/LLVM, not a defect in Task 5/6, and the
+assertion is doing exactly the job it was added for. Two consequences:
+
+- Gate 6 may need `find <build> -name '*.hsaco' -empty -delete && ninja` a few times.
+- A CI build must not treat first-pass success as guaranteed. Worth an upstream report,
+  and worth deciding whether `hd 48` should stay in `FLYC_HEAD_DIMS` meanwhile — it is a
+  legitimate entry (`resolve_knobs` handles it), so removing it would be hiding the bug.
 
 ## Task 7 — package into `.aks2` and `aotriton.images/*.zip`
 
@@ -1283,6 +1320,36 @@ python -m zipfile -l <build>/aotriton.images/amd-gfx1201/flash/flyc_attn_fwd.zip
 Expect one zip entry per surviving functional, named by `unified_signature`. Unpack one
 `.aks2` and confirm it holds a single hsaco whose ELF is `EM_AMDGPU` / `gfx1201`. Then
 `ninja install` and confirm the zip appears under the install prefix.
+
+**Status: PASSED.** `ninja` produces `aotriton.images/amd-gfx120x/flash/flyc_attn_fwd.zip`,
+288 entries, all `STORED`, 2.6 MB of payload, zero stubs once the hd-48 flakiness above is
+retried out. Unpacking one entry (16-byte header: magic + 3×u32, then an LZMA stream)
+gives `kernels=1`, a 144-byte directory, and an embedded ELF at offset 144 that is
+`AMDGPU - HSA` / `EM_AMDGPU` / `Flags: 0x4e, gfx1201`. No CMake change was needed for
+Task 7, as 7c predicted.
+
+**A failed kernel does not corrupt the archive.** `aks2.py:62-68` already handles a
+zero-length blob: it writes a zero-size entry and asserts `compile_status != 'Complete'`.
+So the 4 hd-48 stubs packed as ~200-byte entries rather than breaking the zip. That is the
+pre-existing path Triton uses under `AOTRITON_BUILD_FOR_TUNING`.
+
+**`.aks2` files do NOT rebuild when their hsaco changes.** `DEPENDS aotriton_v2_compile`
+on a custom TARGET becomes an **order-only** edge in ninja — `ninja -t query` on any
+`.aks2` shows `|| v3src/aotriton_v2_compile`. Order-only means "build that first", not
+"I am dirty when it changes", so after rebuilding the 4 flaky hsacos the zip still
+contained their stale stubs, and a plain `ninja` reported nothing to do. Fixing the
+kernels required `rm -rf <build>/v3src/aks2` and a re-`ninja`.
+
+This is pre-existing and applies to Triton identically (same `DEPENDS` shape), and it is
+the same root cause as the cost problem below — the two are opposite faces of one
+too-coarse edge: everything must be built first, yet nothing is dirty when it changes.
+Both would be fixed by depending on the cluster's own hsacos, the list already written
+into the `.nsv`.
+
+*Caveat when clearing stale archives*: delete only `<build>/v3src/aks2`, never
+`<build>/v3src/aotriton.images` — `write_cluster` writes the `.nsv` ZIP manifests into the
+images tree at GENERATE time, so removing it breaks the build until the next `cmake`
+configure regenerates them.
 
 **Budget this gate: building ANY single `.aks2` builds EVERY hsaco in the tree — 47,766
 of them for one arch.** Measured, not estimated. `v3src/CMakeLists.txt:262` gives each
