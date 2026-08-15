@@ -139,6 +139,7 @@ class CompiledFamily:
         self.kernels = {}      # def-name -> KernelShell
         self.metros = {}       # backend enum-name -> MetroShell
         self.affines = {}      # affine NAME -> AffineDecl
+        self.flycs = {}        # flyc NAME -> FlycDecl (Task 5a; reached via aot.flyc_kernels)
         self.operators = {}    # op-name -> OperatorShell
         self.op_order = []     # operator NAMEs in declared order
 
@@ -181,6 +182,12 @@ class FamilyCompiler:
     def run(self):
         for op_def in getattr(self.aot, 'operators', []):
             self.visit_operator(op_def)
+        # A flyc description is reachable through neither `operators` NOR any
+        # backend ref (PLAN-PHASE1.md Task 5a/5e deliberately does not register it
+        # as one) -- `aot.flyc_kernels` is the second root modules/<family>/aot
+        # exposes just for this.
+        for flyc_def in getattr(self.aot, 'flyc_kernels', []):
+            self.visit_flyc(flyc_def)
         return self.compiled
 
     # --- operator + backend dispatch -----------------------------------------
@@ -223,6 +230,18 @@ class FamilyCompiler:
         if adecl.name not in self.compiled.affines:
             self.compiled.affines[adecl.name] = adecl
         return (b.index, 'affine', adecl.name)
+
+    def visit_flyc(self, flyc_def):
+        """Record a flyc description from `aot.flyc_kernels` (dedup by name, same
+        pattern as visit_affine). Not dispatched through `_node_kind` / backend_refs
+        -- flyc is not a backend in Phase 1 (Task 5a)."""
+        from aotriton.template_instantiation.specs.flyc import FlycDecl
+        node = getattr(flyc_def, '__ati_node__', None)
+        assert isinstance(node, FlycDecl), (
+            f'{self.family}: flyc_kernels entry {flyc_def!r} has no FlycDecl '
+            f'(not a passive @ati.flyc.kernel def)')
+        if node.name not in self.compiled.flycs:
+            self.compiled.flycs[node.name] = node
 
     # --- metro sub-plan descent (Call | Cond tree) ---------------------------
 

@@ -269,7 +269,7 @@ def _flyc_fwd_disabled(f):
 # so they are not perf fields on the context. They have to reach it some other way —
 # the JSON sidecar folded into the compiled-in metadata is the obvious candidate.
 @ati.flyc.hints(FlycFwdHints)
-@ati.flyc.kernel('../flyc/flash_attn_func_gfx1201_aiw.py')
+@ati.flyc.kernel('../flyc/flash_attn_func_gfx1201_aiw.py', functionals_of='op_attn_fwd')
 def flyc_attn_fwd(choices, hints):
     """Build one hsaco for the functional described by `choices`, optimized
     for `hints`.

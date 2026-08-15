@@ -29,6 +29,7 @@ from .bwd_preprocess_varlen import bwd_preprocess_varlen
 from .debug_simulate_encoded_softmax import debug_simulate_encoded_softmax
 from .aiter_fwd import aiter_fmha_v3_fwd
 from .aiter_bwd import aiter_fmha_v3_bwd
+from .flyc_attn_fwd import flyc_attn_fwd
 
 
 # --- triton metro backends (transpiled, never executed) -------------------
@@ -89,4 +90,9 @@ def op_attn_bwd():
 
 
 operators = [op_attn_fwd, op_attn_bwd]
-__all__ = ['operators']
+# Kept separate from `operators`: flyc is not an @ati.backend yet (Phase 2 change),
+# so it is not reachable by walking a backend tree. `flyc_attn_fwd` declares
+# `functionals_of='op_attn_fwd'` instead (PLAN-PHASE1.md Task 5a) and
+# `codegen/parser.py` reads this list directly.
+flyc_kernels = [flyc_attn_fwd]
+__all__ = ['operators', 'flyc_kernels']
