@@ -1179,18 +1179,43 @@ expected every gpu.binary object to be byte-identical, got 2 distinct blob(s) am
 
 The module is serialized twice — once per attached target, `#rocdl.target<chip="gfx1201">`
 and the `no_wave64` variant — and at hd 48 the two results differ in **10,178 of 19,512
-bytes**, i.e. genuinely different `.text`, not padding. It is intermittent: 8 repeat runs
-of one hd-48 config gave 7 ok / 1 fail, another sample gave 1 ok / 2 fail, while hd 64 was
-8/8 clean. Deleting the empties and rebuilding converged to 0 after three passes, so every
-configuration *can* build.
+bytes**. Characterised further:
+
+- Each serialization independently lands on one of **two** possible outputs. Neither
+  target is the stable one — both orderings have been observed (`plain=A, no_wave64=B`
+  and the exact mirror). They agree about half the time, which matches the observed
+  6 ok / 6 fail over 12 runs for two independent draws.
+- The two outputs are **not** semantically distinguishable by anything the artifact
+  exposes: both wave32, both `sgpr 104 / vgpr 121`, both LDS 6784, both
+  `max_flat_workgroup_size 256`, both exactly 2217 instructions.
+- The whole difference is late scheduling: VOPD dual-issue packing (`v_dual_mov_b32`
+  31↔32, `v_dual_mul_f32` 31↔30, with compensating single `v_mov_b32`/`v_mul_f32`),
+  `s_delay_alu` placement, and one `s_code_end` pad. A compiler determinism/QoI bug,
+  not — on this evidence — a codegen correctness bug. Unproven without a gfx1201 GPU.
+
+hd 64 was 8/8 clean. Deleting the empties and rebuilding converged to 0 after three
+passes, and every successful run produced the same artifact, so every configuration
+*can* build and the accepted artifact is stable.
 
 This is upstream nondeterminism in FlyDSL/LLVM, not a defect in Task 5/6, and the
 assertion is doing exactly the job it was added for. Two consequences:
 
 - Gate 6 may need `find <build> -name '*.hsaco' -empty -delete && ninja` a few times.
-- A CI build must not treat first-pass success as guaranteed. Worth an upstream report,
-  and worth deciding whether `hd 48` should stay in `FLYC_HEAD_DIMS` meanwhile — it is a
-  legitimate entry (`resolve_knobs` handles it), so removing it would be hiding the bug.
+- A CI build must not treat first-pass success as guaranteed. Worth an upstream report;
+  `hd 48` is a legitimate `FLYC_HEAD_DIMS` entry (`resolve_knobs` handles it), so dropping
+  it would hide the bug rather than fix it.
+
+**Do not "fix" this by relaxing the assertion**, tempting as it looks. Picking one blob
+unconditionally would make hd 48 build every time, but the artifact would then vary run to
+run — the assertion is precisely what makes the accepted output reproducible, since it only
+accepts when both draws agree. The trade is: keep the canary and retry (reproducible
+artifact, flaky build) or relax it (reliable build, irreproducible artifact). Phase 1 keeps
+the canary.
+
+Nothing dispatches to flyc yet — it is reached through `functionals_of=`, and
+`@ati.backend` registration is Phase 2 — so a missing hd-48 image is not user-visible
+today. It becomes visible the moment flyc is a real backend, which is the deadline for
+resolving this upstream.
 
 ## Task 7 — package into `.aks2` and `aotriton.images/*.zip`
 
