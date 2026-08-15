@@ -26,9 +26,9 @@
 | 2.5 flydsl in the build venv | done, merged. **Gate now FULLY verified** — see "CMake unblocked" below. The old `find_package(hip REQUIRED)` failure was upstream #207, fixed by rebasing. |
 | 3 `flyc_compile.py` | done, merged. Then **rewritten** by `jit2aot-exec.md` steps 1-6 (`4731404`..`1ea44e5`) — see below. |
 | 4 `ati.flyc.*` + `ir/flyc/` | done, merged. **Gate 3 verified independently**: 13496-byte ELF, `EM_AMDGPU`, `Flags: 0x4e, gfx1201`, symbol `flash_attn_func_aiw_kernel_0`, sidecar `block_m=256` / `block_size=512`; 12/12 sweep. |
-| 5 generator emits `Fly.compile` | **not started** |
-| 6 CMake rule loop | **not started** — gate needs a working configure, so it will be structurally complete but unverified here |
-| 7 aks2 / flatzip packaging | **not started** — same ceiling as 6 |
+| 5 generator emits `Fly.compile` | done, merged (`751b186c`). Gate 5 verified: 288 rows, 7 fields, `gfx1201`, no dup outputs. |
+| 6 CMake rule loop | done, merged (`c18ade5e`). Gate 6 verified: 288/288 hsacos, ELF spot-checks pass. **hd 48 is flaky upstream** — see below. |
+| 7 aks2 / flatzip packaging | done, merged (`3b3279e1`). **Deliverable exists**: `aotriton.images/amd-gfx120x/flash/flyc_attn_fwd.zip`, 288 entries. |
 
 ### This review
 
@@ -172,6 +172,42 @@ Also fixed while gating: `flyc_bootstrap`'s dead `<repo>/third_party/flydsl` fal
 (`1a0b182c`). PLAN-PHASE1.md:376 already said the variable is required with no fallback;
 the code had drifted, and the stale default produced a *misleading* error under a
 non-editable install — it advertised `<site-packages>/third_party/flydsl`.
+
+### Tasks 5-7: done and merged. Phase 1's deliverable exists.
+
+`751b186c` / `c18ade5e` / `3b3279e1`, merged fast-forward. Verified independently in a
+worktree-shadowed build, not taken on report:
+
+- **Gate 5** — 288 rows, field count exactly 7, column 5 exactly `gfx1201`, no duplicate
+  outputs. Under `-DAOTRITON_NOIMAGE_MODE=ON`, `Fly.compile` is 0 bytes (see below).
+- **Gate 6** — 288/288 hsacos, three ELF spot-checks `EM_AMDGPU` / `Flags: 0x4e, gfx1201`,
+  plain `ninja` builds them.
+- **Gate 7** — `aotriton.images/amd-gfx120x/flash/flyc_attn_fwd.zip`, 288 entries, all
+  `STORED`. Unpacked one aks2: 1 kernel, embedded ELF `AMDGPU - HSA` / gfx1201. **No CMake
+  change was needed**, exactly as your `Fly.compile`-only simplification predicted.
+- suite 192 passed / 7 skipped; plain `ninja` links `libaotriton_v2.so.0.14.0`.
+
+Three things worth your attention, none of them defects in Tasks 5-7:
+
+1. **`BLOCK_DMODEL=48` is nondeterministic upstream.** First full pass produced 4 zero-byte
+   stubs, all hd 48, from `_extract_hsaco`'s assertion: the module is serialized twice
+   (plain and `no_wave64` targets) and the two results differ in 10,178 of 19,512 bytes.
+   Intermittent — 8 repeats of one config gave 7 ok / 1 fail; hd 64 was 8/8 clean. Three
+   delete-and-rebuild passes converged to 0. So every config *can* build, but a CI run
+   cannot assume first-pass success. `hd 48` is a legitimate `FLYC_HEAD_DIMS` entry, so
+   dropping it would hide the bug rather than fix it. Worth an upstream FlyDSL report.
+2. **`.aks2` never rebuilds when its hsaco changes.** `DEPENDS aotriton_v2_compile` is an
+   **order-only** ninja edge (`||` in `ninja -t query`), so after fixing the flaky hsacos
+   the zip still held stale stubs and `ninja` said nothing to do. Pre-existing, identical
+   for Triton, and the same root cause as the "one aks2 builds all 47,766 hsacos" cost
+   noted in Gate 7 — one edge that is too coarse in both directions.
+3. **`write_image_signature.py` imports triton unconditionally**, so even a
+   `-DAOTRITON_DEBUG_SKIP_TRITON_KERNELS=ON` build needs the triton wheel installed in the
+   venv. Pre-existing; my debug option deliberately leaves the wheel install alone.
+
+Also corrected: Gate 5 said `Fly.compile` must be **absent** under noimage. It cannot be —
+my `touch()` fix made every `shard_names` entry always exist. All four rule files are
+0 bytes there; the behaviour under test is unchanged. Plan updated.
 
 ### Where to continue
 
