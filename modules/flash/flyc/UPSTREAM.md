@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: 971dce489ee5d4eed6938675549d7d7a3143ce4f
+commit: 93d8d497f8e9bbc66106617feb851cf0fb12acd3
 path:   kernels/attention/parity/
 ```
 
@@ -48,7 +48,7 @@ root on `sys.path`; replaced by the interim described below),
 ## Task 0 interim — how `kernels.common` resolves today
 
 `kernels/common` is not in the installed flydsl 0.3.1 wheel (verified:
-`find_spec('kernels')` is `None` in `/home/xinyazha/.venvs/nogpu`). Until an
+`find_spec('kernels')` is `None` in the flydsl wheel). Until an
 upstream packaging change ships it as `flydsl.kernels.common`, the build
 shallow-clones a FlyDSL source tree at the `third_party/flydsl-kernel.txt` tag
 and `python/flyc_bootstrap.py` puts its root — `$AOTRITON_FLYDSL_KERNEL_ROOT`,
@@ -81,10 +81,14 @@ table's right column changes.
 
 | file | replace | with (interim) | with (post-packaging) |
 |---|---|---|---|
-| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import buffer_ops, wmma_ops` | `from kernels.common import buffer_ops`<br>`import flyc_polyfill as wmma_ops` | `from flydsl.kernels.common import buffer_ops`<br>`from flydsl.kernels.common.mma import wmma_ops` |
+| `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import buffer_ops` | `from kernels.common import buffer_ops` | `from flydsl.kernels.common import buffer_ops` |
 | `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
-| `fmha_common_gfx1201.py` | `from gfx1201_standalone import kernels_common` | `from kernels.common import kernels_common` | `from flydsl.kernels.common import kernels_common` |
+| `fmha_common_gfx1201.py` | `from gfx1201_standalone import buffer_ops, kernels_common, wmma_ops` | `from kernels.common import buffer_ops, kernels_common`<br>`import flyc_polyfill as wmma_ops` | `from flydsl.kernels.common import buffer_ops, kernels_common`<br>`from flydsl.kernels.common.mma import wmma_ops` |
 | `fmha_common_gfx1201.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+
+`wmma_ops` moved from `flash_attn_func_gfx1201_aiw.py` to `fmha_common_gfx1201.py` in the
+`93d8d497` re-sync (upstream's "the shared prologue moves to fmha_common"); the set of
+symbols taken is unchanged, only which file takes them.
 
 ### Why two of those go to `flyc_polyfill` rather than `kernels.common`
 
@@ -121,16 +125,23 @@ what those already assume, same contract as `modules/flash/kernel/`.
 
 ## Torch-lazy rewrites (1b)
 
-`fmha_abi_gfx1201.py` had two module-scope torch imports. The build venv must
-never have torch (`CMakeLists.txt:142`), so both became function-local. Both
-uses were already inside functions.
+`fmha_abi_gfx1201.py` has two module-scope torch imports. The build venv must
+never have torch (`CMakeLists.txt:142`), so both become function-local. Every
+use is already inside a function.
+
+**Three** insertion points as of `93d8d497`, up from two: upstream split the
+rank-2 f32 row check into two callers, so `torch_f32` is now needed in both.
 
 | where | before | after |
 |---|---|---|
-| module scope (~line 33) | `import torch` | deleted |
-| module scope (~line 35) | `from torch import float32 as torch_f32` | deleted |
-| `lse_args()` (first statement) | — | `from torch import float32 as torch_f32  # lazy: build venv has no torch (CMakeLists.txt:142)` |
-| `u64_scalar()` (immediately before `with torch.cuda.stream(...)`) | — | `import torch  # lazy: only reached when caller passes a plain int seed; the AOT driver passes None` |
+| module scope | `import torch` | deleted |
+| module scope | `from torch import float32 as torch_f32` | deleted |
+| the rank-2 f32 row check, first statement (`if t is None:`) | — | `from torch import float32 as torch_f32  # lazy: the build venv has no torch` |
+| the logsumexp pointer helper, first statement (`if lse is None:`) | — | `from torch import float32 as torch_f32  # lazy: the build venv has no torch` |
+| the philox u64 scalar helper, first statement | — | `import torch  # lazy: only reached for a plain int seed; AOT passes None` |
+
+Locate them by searching for `torch_f32` and `torch.cuda.stream` rather than by
+line number — the file has been restructured once already.
 
 Neither rewrite changes behaviour: `lse_args`'s `torch_f32` check and
 `u64_scalar`'s `torch.cuda.stream`/`torch.tensor` calls only execute when a
@@ -173,6 +184,33 @@ read), record the addition here:
   as of the vendored commit; `_launch` passes it to `abi.dropout_args(...,
   Q.device, stream)` unconditionally (`flash_attn_func_gfx1201_aiw.py:2284`),
   even when dropout is disabled.
+
+## Re-sync cost, measured at `93d8d497`
+
+The `971dce48` -> `93d8d497` re-sync was done deliberately as a cost experiment: copy all
+five files verbatim first, then re-wire, and see what it takes.
+
+| | |
+|---|---|
+| upstream commits spanned | 287 (the branch had also been **rebased**, so `<old>..HEAD` is not a usable diff) |
+| upstream lines changed in vendored files | 443 across 3 of 5 files |
+| **our re-wiring** | **28 lines**: 2 import blocks + 3 lazy-torch insertions |
+| polyfill changes needed | none — same 5 symbols, only redistributed between files |
+| ATI description changes needed | none |
+| emitted hsaco | **byte-identical across all 12 sweep configurations** |
+
+So a large upstream drift cost almost nothing here, and that is a property of the
+vendoring strategy rather than luck: the only coupling points are the `gfx1201_standalone`
+imports and the module-scope torch imports, both of which are mechanical and both of which
+this file enumerates. The kernarg ABI was independently re-verified — 45 launcher / 44
+kernel params, `launcher-minus-stream == kernel` names in order, and the description's 29
+declared operands still in matching relative order (the other 15 kernel params are
+`stride_*`, supplied by `strides='stride_q_*'` wildcards).
+
+Two things that would have made it expensive, neither of which happened: a new
+branch-local helper (would need a `flyc_polyfill.py` entry) or a kernarg reorder (would
+need the description's operand list re-ordered, and it is order-sensitive). Check both
+explicitly on every re-sync — the AST order check is the cheap way.
 
 ## Re-sync procedure
 
