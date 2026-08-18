@@ -70,11 +70,14 @@ own warning.
 
 from dataclasses import dataclass
 
-from kernels.common import kernels_common
-# Import rewrite (see UPSTREAM.md): every symbol this file takes from
-# `kernels.common.utils` -- ssel, smin, smax, sdiv_rd_pow2 -- is branch-local,
-# so the name aliases the polyfill wholesale and no call site below changes.
-# `kernels_common` above is NOT rewritten: _if_then is in the released tree.
+from kernels.common import buffer_ops, kernels_common
+# Import rewrite (see UPSTREAM.md): `wmma_ops`, and every symbol this file takes
+# from `kernels.common.utils` -- ssel, smin, smax, sdiv_rd_pow2 -- are
+# branch-local and absent from the released tag the build clones, so both names
+# alias the polyfill wholesale and no call site below changes. `buffer_ops` and
+# `kernels_common` are NOT rewritten: `get_element_ptr` and `_if_then` are in
+# the released tree.
+import flyc_polyfill as wmma_ops
 import flyc_polyfill as common_utils
 
 import flydsl.expr as fx
@@ -86,6 +89,10 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 __all__ = [
+    "wave_lanes",
+    "llvm_value",
+    "split_ptr",
+    "wmma_acc",
     "pointer_to_llvm_ptr",
     "load_geom",
     "acc_elem_column",
@@ -125,6 +132,66 @@ __all__ = [
     "philox_seed_value",
     "philox_report",
 ]
+
+
+def wave_lanes(warp_size):
+    """`(tid, wave_id, lane, lane16, klane)` -- this thread's place in the block.
+
+    The same five lines opened all four kernels. `lane16` and `klane` are the
+    WMMA operand split rather than anything general: a 16x16x16 fragment puts
+    the row/column in `lane % 16` and the K offset in `lane // 16`, which is
+    why they belong together with the wave decomposition and not with the
+    caller's tiling.
+
+    **Emission order is load-bearing** and matches what the four kernels had
+    line for line: `//` before `%`, then the two lane splits. Reordering the
+    first two is behaviour-preserving but moves the SSA definitions, which at
+    head_dim 384 -- where the kernel is pinned at 256 VGPRs -- was enough to
+    reschedule the whole body. Same instruction mix and same count, different
+    order; not a regression, but not something to change by accident either.
+    """
+    tid = fx.Index(gpu.thread_idx.x)
+    wave_id = tid // warp_size
+    lane = tid % warp_size
+    return tid, wave_id, lane, lane % 16, lane // 16
+
+
+def wmma_acc(a_v8, b_v8, c_v8):
+    """One 16x16x16 WMMA into an f32 accumulator.
+
+    Dispatch is on the operand element type, inside `wmma_ops`, rather than on
+    a `dtype_str` here -- see that module for why. Was a closure over
+    `v8f32_type` in all four kernels; the type is a context lookup, so making
+    it here costs nothing and removes the closure.
+    """
+    return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, Vec.make_type(8, fx.Float32))
+
+
+def llvm_value(value):
+    """Unwrap a FlyDSL scalar/vector wrapper for a raw LLVM pointer op."""
+    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
+        return value.ir_value()
+    return value
+
+
+def split_ptr(ptr, base64, off, elem_type):
+    """`ptr + base64 + off`, both 64-bit, added as two element steps.
+
+    The split is for the addressing mode, not for arithmetic: `base64` is
+    uniform across the wave and `off` is divergent, and keeping them separate
+    is what lets `SelectGlobalSAddr` hold the base in SGPRs instead of forcing
+    a 64-bit VGPR address pair.
+
+    **`off` must not be narrowed to i32.** It carries `row_in_tile * s_seq`,
+    and a view keeps the strides of the tensor it was taken from rather than
+    of the shape the kernel sees: eight heads sliced out of a 1 GiB
+    `(1, 64, 16384, 512)` f16 tensor give `s_seq = 8388608`, whose 256th row
+    is exactly 2**31. The truncation wrapped and the kernel read another
+    allocation. `s_seq` is already `fx.Index`, so the product was always
+    computed in 64 bits; only the cast threw the high half away.
+    """
+    p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
+    return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
 
 
 def pointer_to_llvm_ptr(ptr) -> ir.Value:
