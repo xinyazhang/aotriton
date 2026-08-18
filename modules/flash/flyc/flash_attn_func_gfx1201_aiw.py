@@ -108,13 +108,11 @@ from fmha_tuning_gfx1201 import (  # noqa: F401
     vo_chunks,
 )
 from kernels.common import buffer_ops
-# Import rewrite (see UPSTREAM.md): upstream reads these from
-# `kernels.common.mma.wmma_ops` and `kernels.common.utils`, which only the
-# gfx1201 feature branch has. Every symbol this file takes from the two
-# modules -- wmma_f32_16x16x16, ssel, smax -- is branch-local, so both names
-# alias the polyfill wholesale and no call site below changes. `buffer_ops`
-# above is NOT rewritten: get_element_ptr is in the released tree.
-import flyc_polyfill as wmma_ops
+# Import rewrite (see UPSTREAM.md): the only symbol this file takes from
+# `kernels.common.utils` is `smax`, which is branch-local and absent from the
+# released tag the build clones, so the name aliases the polyfill wholesale and
+# no call site below changes. `buffer_ops` is NOT rewritten: `get_element_ptr`
+# is in the released tree.
 import flyc_polyfill as common_utils
 from philox import Philox
 
@@ -155,22 +153,15 @@ def dtype_to_elem_type(dtype_str: str):
     raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')")
 
 
-def _llvm_value(value):
-    """Unwrap FlyDSL scalar/vector wrappers for LLVM pointer load ops."""
-    if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
-        return value.ir_value()
-    return value
-
-
 _COMPILED = abi.new_compiled_cache()
 
 
 def _pointer_load(result_type: ir.Type, ptr: ir.Value) -> ir.Value:
-    return _llvm.LoadOp(result_type, _llvm_value(ptr)).result
+    return _llvm.LoadOp(result_type, fmha.llvm_value(ptr)).result
 
 
 def _pointer_store(value: ir.Value, ptr: ir.Value):
-    return _llvm.StoreOp(_llvm_value(value), _llvm_value(ptr))
+    return _llvm.StoreOp(fmha.llvm_value(value), fmha.llvm_value(ptr))
 
 
 # Causal alignment as a *window* sentinel, AOTriton's `WindowValue`. These
@@ -793,14 +784,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         v_ptr = fmha.pointer_to_llvm_ptr(V)
         v_ptr_i64 = _to_global_ptr_i64(V)
         o_ptr = fmha.pointer_to_llvm_ptr(O)
-        v8f32_type = Vec.make_type(8, fx.Float32)
         v8f16_type = Vec.make_type(8, elem_dtype)
         vxf16_type = Vec.make_type(VEC_WIDTH, elem_dtype)
-
-        def wmma_acc(a_v8, b_v8, c_v8):
-            # Dispatch is on the operand element type, in `wmma_ops`, rather
-            # than on `dtype_str` here -- see that module for why.
-            return wmma_ops.wmma_f32_16x16x16(a_v8, b_v8, c_v8, v8f32_type)
 
         # ---- Varlen prologue: VarlenBits -> six scalars ----
         #
@@ -837,12 +822,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _lds_byte_base = fx.as_ir_value(fx.ptrtoint(lds_kv))
         _RED_BYTE0 = (LDS_V_BASE if RED_ALIASES_V else LDS_KV_TOTAL_SIZE - (RED_F32_TOTAL * 4 + 1) // 2) * 2
 
-        tid = fx.Index(gpu.thread_idx.x)
-
-        wave_id = tid // WARP_SIZE
-        lane = tid % WARP_SIZE
-        lane16 = lane % 16
-        klane = lane // 16
+        tid, wave_id, lane, lane16, klane = fmha.wave_lanes(WARP_SIZE)
 
         # (q_tile, shard) decomposition of the wave index. At QK_SHARDS == 1
         # this is q_tile == wave_id and shard == 0, i.e. the unsharded mapping.
@@ -909,7 +889,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # unmapped page. It is a *read*, and one whose result is discarded, so
         # smaller overshoots land inside the allocation and are silently
         # harmless, which is exactly why the varlen tests did not catch it.
-        _q_start_addr = fx.Index(_alive.select(start_q, fx.Index(0)))
+        _q_start_addr = fx.Index(start_q if _alive else fx.Index(0))
 
         # MQA/GQA: Num_head_q / Num_head_k query heads share each KV head.
         # The ratio is uniform and computed once, so the scalar divide is
@@ -1099,29 +1079,11 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             needs_guard=V_NEEDS_GUARD,
         )
 
-        def _split_ptr(ptr, base64, off):
-            """ptr + base64 (uniform) + off (divergent). Both 64-bit.
-
-            `off` used to be truncated to i32 on the reasoning that a
-            within-tile offset is small. It is not: it carries
-            `row_in_tile * s_seq`, and a non-compact input's sequence stride is
-            bounded by the tensor its view was taken from, not by the shape the
-            kernel sees. Slicing eight heads out of a 1 GiB
-            (1, 64, 16384, 512) f16 tensor gives `s_seq = 8388608`, and 256
-            rows of that is exactly 2**31 -- so the truncation wrapped and the
-            kernel read another allocation.
-
-            `s_seq` is already `fx.Index`, so the product was always computed
-            in 64 bits; only this cast threw the high half away.
-            """
-            p = buffer_ops.get_element_ptr(ptr, fx.Int64(base64), elem_type=elem_type)
-            return buffer_ops.get_element_ptr(p, fx.Int64(off), elem_type=elem_type)
-
         def _load_global_half_vec(ptr, base64, off32, vec_type):
-            return _pointer_load(vec_type, _split_ptr(ptr, base64, off32))
+            return _pointer_load(vec_type, fmha.split_ptr(ptr, base64, off32, elem_type))
 
         def _store_global_half(ptr, base64, off32, val):
-            _pointer_store(val, _split_ptr(ptr, base64, off32))
+            _pointer_store(val, fmha.split_ptr(ptr, base64, off32, elem_type))
 
         def load_global_f16xN(base_ptr, base64, off32):
             return _load_global_half_vec(base_ptr, base64, off32, vxf16_type)
@@ -1361,8 +1323,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             _full_end = (seqlen_k_v // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N)
             kv_upper = fx.Index(((seqlen_k_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)) * fx.Index(BLOCK_N))
             # Same empty-work clamp as the causal arm above.
-            _full_end = fx.Index(_alive.select(_full_end, fx.Index(0)))
-            kv_upper = fx.Index(_alive.select(kv_upper, fx.Index(0)))
+            _full_end = fx.Index(_full_end if _alive else fx.Index(0))
+            kv_upper = fx.Index(kv_upper if _alive else fx.Index(0))
 
         # Tiles this workgroup will actually walk. Zero for a sequence with no
         # keys and for every workgroup the varlen grid dispatches past the end
@@ -1384,11 +1346,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         if const_expr(CAUSAL):
             _first_col = fx.Index(
                 common_utils.smax(
-                    common_utils.ssel(
-                        (_n_f > fx.Int32(0)),
-                        _f_col0,
-                        _m_col0,
-                    ),
+                    _f_col0 if _n_f > fx.Int32(0) else _m_col0,
                     fx.Int32(0),
                 )
             )
@@ -1412,13 +1370,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         # scalars only and rejects the list of vectors a prefetch produces,
         # while a loop carries exactly that list. The trip count is uniform
         # across the workgroup, so no divergence is introduced.
-        _pf_n = fx.Index(
-            common_utils.ssel(
-                (_kv_tiles_i32 > fx.Int32(0)),
-                fx.Int32(1),
-                fx.Int32(0),
-            )
-        )
+        _pf_n = fx.Index(fx.Int32(1) if _kv_tiles_i32 > fx.Int32(0) else fx.Int32(0))
         _pf_init = []
         if const_expr(K_PREFETCH_DIST):
             for _ in range_constexpr(k_ap.num_batches):
@@ -1533,8 +1485,12 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     acc_idx_a = st_idx * 2
                     acc_idx_b = st_idx * 2 + 1
                     for qt in range_constexpr(ROW_SUBTILES):
-                        s_accs_all[qt][acc_idx_a] = wmma_acc(k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a])
-                        s_accs_all[qt][acc_idx_b] = wmma_acc(k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b])
+                        s_accs_all[qt][acc_idx_a] = fmha.wmma_acc(
+                            k_pack_a, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_a]
+                        )
+                        s_accs_all[qt][acc_idx_b] = fmha.wmma_acc(
+                            k_pack_b, q_b_packs_all[qt][ks], s_accs_all[qt][acc_idx_b]
+                        )
 
             # ==== Cross-shard S reduction ====
             # Each shard-wave holds a partial sum over its own BLOCK_DMODEL slice;
@@ -1669,7 +1625,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             # term inert.
                             _dead = _dead | (_col > q_row_i32 + _wr_i32)
                             _dead = _dead | (_col < q_row_i32 - _wl_i32)
-                        s_raw[_i] = _dead.select(c_neg_inf, s_raw[_i])
+                        s_raw[_i] = c_neg_inf if _dead else s_raw[_i]
 
                 local_max = s_raw[0]
                 for r in range_constexpr(NUM_S_VALS - 1):
@@ -1718,7 +1674,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         _keep = PHILOX.keep_span(_ph_seed, _first, 8, idropout_p)
                         for _r in range_constexpr(8):
                             _i = _st * 8 + _r
-                            p_vals[_i] = fx.as_ir_value(_keep[_r].select(fx.Float32(p_vals[_i]), fx.Float32(0.0)))
+                            p_vals[_i] = fx.as_ir_value(fx.Float32(p_vals[_i]) if _keep[_r] else fx.Float32(0.0))
 
                 m_new_all.append(m_new_raw)
                 l_new_all.append(l_new)
@@ -1788,7 +1744,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         # the V LDS reads per FLOP at ROW_SUBTILES > 1.
                         for st_idx in range_constexpr(COL_SUBTILES):
                             for qt in range_constexpr(ROW_SUBTILES):
-                                o_accs_all[qt][_vc * D_CHUNKS + dc] = wmma_acc(
+                                o_accs_all[qt][_vc * D_CHUNKS + dc] = fmha.wmma_acc(
                                     cur_v_packs[st_idx],
                                     p_packs_all_qt[qt][st_idx][pks],
                                     o_accs_all[qt][_vc * D_CHUNKS + dc],
@@ -1871,11 +1827,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # The successor of the last full tile is the first masked one,
                 # which is only the adjacent tile when the left run is empty.
                 _nxt = fx.Index(
-                    common_utils.ssel(
-                        (fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32),
-                        fx.Int32(kv_block_start) + _BN_I32,
-                        _m_col0,
-                    )
+                    fx.Int32(kv_block_start) + _BN_I32
+                    if fx.Int32(kv_block_start) + _BN_I32 < _f_col0 + _n_f * _BN_I32
+                    else _m_col0
                 )
                 loop_results = yield kv_loop_body(kv_block_start, inner_iter_args, False, next_kv_start=_nxt)
 
@@ -1884,11 +1838,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 right one. Discontinuous at the seam, which is exactly why the
                 prefetch has to go through this same map."""
                 _i = fx.Int32(i_idx)
-                return common_utils.ssel(
-                    (_i < _n_l),
-                    _l_col0 + _i * _BN_I32,
-                    _r_col0 + (_i - _n_l) * _BN_I32,
-                )
+                return _l_col0 + _i * _BN_I32 if _i < _n_l else _r_col0 + (_i - _n_l) * _BN_I32
 
             for _mi, inner_iter_args in range(fx.Index(0), _n_masked, 1, init=loop_results):
                 loop_results = yield kv_loop_body(
@@ -1946,9 +1896,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                 # zero for exactly the rows that must contribute nothing.
                 # l is bit-exact 0 there, so test the bit pattern; integer
                 # compares lower predictably.
-                _lse = (fmha.bitcast_i32(fx.Float32(_l)) != fx.Int32(0)).select(
-                    fx.Float32(_lse), fx.Float32(float("inf"))
-                )
+                _lse = fx.Float32(_lse) if fmha.bitcast_i32(fx.Float32(_l)) != fx.Int32(0) else fx.Float32(float("inf"))
                 # LSE_LAYOUT, VarlenBits bits 17:16. The *inputs* are Q's
                 # decode -- batch, row offset, length -- so the two layouts
                 # are the same indices arranged two ways, not two features
@@ -2062,7 +2010,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     ):
         ctx = CompilationContext.get_current()
 
-        nseq_idx = fx.Index((num_seqlens != fx.Int32(0)).select(num_seqlens, batch_size))
+        nseq_idx = fx.Index(num_seqlens if num_seqlens != fx.Int32(0) else batch_size)
         # Grid Q extent keys on Max_seqlen_q: under varlen there is no single
         # seqlen_q, so every sequence gets the longest one's worth of
         # workgroups and the short ones exit empty (plan section 6).
@@ -2225,45 +2173,9 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             raise ValueError(f"bias must have a contiguous last (Sk) dimension, got " f"stride(3)={bias.stride(3)}")
         return (abi.ptr_arg(bias), bias.stride(0), bias.stride(1), bias.stride(2))
 
-    def _resolve_scale(Q, scale):
-        """Default sm_scale from the tensor's *real* head dim, not the tile.
-
-        The builder can only default to `1/sqrt(BLOCK_DMODEL)`, since it has no
-        idea what `hdim_qk` will be -- and under PADDED_HEAD that is the wrong
-        number. Deriving it here from `Q.shape[3]` is right in both cases and
-        identical to the builder default whenever hdim == the tile.
-        """
-        if scale is not None:
-            return float(scale)
-        if PADDED_HEAD and hasattr(Q, "shape"):
-            return 1.0 / host_math.sqrt(Q.shape[3])
-        return float(sm_scale)
-
-    def _prep(Q, K, V, O):  # noqa: E741
-        """Pointers, head counts and the twelve strides, in launch order.
-
-        Deliberately does **not** flatten: `t.reshape(-1)` materialises a copy
-        for any non-contiguous tensor, which would silently defeat the whole
-        point of reading strides. `data_ptr()` is the tensor's base either way.
-        """
-        st = []
-        for t, name in ((Q, "Q"), (K, "K"), (V, "V"), (O, "O")):
-            st.extend(abi.strides_of(t, name))
-        # BHSD: axis 1 is heads, axis 2 the sequence. Read rather than
-        # assumed -- under MQA/GQA K and V carry fewer heads than Q.
-        nhq, nhk = Q.shape[1], K.shape[1]
-        hqk, hvo = Q.shape[3], V.shape[3]
-        if V.shape[1] != nhk:
-            raise ValueError(f"K and V must share num_heads, got {nhk} and {V.shape[1]}")
-        if O.shape[1] != nhq:
-            raise ValueError(f"O and Q must share num_heads, got {O.shape[1]} and {nhq}")
-        if nhq % nhk:
-            raise ValueError(f"num_heads_q ({nhq}) must be divisible by num_heads_k ({nhk})")
-        return [abi.ptr_arg(t) for t in (Q, K, V, O)], (nhq, nhk, hqk, hvo), st
-
     launch_flash_attn_aiw.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(
+    def _args(
         Q,
         K,
         V,
@@ -2285,116 +2197,69 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         philox_seed_output=None,
         philox_offset_output=None,
     ):  # noqa: E741
+        """Every kernel argument but the stream, in launch order.
+
+        `_launch` and `_compile` were 62 identical lines out of 66, differing
+        only in whether the tail is `run_compiled` or `flyc.compile` and how
+        the stream is spelled. dQ already had this shape; the forward did not.
+        """
         seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta, st = _prep(Q, K, V, O)
+        ptrs, meta, st = abi.prep_tensors([("Q", Q), ("K", K), ("V", V), ("O", O)], q_heads=("O",))
         _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
         _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
         _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
             STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
         )
         _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
+        # `_hold` keeps a materialised philox scalar alive across the launch;
+        # see `abi.u64_scalar`. Returned so the caller's frame owns it.
         _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
             ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
         )
         _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
-        abi.run_compiled(
-            _COMPILED,
-            launch_flash_attn_aiw,
-            *ptrs,
-            _lse_p,
-            _bp,
-            _sq0,
-            _sq1,
-            _sk0,
-            _sk1,
-            _vb,
-            batch_size,
-            num_seqlens,
-            _mq,
-            _mk,
-            _wl,
-            _wr,
-            _ps,
-            _po1,
-            _po2,
-            _so,
-            _oo,
-            _ip,
-            _dsc,
-            *meta,
-            *st,
-            _sb0,
-            _sb1,
-            _sb2,
-            _resolve_scale(Q, scale),
-            stream if stream is not None else fx.Stream(None),
+        return (
+            (
+                *ptrs,
+                _lse_p,
+                _bp,
+                _sq0,
+                _sq1,
+                _sk0,
+                _sk1,
+                _vb,
+                batch_size,
+                num_seqlens,
+                _mq,
+                _mk,
+                _wl,
+                _wr,
+                _ps,
+                _po1,
+                _po2,
+                _so,
+                _oo,
+                _ip,
+                _dsc,
+                *meta,
+                *st,
+                _sb0,
+                _sb1,
+                _sb2,
+                abi.resolve_scale(Q, scale, PADDED_HEAD, sm_scale),
+            ),
+            _hold,
+            stream,
         )
 
-    def _compile(
-        Q,
-        K,
-        V,
-        O,  # noqa: E741
-        batch_size,
-        seqlen_q,
-        seqlen_k=None,
-        num_seqlens=0,
-        scale=None,
-        stream=None,
-        lse=None,
-        window=None,
-        varlen=None,
-        bias=None,
-        dropout_p=None,
-        philox_seed=0,
-        philox_offset1=None,
-        philox_offset2=0,
-        philox_seed_output=None,
-        philox_offset_output=None,
-    ):  # noqa: E741
-        seqlen_k = seqlen_q if seqlen_k is None else seqlen_k
-        ptrs, meta, st = _prep(Q, K, V, O)
-        _lse_p = abi.lse_args(lse, seqlen_q, varlen, meta[0])
-        _wl, _wr = abi.resolve_window(CAUSAL_TYPE, HOST_CAUSAL_TYPE, window, seqlen_q, seqlen_k)
-        _vb, _sq0, _sq1, _sk0, _sk1, _mq, _mk = abi.varlen_args(
-            STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens
-        )
-        _bp, _sb0, _sb1, _sb2 = _bias_args(bias)
-        _ps, _po1, _po2, _ip, _dsc, _hold = abi.dropout_args(
-            ENABLE_DROPOUT, dropout_p, philox_seed, philox_offset1, philox_offset2, Q.device, stream
-        )
-        _so, _oo = abi.dropout_outputs(ENABLE_DROPOUT, philox_seed_output, philox_offset_output)
-        return flyc.compile(
-            launch_flash_attn_aiw,
-            *ptrs,
-            _lse_p,
-            _bp,
-            _sq0,
-            _sq1,
-            _sk0,
-            _sk1,
-            _vb,
-            batch_size,
-            num_seqlens,
-            _mq,
-            _mk,
-            _wl,
-            _wr,
-            _ps,
-            _po1,
-            _po2,
-            _so,
-            _oo,
-            _ip,
-            _dsc,
-            *meta,
-            *st,
-            _sb0,
-            _sb1,
-            _sb2,
-            _resolve_scale(Q, scale),
-            fx.Stream(stream),
-        )
+    def _launch(*args, **kwargs):
+        """Dispatch one forward pass. Signature is `_args`'s, which binds it."""
+        packed, _hold, stream = _args(*args, **kwargs)
+        abi.run_compiled(_COMPILED, launch_flash_attn_aiw, *packed, stream if stream is not None else fx.Stream(None))
+
+    def _compile(*args, **kwargs):
+        """AOT-compile the same call `_launch` would dispatch."""
+        packed, _hold, stream = _args(*args, **kwargs)
+        return flyc.compile(launch_flash_attn_aiw, *packed, fx.Stream(stream))
 
     _launch.compile = _compile
     # Still attached to the launcher, for the callers and tests that reach them
