@@ -176,7 +176,9 @@ def _build_flycs(compiled, operators):
             f'operators: {sorted(operators)}')
         kdesc = KernelDescription(name=name, family=compiled.family,
                                   module_path=decl.module_path, disable=decl.disable,
-                                  functionals_source=op)
+                                  functionals_source=op,
+                                  tensors=decl.tensors, scalars=decl.scalars,
+                                  builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
         out[name] = kdesc
     return out
