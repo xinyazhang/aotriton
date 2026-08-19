@@ -25,6 +25,18 @@ from .common import codegen_struct_cfields, codegen_includes
 from .flytune import FlycTuneCodeGenerator
 
 
+# TODO(de-duplication): this generator and codegen/kernel.py's
+# KernelShimGenerator are substantially parallel, as are the flyc.{h,cc}
+# templates against shim.{h,cc} (measured: ~34 of ~200 lines differ in the .cc,
+# ~31 of ~110 in the .h). The duplication is deliberate for now -- flyc's shape
+# was still moving -- but it is real debt: a fix or feature applied to one side
+# silently misses the other. The `kctl.control_bits` handling is the concrete
+# example, appearing three times in each template.
+#
+# Unify once flyc stops moving. The divergences are all parameterisable: the
+# header name, the PP_FUNC signature (flyc has no TritonAuxiliaryArguments),
+# one Schemaless line in lookup_optimal, and the tune namespace.
+
 class FlycShimGenerator(InterfaceGenerator):
     HEADER_TEMPLATE = get_template('flyc.h')
     SOURCE_TEMPLATE = get_template('flyc.cc')
