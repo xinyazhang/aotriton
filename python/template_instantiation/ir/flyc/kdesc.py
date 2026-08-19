@@ -240,7 +240,7 @@ class KernelDescription(Interface):
                 s = scalar_lookup[name]
                 if isinstance(s.wires_to, ContextHelper):
                     yield LaunchArg(aname=name, kind='context_helper',
-                                     expr=f'CAST(&context._{s.wires_to.name}_scratch)')
+                                     expr=f'CAST(&context.scratch_params.{s.wires_to.name})')
                 else:
                     yield LaunchArg(aname=name, kind='scalar',
                                      expr=f'CAST(&params.{_apparel(s)})')

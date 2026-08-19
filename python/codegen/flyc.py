@@ -127,8 +127,20 @@ const std::vector<{infotype}>& {meta_class}::get_{tp.repr_name}_choices()
         return '\n    '.join(lines)
 
     def codegen_context_helper_scratch_members(self):
+        """Storage for the ati.context_helper() results.
+
+        Grouped into one struct rather than loose members so the kernarg
+        vector's `CAST(&context.scratch_params.<name>)` reads as one namespace,
+        and so adding a helper does not add another top-level context field.
+        `mutable` because pp_args fills them from a const context, and the
+        kernarg vector holds their addresses -- a local would dangle.
+        """
         kdesc = self._iface
-        lines = [f'mutable {ctype} _{name}_scratch;' for name, ctype in kdesc.iter_context_helpers()]
+        helpers = list(kdesc.iter_context_helpers())
+        if not helpers:
+            return '// no context helpers'
+        body = '\n'.join(f'        {ctype} {name};' for name, ctype in helpers)
+        return 'mutable struct {\n' + body + '\n    } scratch_params;'
         return '\n    '.join(lines)
 
     def codegen_kernel_arguments(self):
