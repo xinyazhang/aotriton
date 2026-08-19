@@ -10,12 +10,13 @@ vocabulary (`num_warps` / `num_stages` / `waves_per_eu`, `COMPILER_OPTIONS`, the
 gfx1250 double-warps workaround) that is specific to Triton's autotune model and
 does not apply here.
 
-flyc enumerates no perf variants in Phase 1 (PLAN-PHASE1.md 0c/5a): the FlyDSL
-tuning model is unsettled, and the programmatic `resolve_knobs` builder is a
-candidate that looks nothing like a psel/copt grid. Rather than guess, both
-sections are permanently empty for now — this keeps the hsaco entry-name /
-archive shape identical to Triton's (so later phases can reuse Triton's autotune
-code generator) without committing to what a flyc perf/copt vocabulary would be.
+flyc's perf vocabulary is Design B (PLAN-PHASE2.md Task 2): no C struct, no
+psel/copt grid choice among candidate images -- every functional resolves to
+exactly one hsaco, whose distinguishing knob set (the builder's `sidecar`, all 23
+`FmhaKnobs` fields) is carried verbatim in the `#P` section as a schemaless
+';'-separated 'k=v' string, parsed at runtime by `class Schemaless`
+(`include/aotriton/_internal/schemaless.h`) rather than a generated struct/accessor.
+`copt_section` stays permanently empty -- flyc has no compiler-option grid.
 """
 
 from functools import cached_property
@@ -23,19 +24,32 @@ from functools import cached_property
 from ..lib import naming as lib_naming
 
 
+def _schemaless_value(v) -> str:
+    """Render one FmhaKnobs field as the Schemaless grammar's `value` production
+    (PLAN-PHASE2.md Task 2): `0 | -1 | True | False | None | transposed | auto`.
+    This is `str(v)`, not `repr(v)` -- for every type FmhaKnobs fields actually
+    take (int, bool, None, str) the two agree except for `str`, where `repr`
+    would add quotes the measured grammar does not have (`v_lds_layout=transposed`,
+    never `v_lds_layout='transposed'`)."""
+    return str(v)
+
+
 class KernelSignature:
     """The perf + compiler-option signature of one compiled flyc kernel instance
-    (one Functional). `perf_section` / `copt_section` are always empty strings —
-    a deliberate deferral (see module docstring), not a claim that flyc has no
-    perf; promote either to a real vocabulary here, not by borrowing Triton's,
-    when the FlyDSL tuning model settles."""
+    (one Functional). `perf_section` renders the builder's `sidecar` dict (all 23
+    `FmhaKnobs` fields, via `asdict(knobs)`) as `k=v;k=v`; `copt_section` is always
+    empty (see module docstring)."""
 
-    def __init__(self, f: 'Functional'):
+    def __init__(self, f: 'Functional', *, sidecar: dict | None = None):
         self._functional = f
+        # The builder's (built, sidecar) return, kept verbatim (PLAN-PHASE2.md
+        # Task 2's trap: NEVER read back from the on-disk <hsaco>.json, which is
+        # produced later, at true build time, by a different process).
+        self._sidecar = dict(sidecar) if sidecar else {}
 
     @property
     def perf_section(self) -> str:
-        return ''
+        return ';'.join(f'{k}={_schemaless_value(v)}' for k, v in self._sidecar.items())
 
     @property
     def copt_section(self) -> str:
