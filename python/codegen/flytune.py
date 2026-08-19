@@ -18,7 +18,7 @@
 # generator calls `fn(choices, hints)` for `knobs` alone and discards `build`
 # without ever calling it -- so the FlyDSL compiler is never invoked 288 times
 # per configure. `knobs` is what feeds `ir/flyc/ksignature.py`'s
-# `perf_section` (Task 2); the true on-disk `<hsaco>.json` sidecar is a
+# `perf_section` (Task 2); the true on-disk `<hsaco>.json` knobs is a
 # separate, later, build-time artifact this generator never reads.
 
 import sys
@@ -42,34 +42,42 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
                  parent_repo):
         super().__init__(args, f, dataframe_for_tuning, parent_repo)
         self._sql = sql
-        kdesc = self._f.meta_object
-        # Replicate flyc_compile.py's do_compile call, up to the point where it
-        # would build: choices is a plain dict of the functional's resolved
-        # axis values (keyed by the SAME semantic axis names -- Q,
-        # BLOCK_DMODEL, CAUSAL_TYPE, ... -- the builder body reads), hints is
-        # the description's declared @ati.flyc.hints dataclass (no CLI
-        # override exists at generate time).
-        choices = {name: tc.triton_compile_signature for name, tc in f.resolved.items()}
+        self._sigs = list(self._gen_signatures())
+
+    def _gen_signatures(self):
+        """Yield one KernelSignature per compiled image of this functional.
+
+        A generator, not a single value, because that is the shape flyc autotune
+        needs: once FlyDSL's schedule becomes `hints`-dependent, one
+        (choices, hints) resolves to SEVERAL (knobs, build) pairs and each one is
+        an image with its own `#P`. Today the count is one; nothing here assumes
+        it, so growing it is adding a loop, not reshaping the class.
+        """
+        f = self._f
+        kdesc = f.meta_object
+        # `compact_choices` is the established accessor and, critically, the SAME
+        # one root.py:write_flyc_hsaco uses to render the `--signature` string
+        # that flyc_compile parses back. So the dict this generator hands the
+        # description is exactly the dict the build-time driver hands it -- keys
+        # and values both. `f.resolved` would be a different thing: 68 entries
+        # (every argument, strides included) rather than the 6 functional axes.
+        choices = {name: tc.triton_compile_signature
+                   for name, tc in f.compact_choices.items()}
         hints = kdesc.hints()
         assert kdesc.builder_fn is not None, (
             f'flyc kernel {kdesc.NAME!r} has no builder_fn '
             f'(linker.py:_build_flycs must thread builder_fn=decl.fn)')
-        # The builder body (e.g. modules/flash/aot/flyc_attn_fwd.py) imports its
-        # vendored kernel/tuning modules by bare name (e.g. `import
-        # fmha_tuning_gfx1201`), resolved relative to the directory containing
-        # kdesc.MODULE_PATH -- not relative to this generator's own package.
-        # This is a path, not flydsl, so it is fine for the generator to set up.
+        # The description imports its vendored kernel/tuning modules by bare name
+        # (e.g. `import fmha_tuning_gfx1201`), resolved relative to the directory
+        # holding kdesc.MODULE_PATH. A path, not flydsl -- fine for the generator.
         kernel_dir = str(Path(kdesc.MODULE_PATH).parent)
         if kernel_dir not in sys.path:
             sys.path.insert(0, kernel_dir)
-        # fn(choices, hints) returns (build, knobs): `build` is a deferred
-        # callable that actually constructs the FlyDSL module (and, for the
-        # standalone flyc_compile.py driver, imports flydsl transitively);
-        # `knobs` is a plain, already-resolved dict. Discard `build` WITHOUT
-        # EVER CALLING IT -- that is the one architectural rule this generator
-        # must never break.
-        _build, sidecar = kdesc.builder_fn(choices, hints)
-        self._sig = KernelSignature(f, sidecar=sidecar)
+        # (build, knobs): `build` is a deferred callable that would construct the
+        # FlyDSL module; `knobs` is already resolved. Discard `build` WITHOUT EVER
+        # CALLING IT -- the one architectural rule this generator must not break.
+        _build, knobs = kdesc.builder_fn(choices, hints)
+        yield KernelSignature(f, psels=knobs)
 
     def generate(self):
         log(lambda : f'Writing to {self._cc_file}')
@@ -83,7 +91,7 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         kdesc = f.meta_object
         flatzip_path = f.full_flatzip_path.as_posix()
         assert f.filepack_inzip_name == f.unified_signature
-        meta_hsacos = self.codegen_compact_kernels(self._sig, flatzip_path)
+        meta_hsacos = self.codegen_compact_kernels(self._sigs, flatzip_path)
         d = {
             'kernel_family_name'    : kdesc.FAMILY,
             'shim_kernel_name'      : kdesc.NAME,
@@ -100,17 +108,24 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         }
         print(self.FLYTUNE_TEMPLATE.format_map(d), file=fout)
 
-    def codegen_compact_kernels(self, ksig, flatzip_path):
+    def codegen_compact_kernels(self, ksigs, flatzip_path):
+        """One TritonKernelCompactMeta row per image, same shape as
+        autotune.py's. Plural for the same reason `_gen_signatures` is a
+        generator: N is 1 today and nothing here says so."""
         string_registry = self._parent_repo.get_string_registry('per_kernel_packed_string')
-        b2sum_u64, raw = ksig.blake2b_hash(flatzip_path)
-        u8raw = raw.decode('utf-8')
-        assert len(b2sum_u64) == 16
-        b2sum_u64_hi = b2sum_u64[:8]
-        b2sum_u64_lo = b2sum_u64[8:]
-        psel_offset = string_registry.register(ksig.perf_section)
-        copt_offset = string_registry.register(ksig.copt_section)
-        return (f'{{ 0x{b2sum_u64_hi}u, 0x{b2sum_u64_lo}u, {psel_offset}, {copt_offset} }}, '
-                f'// {b2sum_u64} = b2sum -l 64 <<< {u8raw}')
+        rows = []
+        for ksig in ksigs:
+            b2sum_u64, raw = ksig.blake2b_hash(flatzip_path)
+            u8raw = raw.decode('utf-8')
+            assert len(b2sum_u64) == 16
+            b2sum_u64_hi = b2sum_u64[:8]
+            b2sum_u64_lo = b2sum_u64[8:]
+            psel_offset = string_registry.register(ksig.perf_section)
+            copt_offset = string_registry.register(ksig.copt_section)
+            rows.append(f'{{ 0x{b2sum_u64_hi}u, 0x{b2sum_u64_lo}u, {psel_offset}, {copt_offset} }}, '
+                        f'// {b2sum_u64} = b2sum -l 64 <<< {u8raw}')
+        ALIGN = '\n' + 4 * ' '
+        return ALIGN.join(rows)
 
     def codegen_deduplicated_pp_args_function_index(self):
         """Unlike autotune.py's equivalent, flyc collapses every functional onto
@@ -152,4 +167,4 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
 
     @property
     def all_signatures(self):
-        return [self._sig]
+        return self._sigs
