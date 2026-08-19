@@ -13,9 +13,15 @@ class LaunchArg:
     KernelDescription.iter_launch_arguments() and consumed when building the
     prepare_arguments() function. `kind` selects the access expression form:
 
-      'tensor_ptr'    -> params.<aname>->kparam_data_ptr()
-      'tensor_stride' -> params.<tensor>->kparam_stride(<dim>)
-      'scalar'        -> CAST(&params.<aname>)
+      'tensor_ptr'      -> params.<aname>->kparam_data_ptr()
+      'tensor_stride'   -> params.<tensor>->kparam_stride(<dim>)
+      'scalar'          -> CAST(&params.<aname>)
+      'context_helper'  -> CAST(&context._<aname>_scratch)  (flyc only, see
+                           ir/flyc/kdesc.py / PLAN-PHASE2.md Task 5 -- the
+                           scratch member is populated by a preamble statement
+                           right before pp_args returns, since the helper's
+                           return value has no other stable home for the
+                           duration of the launch)
 
     `expr` is the fully-rendered C++ expression; `aname` is the kernel argument
     name (used for the trailing comment + per-functional constexpr lookup)."""
