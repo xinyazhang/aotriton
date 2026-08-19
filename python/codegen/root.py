@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 from .linker import Linker
 from .kernel import KernelShimGenerator
+from .flyc import FlycShimGenerator
 from .slim_affine import SlimAffineGenerator
 from .operator import OperatorGenerator
 from ..utils import (
@@ -21,7 +22,6 @@ from .common import (
     hsaco_inaks2_name,
 )
 from ..gpu_targets import AOTRITON_ARCH_TO_DIRECTORY, cluster_gpus
-from ..template_instantiation.ir.flyc import KernelSignature as FlycKernelSignature
 import sys
 import os
 import re
@@ -102,10 +102,6 @@ class RootGenerator(object):
     def do_generate(self):
         args = self._args
         sel = args.selective  # str (possibly with * glob) or None
-        # flyc has no InterfaceGenerator of its own (Task 5a: no shim, no build) --
-        # so, unlike ops/kerns/affs above, it must compute the {arch: gpus} map
-        # InterfaceGenerator.__init__ derives per-Interface via cluster_gpus(args.target_gpus).
-        target_arch = cluster_gpus(args.target_gpus)
         if sel is not None:
             _sel_path = Path(sel)
             if 'affine' in _sel_path.parts:
@@ -120,6 +116,7 @@ class RootGenerator(object):
                     f"Use e.g. '{_sel_path.parent}/*'"
 
         hsaco_for_kernels = []
+        flyc_hsaco_for_kernels = []
         asms_for_kernels = []
         shims = []
         # (arch, op_name, lut_value) -> count
@@ -175,6 +172,23 @@ class RootGenerator(object):
                 asms_for_kernels.append((ak, asms))
             shims += aksg.shim_files
 
+        # flyc (PLAN-PHASE2.md Task 1): mirrors the Triton kerns loop above via
+        # FlycShimGenerator, so the generated flyc.<name>.{h,cc} shim (and the
+        # flytune.<name>/ per-functional .cc files, written as a side effect of
+        # generate() through FlycTuneCodeGenerator) participate in the same
+        # Bare.shim aggregation. Unlike Triton, flyc image rules (Fly.compile)
+        # are never gated by AOTRITON_DEBUG_SKIP_TRITON_KERNELS -- that flag only
+        # skips the Triton image pipeline.
+        flycs = self._flyc_kernels
+        if sel is not None:
+            flycs = [fk for fk in flycs if fk.unique_path.match(sel)]
+        for fk in flycs:
+            fsg = FlycShimGenerator(self._args, fk, parent_repo=None)
+            fsg.generate()
+            shims += fsg.shim_files
+            hsacos = fsg.this_repo.get_data('hsaco')
+            flyc_hsaco_for_kernels.append((fk, hsacos))
+
         if args.build_for_tuning_second_pass:
             return
 
@@ -210,34 +224,34 @@ class RootGenerator(object):
                     aks2_abs = (aks2_dir / fodp).with_suffix('.aks2').absolute().as_posix()
                     flatzip_dict.setdefault(fzp_stem, {})[aks2_abs] = functional.filepack_inzip_name
 
-            # flyc (PLAN-PHASE1.md Task 5/7): compiled during the build from a FlyDSL
+            # flyc (PLAN-PHASE2.md Task 1): compiled during the build from a FlyDSL
             # description, via a separate driver (`aotriton.flyc_compile`) and a
             # disjoint row shape (`Fly.compile`, not `Bare.compile`). Deliberately NOT
             # gated by AOTRITON_DEBUG_SKIP_TRITON_KERNELS above -- that flag skips only
-            # the Triton image pipeline, and flyc rows are how Gate 7 exercises the
+            # the Triton image pipeline, and flyc rows are how Gate A/7 exercises the
             # rest of the pipeline cheaply while Triton's is skipped.
             #
-            # No InterfaceGenerator subclass here (flyc emits no shim, Task 5a): the
-            # functionals come straight from Interface.gen_functionals, inherited
-            # unchanged by ir/flyc/kdesc.py's KernelDescription and filtered through
-            # its own is_functional_disabled (the description's @ati.disable).
-            flycs = self._flyc_kernels
-            if sel is not None:
-                flycs = [fk for fk in flycs if fk.unique_path.match(sel)]
-            for fk in flycs:
+            # `hsacos` here is the same shape as Triton's `ksg.this_repo.get_data('hsaco')`
+            # above ({functional: [ksig, ...]}), populated by FlycTuneCodeGenerator via
+            # HsacoRegistry -- flyc's KernelSignature already carries the sidecar-derived
+            # perf() string (Task 2/3), so no separate FlycKernelSignature construction is
+            # needed here any more. Disabled functionals never reach this dict: they are
+            # filtered out in FlycShimGenerator.create_sub_generator (the description's
+            # @ati.disable), so no .cc/hsaco entry is ever registered for them.
+            for fk, hsacos in flyc_hsaco_for_kernels:
                 image_path = hsaco_dir(args.build_dir, fk)
                 image_path.mkdir(parents=True, exist_ok=True)
-                for functional in fk.gen_functionals(target_arch):
-                    if fk.is_functional_disabled(functional):
-                        continue
-                    ksig = FlycKernelSignature(functional)
-                    self.write_flyc_hsaco(fk, image_path, functional, ksig, flyrulefile)
+                for functional, signatures in hsacos.items():
+                    for ksig in signatures:
+                        self.write_flyc_hsaco(fk, image_path, functional, ksig, flyrulefile)
                     # Task 7b: fold into the SAME cluster_dict/flatzip_dict Triton (and
                     # affine, below) populate -- Fly.compile is the only new rule file;
                     # Bare.cluster / Bare.flatzip already cover both backends' rows.
                     fodp = functional.filepack_ondisk_path  # meta_object = fk (flyc's own .zip)
-                    cluster_dict.setdefault(fodp, {})[self._absobjfn(image_path, fk, ksig)] = \
-                        hsaco_inaks2_name(fk, ksig)
+                    cluster_dict.setdefault(fodp, {}).update(
+                        {self._absobjfn(image_path, fk, ksig): hsaco_inaks2_name(fk, ksig)
+                         for ksig in signatures}
+                    )
                     aks2_abs = (aks2_dir / fodp).with_suffix('.aks2').absolute().as_posix()
                     flatzip_dict.setdefault(fodp.parent, {})[aks2_abs] = functional.filepack_inzip_name
         with LazyFile(out_dir / 'Bare.cluster') as clusterfile:
