@@ -16,7 +16,7 @@ class LaunchArg:
       'tensor_ptr'      -> params.<aname>->kparam_data_ptr()
       'tensor_stride'   -> params.<tensor>->kparam_stride(<dim>)
       'scalar'          -> CAST(&params.<aname>)
-      'context_helper'  -> CAST(&context._<aname>_scratch)  (flyc only, see
+      'context_helper'  -> CAST(&context.scratch_params.<aname>)  (flyc only, see
                            ir/flyc/kdesc.py / PLAN-PHASE2.md Task 5 -- the
                            scratch member is populated by a preamble statement
                            right before pp_args returns, since the helper's

@@ -139,7 +139,7 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
             # context_helper_declares slot). Calling it through `context.` here
             # keeps pp_args a free function while still reading the context's
             # own params/tensors.
-            stmt.append(f'context._{name}_scratch = context.{name}();')
+            stmt.append(f'context.scratch_params.{name} = context.{name}();')
         ret_lines = [larg.expr + f', // {larg.aname}' for larg in largs]
         pfx = '  return { '
         join = '\n' + ' ' * len(pfx)
