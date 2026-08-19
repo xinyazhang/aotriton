@@ -504,7 +504,11 @@ def do_compile(args):
     # JSON-serialisable dict of whatever it wants recorded alongside the hsaco
     # (for flyc_attn_fwd, asdict(knobs) -- including block_m). The driver stays
     # kernel-agnostic: it serialises the dict without knowing what is in it.
-    built, sidecar = fn(choices, hints)
+    # The description returns a DEFERRED builder, not a built module: the code
+    # generator calls `fn` for its knobs and never calls `build`, so it never
+    # imports flydsl. Only this driver -- run by ninja -- calls `build()`.
+    build, sidecar = fn(choices, hints)
+    built = build()
 
     jf = jit_function_of(built)
     launch_args = synthesise_args(jf)

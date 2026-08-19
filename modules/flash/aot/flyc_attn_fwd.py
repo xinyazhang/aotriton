@@ -320,7 +320,9 @@ def flyc_attn_fwd(choices, hints):
     functional axis, so `plan()` would silently re-derive an axis the operator has
     already fixed. The builder's own keyword front end draws the same distinction.
     """
-    from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
+    # ONLY the flydsl-free tuning module at call time. The FlyDSL-bearing import
+    # lives inside `build()` below, so the code generator -- which calls this
+    # function but never the callable -- never imports flydsl.
     from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
 
     tile = choices['BLOCK_DMODEL']
@@ -351,5 +353,11 @@ def flyc_attn_fwd(choices, hints):
     ))
     assert not knobs.strides_constexpr, \
         'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
-    built = build_flash_attn_func_aiw_module_primary(meta, knobs)
-    return built, asdict(knobs)
+
+    def build():
+        """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
+        so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+        from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
+        return build_flash_attn_func_aiw_module_primary(meta, knobs)
+
+    return build, asdict(knobs)
