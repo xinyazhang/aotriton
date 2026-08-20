@@ -105,14 +105,31 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    keys/values in an attention codebase), anything `nv` (NVIDIA), `lite`
    (sqlite3), `assignments`, `flatspec`, `slimspec`.
 
-   **One caution the name must not carry.** The "Python Object Notation" gloss
-   invites the thought *"so I can just `eval()` it"* — which is exactly the hole
-   Plan step 4 exists to close. `parse_python`'s `eval()` is a
-   remote-code-execution shape, because the strings reach the tuner from the
-   database. PON is parsed with `ast.literal_eval` and **never** `eval`. The
-   Python in the name refers to the *literal grammar*, not to the evaluator; say
-   so in the module docstring, where someone reaching for the shortcut will read
-   it.
+   **Eval-ability is the design criterion, not the implementation.** This
+   distinction is the whole point of the paragraph, so state it in the module
+   docstring in these terms:
+
+   * **By design**, a PON string is valid Python expression syntax. The format
+     was specified that way deliberately: a reader (human or C++) never has to
+     consult an invented grammar, because the answer to "what does this value
+     mean" is "whatever Python says it means". `eval()` on a PON value *would*
+     produce the intended object, and that is exactly the property that makes
+     the format well-defined and the "Python Object Notation" gloss exact.
+   * **In practice the string must never be parsed by `eval()`.** The criterion
+     defines the format; it does not license the evaluator. Every reader uses
+     `ast.literal_eval`.
+
+   The security reason is concrete, not hypothetical: these strings reach the
+   tuner from the database, so `eval()` on one is a remote-code-execution
+   shape. That is why Plan step 4 retires `parse_python` — the existing
+   `eval()`-based reader — rather than merely wrapping it.
+
+   **The criterion is therefore tighter than "eval-able":** a PON value must lie
+   in the subset where `eval` and `ast.literal_eval` *agree*. `1+2` and `foo()`
+   are eval-able but are not PON; `256`, `True`, `None`, `'transposed'` and
+   `(1, 2)` are. Specifying the format as "the literal subset of Python
+   expression syntax" gets both properties at once — a grammar nobody has to
+   invent, and a reader that cannot execute anything.
 
 1. **That module becomes the one home**, gaining the writer beside the parser:
 
