@@ -20,9 +20,6 @@ operator's (PLAN-PHASE1.md Task 7a: "Give flyc its own zip ... keyed by the
 description's name").
 """
 
-import ast
-from pathlib import Path
-
 from ..interface import Interface
 from ..context_helper import ContextHelper
 from ..choices import ChoiceVarAbsent
@@ -209,30 +206,6 @@ class KernelDescription(Interface):
         return self.hints_cls() if self.hints_cls is not None else None
 
     # --- launch-argument vector (PLAN-PHASE2.md Task 5) ---
-
-    def _real_param_order(self):
-        """AST-walk self.MODULE_PATH (the vendored kernel file, e.g.
-        flash_attn_func_gfx1201_aiw.py) for the unique @flyc.kernel-decorated
-        function and return its parameter names in real signature order. This is
-        the actual compiled kernel's ABI order -- NOT the same as the
-        description's own @ati.tensor/@ati.scalar declaration order (the 15
-        stride parameters land in one contiguous block near the end of the real
-        signature rather than interleaved after each owning tensor; see
-        PLAN-PHASE2.md Task 5)."""
-        path = Path(self.MODULE_PATH)
-        tree = ast.parse(path.read_text(), filename=str(path))
-
-        def _is_kernel_decorator(dec):
-            node = dec.func if isinstance(dec, ast.Call) else dec
-            return isinstance(node, ast.Attribute) and node.attr == 'kernel'
-
-        matches = [node for node in ast.walk(tree)
-                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and any(_is_kernel_decorator(dec) for dec in node.decorator_list)]
-        assert len(matches) == 1, (
-            f'flyc kernel {self.NAME!r}: expected exactly one @flyc.kernel-decorated '
-            f'function in {path}, found {len(matches)}')
-        return [a.arg for a in matches[0].args.args]
 
     def iter_launch_arguments(self):
         """Yield the C++ launch-argument vector entries in the REAL kernel's
