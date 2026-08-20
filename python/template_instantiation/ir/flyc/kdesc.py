@@ -20,11 +20,12 @@ operator's (PLAN-PHASE1.md Task 7a: "Give flyc its own zip ... keyed by the
 description's name").
 """
 
-import ast
 from pathlib import Path
 
 from ..interface import Interface
 from ..context_helper import ContextHelper
+from ..choices import ChoiceVarAbsent
+from aotriton.template_instantiation.builder import DescriptionError
 
 
 # Elemental type string (as authored on an @ati.scalar) -> C scratch-member
@@ -54,13 +55,19 @@ class KernelDescription(Interface):
     ENUM_PREFIX = 'kFlyc_'
     is_tunable = False
 
-    def __init__(self, *, name, family, module_path, disable=None,
+    def __init__(self, built, *, family, module_path,
                 functionals_source=None, tensors=None, scalars=None,
                 builder_fn=None, hints_cls=None):
-        self.NAME = name
+        # `built` is the BuiltKernel build_kernel() lowered this kernel's
+        # cite-resolved FlycDecl clone into (PLAN-PON.md Part 3): it answers
+        # "what are this kernel's arguments?" (order, disables) -- NOT "which
+        # variants exist?", which stays functionals_source's job below (the
+        # design caveat: a BuiltKernel giving flyc its own axes would make it
+        # enumerate a second, wrong functional space).
+        self._built = built
+        self.NAME = built.name
         self.FAMILY = family
         self.MODULE_PATH = module_path
-        self._disable = disable                        # DisableSpec | None
         # The Operator this kernel's `functionals_of=` names, resolved by the
         # linker (Task 5a). None only transiently, between __new__ and the
         # linker's assignment -- every kdesc actually handed to the generator has
@@ -152,9 +159,24 @@ class KernelDescription(Interface):
         return self._require_functionals_source().real_of(apparel_arg)
 
     def is_functional_disabled(self, functional):
-        if self._disable is None:
-            return False
-        return self._disable.when(functional)
+        # Mirrors ir/triton/kdesc.py's is_functional_disabled exactly (PLAN-PON.md
+        # Part 3): self._built.disables is the cite-resolved list (build_kernel /
+        # resolve_cites already applied the §4.5 local-replaces-cited rule), so
+        # there is no separate "self._disable" concept left here.
+        for d in self._built.disables:
+            try:
+                if d.holds(functional):
+                    return True
+            except ChoiceVarAbsent as e:
+                pred = getattr(d.when, '__name__', d.when)
+                raise DescriptionError(
+                    f"kernel {self.NAME!r}: the @ati.disable predicate {pred!r} reads "
+                    f"a choice variable this kernel does not have ({e}). It is likely "
+                    f"inherited via @ati.cite from a kernel with a different choice "
+                    f"space. Declare a local @ati.disable on {self.NAME!r} that uses "
+                    f"only its own choice variables (a local disable replaces the "
+                    f"cited one).") from e
+        return False
 
     # --- builder invocation: the code generator (FlycTuneCodeGenerator,
     # python/codegen/flytune.py) calls `self.builder_fn(choices, hints)`
@@ -209,7 +231,7 @@ class KernelDescription(Interface):
         # ir/triton/kdesc.py's iter_launch_arguments.
         from aotriton.codegen.common import LaunchArg
 
-        real_param_order = self._real_param_order()
+        real_param_order = self._built.arguments
 
         tensor_ptr_lookup = {}
         for t in self.tensors:
