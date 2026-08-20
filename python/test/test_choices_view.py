@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aotriton.template_instantiation.ir import (
     TypedChoice, Axis, Override, eq, Interface,
+    ChoiceView, ChoiceVarAbsent, MappingChoiceView,
 )
 
 
@@ -93,6 +94,88 @@ def test_arg_reads_resolved():
 def test_view_is_cached():
     f = _functional(bias_type=1)
     assert f.choices is f.choices
+
+
+def test_bare_choiceview_uninstantiable():
+    # ChoiceView is an ABC (ir/choices.py): it declares the interface but has
+    # no backing of its own, so instantiating it directly must fail, naming
+    # every unimplemented abstract method.
+    try:
+        ChoiceView()
+    except TypeError as e:
+        msg = str(e)
+        for name in ('tc', 'arg', 'arg_tc', '__getattr__'):
+            assert name in msg, f'{name!r} missing from TypeError message: {msg!r}'
+        return
+    raise AssertionError('expected TypeError instantiating ChoiceView')
+
+
+def test_mapping_tc_raises_not_implemented():
+    view = MappingChoiceView({'BLOCK_DMODEL': 16})
+    try:
+        view.tc('BLOCK_DMODEL')
+    except NotImplementedError as e:
+        assert 'MappingChoiceView' in str(e)
+        return
+    raise AssertionError('expected NotImplementedError from MappingChoiceView.tc')
+
+
+def test_mapping_arg_tc_raises_not_implemented():
+    view = MappingChoiceView({'Q': '*fp16:16'})
+    try:
+        view.arg_tc('Q')
+    except NotImplementedError as e:
+        assert 'MappingChoiceView' in str(e)
+        return
+    raise AssertionError('expected NotImplementedError from MappingChoiceView.arg_tc')
+
+
+def test_mapping_getattr_and_arg_read_the_same_dict():
+    view = MappingChoiceView({'BLOCK_DMODEL': 16, 'Q': '*fp16:16'})
+    assert view.BLOCK_DMODEL == 16
+    assert view.arg('BLOCK_DMODEL') == 16
+    assert view.arg('Q') == '*fp16:16'
+
+
+def test_mapping_unknown_key_raises():
+    view = MappingChoiceView({'BLOCK_DMODEL': 16})
+    try:
+        _ = view.NoSuchVar
+    except ChoiceVarAbsent as e:
+        assert isinstance(e, AttributeError)   # duck-typing contract (choices.py)
+        assert 'NoSuchVar' in str(e)
+        assert 'BLOCK_DMODEL' in str(e)
+    else:
+        raise AssertionError('expected ChoiceVarAbsent')
+    try:
+        view.arg('NoSuchVar')
+    except KeyError as e:
+        assert 'NoSuchVar' in str(e)
+        return
+    raise AssertionError('expected KeyError from MappingChoiceView.arg')
+
+
+def test_both_backings_agree_on_shared_keys():
+    # FunctionalChoiceView (real Functional) and MappingChoiceView (parsed
+    # dict) must answer identically for a key/var both can honestly hold --
+    # the whole point of ChoiceView being one declared interface with two
+    # backings (ir/choices.py) rather than a dict on one side and an object
+    # on the other.
+    f = _functional(bias_type=1)
+    mapping = MappingChoiceView({
+        'T_io': f.choices.T_io,
+        'CAUSAL_TYPE': f.choices.CAUSAL_TYPE,
+        'BIAS_TYPE': f.choices.BIAS_TYPE,
+    })
+    # Attribute access is keyed by var_name on both backings.
+    for var in ('T_io', 'CAUSAL_TYPE', 'BIAS_TYPE'):
+        assert getattr(f.choices, var) == getattr(mapping, var)
+    # .arg(aname) is keyed by real argument name; T_io's var_name is not one
+    # of its own argument names (its axis spans Q/K/V/B/Out), but a
+    # single-argument axis like CAUSAL_TYPE/BIAS_TYPE has var_name == its
+    # only argument name, so both backings must agree there too.
+    for var in ('CAUSAL_TYPE', 'BIAS_TYPE'):
+        assert f.choices.arg(var) == mapping.arg(var)
 
 
 def main():
