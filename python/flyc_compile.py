@@ -36,8 +36,47 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 
 from . import flyc_bootstrap
-from .template_instantiation.ir.choices import MappingChoiceView
+from .template_instantiation.ir.choices import ChoiceView, ChoiceVarAbsent
 from .utils import parse_pon
+
+
+class MappingChoiceView(ChoiceView):
+    """`ChoiceView` backed by a plain `{name: literal}` dict -- what this
+    driver has: the `--signature` text, parsed by `parse_pon`, with no linked
+    `Functional` to build a real view from.
+
+    Lives here rather than beside the ABC because this is its only user. The
+    generator side never constructs one (it has real Functionals), and a class
+    with one call site belongs at that call site.
+
+    There is no distinction here between a "choice variable" and a "resolved
+    argument": both are just keys of the one dict the wire format carries, so
+    `arg(aname)` and attribute access answer identically when `aname` is a key.
+    There is deliberately no `tc`/`arg_tc`: a parsed dict never carried a
+    `TypedChoice`, and the ABC does not ask for one (see `ir/choices.py`)."""
+
+    __slots__ = ('_d',)
+
+    def __init__(self, d: dict):
+        self._d = dict(d)
+
+    def arg(self, aname):
+        if aname not in self._d:
+            raise KeyError(
+                f'{aname!r} is not a key of this choices mapping; '
+                f'valid: {sorted(self._d)}')
+        return self._d[aname]
+
+    def __getattr__(self, var):
+        # __slots__ means only '_d' can ever be a real instance attribute, so
+        # any other name that reaches here is a mapping key lookup.
+        d = object.__getattribute__(self, '_d')
+        if var not in d:
+            raise ChoiceVarAbsent(
+                f'{var!r} is not a key of this choices mapping; '
+                f'valid: {sorted(d)}')
+        return d[var]
+
 
 desc = """
 FlyDSL ahead-of-time compiler: cross-compiles one @ati.flyc.kernel description
@@ -497,10 +536,10 @@ def do_compile(args):
     # `--signature`: `{name: literal}`, nothing else, no fabricated `Functional`.
     # The driver runs in a separate process from the generator and has no linked
     # IR to hand the body a real one. Unlike the untyped stand-in this replaced,
-    # `MappingChoiceView` is a declared ChoiceView implementation (ir/choices.py):
-    # `.tc`/`.arg_tc` raise `NotImplementedError` naming the backing rather than
-    # drifting silently, so a description that reaches for a TypedChoice this
-    # side genuinely does not have finds out immediately, not by accident.
+    # `MappingChoiceView` (above) is a declared implementation of the
+    # `ChoiceView` ABC (ir/choices.py), so a description written against that
+    # interface reads the same here as it does on the generator side, and any
+    # method it grows must be answered by both backings.
     choices = MappingChoiceView(parse_pon(args.signature, sep=' '))
     hints = _build_hints(node, args.hints)
     # The description body returns (built, sidecar): `built` is the FlyDSL
