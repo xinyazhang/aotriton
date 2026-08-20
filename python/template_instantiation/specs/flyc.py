@@ -82,6 +82,12 @@ class FlycDecl(AtiNode):
             return None
         return self.hints_cls()
 
+    @property
+    def param_names(self):
+        """Mirrors KernelSpec.param_names (specs/kernel.py) -- build_kernel's
+        `_build_axes` reads this off either spec type duck-typed."""
+        return [p.name for p in self.params]
+
 
 def _flyc_kernel_stub(module_path, name):
     """AST-parse `module_path` (the vendored kernel file) for the unique

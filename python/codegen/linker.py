@@ -97,6 +97,37 @@ def _clone_spec(spec):
     return clone
 
 
+def _flyc_kernel_spec(decl):
+    """The builder-facing `KernelSpec` for a `FlycDecl`, with FRESH mutable
+    lists. This is the ONE place a flyc description is adapted to the shape
+    `resolve_cites`/`build_kernel` read, and it exists for two reasons:
+
+    * `resolve_cites` appends gap tensors/scalars/overrides/dtype_vars and may
+      set tune/disables, so it must never touch the module-level passive
+      FlycDecl. Same contract as `_clone_spec` above.
+    * A description carries at most ONE `@ati.cite` and one `@ati.disable`;
+      the builder reads list-valued `cites`/`disables`. The wrap happens here,
+      at the boundary, rather than in FlycDecl -- a declaration that offered
+      `cites` would advertise a cardinality a user cannot actually write.
+
+    Returning a real KernelSpec (rather than a FlycDecl duck-typed into the
+    role) means the builder is handed exactly the type it was written against,
+    and every attribute it reads is declared in one place.
+    """
+    from aotriton.template_instantiation.specs.kernel import KernelSpec
+    return KernelSpec(
+        kernel=decl.kernel,
+        params=decl.params,                 # immutable signature; sharing is fine
+        tensors=list(decl.tensors),
+        scalars=list(decl.scalars),
+        overrides=list(decl.overrides),
+        tune=decl.tune,
+        disables=[decl.disable] if decl.disable is not None else [],
+        dtype_vars=list(decl.dtype_vars),
+        cites=[decl.cite] if decl.cite is not None else [],
+    )
+
+
 def _build_kernels(compiled):
     """Resolve cites + build every kernel shell into a KernelDescription, in cite
     dependency order. Returns {def-name -> KernelDescription}."""
@@ -160,13 +191,29 @@ def _build_affines(compiled):
     return out
 
 
-def _build_flycs(compiled, operators):
+def _build_flycs(compiled, operators, built_kernels):
     """Build every flyc KernelDescription from its parsed FlycDecl, resolving
     `functionals_of` against the already-built operators (PLAN-PHASE1.md Task 5a).
     Must run AFTER `_build_operators` -- unlike affine kernels (bound to an
     operator only as a listed backend), a flyc kernel's functional space is
-    resolved by NAME against the finished operators dict."""
+    resolved by NAME against the finished operators dict.
+
+    This is also where a flyc kernel's own @ati.cite is finally activated
+    (PLAN-PON.md Part 3): the same `resolve_cites` + `build_kernel` pipeline
+    `_build_kernels` runs for Triton, with `inherit_tune=False` -- flyc has no
+    perf-tuning concept of its own and must NOT inherit the cited Triton
+    kernel's tune. `built_kernels` (the already-built Triton
+    {def-name -> KernelDescription} dict) is the `lookup` donor set: a flyc
+    cite target like 'op_attn_fwd.triton.attn_fwd' is a 3-segment (kernel-level)
+    cite, which resolves through the flat `lookup(family, kernel_name)` path,
+    never through `metro_lookup`/`op_lookup`."""
     from aotriton.template_instantiation.ir.flyc import KernelDescription
+    from aotriton.template_instantiation.ir.ops.cite import resolve_cites
+    from aotriton.template_instantiation.builder import build_kernel
+
+    def lookup(_family, kernel_name):
+        return built_kernels.get(kernel_name)
+
     out = {}
     for name, decl in compiled.flycs.items():
         op = operators.get(decl.functionals_of)
@@ -174,12 +221,17 @@ def _build_flycs(compiled, operators):
             f'flyc kernel {name!r} declares functionals_of={decl.functionals_of!r} '
             f'but no such operator was built in family {compiled.family!r}; '
             f'operators: {sorted(operators)}')
-        kdesc = KernelDescription(name=name, family=compiled.family,
-                                  module_path=decl.module_path, disable=decl.disable,
+        spec = _flyc_kernel_spec(decl)
+        resolve_cites(spec, family=compiled.family, lookup=lookup,
+                      inherit_tune=False)
+        bk = build_kernel(spec)
+        kdesc = KernelDescription(bk, family=compiled.family,
+                                  module_path=decl.module_path,
                                   functionals_source=op,
-                                  tensors=decl.tensors, scalars=decl.scalars,
+                                  tensors=spec.tensors, scalars=spec.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
+        kdesc.kernel_spec = spec       # the cite-resolved clone
         out[name] = kdesc
     return out
 
@@ -323,7 +375,7 @@ class Linker:
 
         # Resolves `functionals_of` against the just-built operators (Task 5a) --
         # must run after _build_operators, unlike affines (bound as backends).
-        flycs = _build_flycs(compiled, operators)
+        flycs = _build_flycs(compiled, operators, built_kernels)
 
         return FamilyArtifacts(
             family,
