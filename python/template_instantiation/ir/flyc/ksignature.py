@@ -22,7 +22,7 @@ than a generated struct/accessor.
 
 from functools import cached_property
 
-from aotriton.utils import render_pon as _render_pon
+from aotriton.utils import render_pon
 
 from ..lib import naming as lib_naming
 
@@ -45,11 +45,11 @@ class KernelSignature:
 
     @property
     def perf_section(self) -> str:
-        return _render_pon(self._psels)
+        return render_pon(self._psels)
 
     @property
     def copt_section(self) -> str:
-        return _render_pon(self._copts)
+        return render_pon(self._copts)
 
     @cached_property
     def hsaco_entry_name(self) -> str:

@@ -58,7 +58,8 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         # `f.choices` (a FunctionalChoiceView) is the real thing, not a dict
         # rebuilt from it: this generator has a linked Functional, unlike
         # python/flyc_compile.py's build-time driver, which parses `--signature`
-        # text into a MappingChoiceView instead (see ir/choices.py). The
+        # text into a MappingChoiceView instead (defined there; the interface
+        # they share is ir/choices.py's ChoiceView). The
         # description reads scalar axes by attribute (`choices.BLOCK_DMODEL`)
         # and real arguments via `.arg(aname)` (`choices.arg('Q')`) -- the same
         # split root.py:write_flyc_hsaco's `--signature` string preserves

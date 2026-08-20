@@ -10,7 +10,7 @@ from .override import (
     Predicate, VarRef, ValueFn, Override,
     eq, ne, lt, gt, le, ge,
 )
-from .choices import ChoiceView, ChoiceVarAbsent, MappingChoiceView
+from .choices import ChoiceView, ChoiceVarAbsent
 from .functional import Functional, FunctionalChoiceView
 # Per-language IR modules, reachable as ir.triton / ir.affine / ir.flyc
 # (e.g. `ati.ir.triton.KernelDescription`), imported last so every symbol
@@ -24,6 +24,6 @@ __all__ = [
     'Predicate', 'VarRef', 'ValueFn', 'Override',
     'eq', 'ne', 'lt', 'gt', 'le', 'ge',
     'Functional', 'ChoiceView', 'ChoiceVarAbsent',
-    'FunctionalChoiceView', 'MappingChoiceView',
+    'FunctionalChoiceView',
     'triton', 'affine', 'flyc',
 ]

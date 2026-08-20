@@ -318,7 +318,7 @@ def flyc_attn_fwd(choices, hints):
                `ir.Functional` and passes the real thing, `f.choices`
                (`FunctionalChoiceView`); the driver (`flyc_compile.py`) has
                only `--signature` text in a separate process with no linked
-               IR, and passes a `MappingChoiceView` over the parsed dict (see
+               IR, and passes its own `MappingChoiceView` over the parsed dict (see
                `jit2aot.md` "Correction 2" for why a `Functional` cannot be
                rebuilt from that text). `choices.NAME` reads a choice variable
                by attribute; `choices.arg('Q')` reads a real argument name

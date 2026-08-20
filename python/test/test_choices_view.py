@@ -1,7 +1,7 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Unit test for Functional.choices accessor view (executive plan Step 1.5)."""
+"""Unit tests for the ChoiceView interface and its two backings."""
 
 import sys
 from pathlib import Path
@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from aotriton.template_instantiation.ir import (
     TypedChoice, Axis, Override, eq, Interface,
-    ChoiceView, ChoiceVarAbsent, MappingChoiceView,
+    ChoiceView, ChoiceVarAbsent, FunctionalChoiceView,
 )
+# MappingChoiceView lives with its only user, the build-time driver.
+from aotriton.flyc_compile import MappingChoiceView
 
 
 class _IRStub(Interface):
@@ -104,30 +106,24 @@ def test_bare_choiceview_uninstantiable():
         ChoiceView()
     except TypeError as e:
         msg = str(e)
-        for name in ('tc', 'arg', 'arg_tc', '__getattr__'):
+        for name in ('arg', '__getattr__'):
             assert name in msg, f'{name!r} missing from TypeError message: {msg!r}'
         return
     raise AssertionError('expected TypeError instantiating ChoiceView')
 
 
-def test_mapping_tc_raises_not_implemented():
-    view = MappingChoiceView({'BLOCK_DMODEL': 16})
-    try:
-        view.tc('BLOCK_DMODEL')
-    except NotImplementedError as e:
-        assert 'MappingChoiceView' in str(e)
-        return
-    raise AssertionError('expected NotImplementedError from MappingChoiceView.tc')
-
-
-def test_mapping_arg_tc_raises_not_implemented():
-    view = MappingChoiceView({'Q': '*fp16:16'})
-    try:
-        view.arg_tc('Q')
-    except NotImplementedError as e:
-        assert 'MappingChoiceView' in str(e)
-        return
-    raise AssertionError('expected NotImplementedError from MappingChoiceView.arg_tc')
+def test_tc_and_arg_tc_are_not_on_the_interface():
+    # tc/arg_tc hand back a raw TypedChoice, which only a Functional has. They
+    # are deliberately NOT part of the ABC: requiring them would force the
+    # mapping-backed view to declare two methods whose only possible body is a
+    # raise -- an interface that advertises an operation and then denies it. A
+    # caller needing a TypedChoice must hold a FunctionalChoiceView, and finds
+    # that out from the type rather than at the call.
+    assert ChoiceView.__abstractmethods__ == frozenset({'arg', '__getattr__'})
+    assert not hasattr(ChoiceView, 'tc')
+    assert not hasattr(ChoiceView, 'arg_tc')
+    assert callable(FunctionalChoiceView.tc)
+    assert callable(FunctionalChoiceView.arg_tc)
 
 
 def test_mapping_getattr_and_arg_read_the_same_dict():
