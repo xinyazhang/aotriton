@@ -35,7 +35,19 @@ class FlycDecl(AtiNode):
     """Passive record of an @ati.flyc stack (a flyc kernel's "object file"): the
     marker + @ati.flyc.* metadata + the inert tensor/scalar kernarg-ABI specs +
     optional @ati.cite/@ati.disable. NO build in Phase 1. Attached to the def as
-    `fn.__ati_node__`."""
+    `fn.__ati_node__`.
+
+    `cite`/`disable` stay SINGULAR. A kernel may carry at most one of each --
+    that is true of a triton kernel too, and `collect_flyc_decl` enforces it
+    below. The builder pipeline (`resolve_cites`, `build_kernel`) reads the
+    list-valued `cites`/`disables` off a Triton `KernelSpec`, but that is the
+    BUILDER's contract, not a fact about a description; the singular-to-list
+    adaptation happens once, in the linker's spec clone, rather than being
+    pushed back into the declaration where it would misstate what a user can
+    write.
+
+    `overrides`/`dtype_vars`/`tune`/`params` are genuinely plural (or genuinely
+    optional) and are added here for the builder pipeline to populate."""
 
     name: str                          # the placeholder def's __name__
     module_path: Path                  # resolved vendored-kernel-file path
@@ -47,6 +59,10 @@ class FlycDecl(AtiNode):
     scalars: list = field(default_factory=list)     # inert list[ScalarSpec]
     cite: 'CiteSpec | None' = None
     disable: 'DisableSpec | None' = None
+    overrides: list = field(default_factory=list)   # list[Override], unused until a later step
+    dtype_vars: list = field(default_factory=list)  # list[ChoiceVar], unused until a later step
+    tune: object = None                             # TuneSpec | None, unused until a later step
+    params: list = field(default_factory=list)      # unused until a later step
 
     def hints(self):
         """A default-constructed instance of the registered hints dataclass, or
