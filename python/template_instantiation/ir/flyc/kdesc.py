@@ -57,7 +57,7 @@ class KernelDescription(Interface):
                 functionals_source=None, tensors=None, scalars=None,
                 builder_fn=None, hints_cls=None):
         # `built` is the BuiltKernel build_kernel() lowered this kernel's
-        # cite-resolved FlycDecl clone into (PLAN-PON.md Part 3): it answers
+        # cite-resolved FlycDecl clone into: it answers
         # "what are this kernel's arguments?" (order, disables) -- NOT "which
         # variants exist?", which stays functionals_source's job below (the
         # design caveat: a BuiltKernel giving flyc its own axes would make it
@@ -169,10 +169,11 @@ class KernelDescription(Interface):
         return self._require_functionals_source().real_of(apparel_arg)
 
     def is_functional_disabled(self, functional):
-        # Mirrors ir/triton/kdesc.py's is_functional_disabled exactly (PLAN-PON.md
-        # Part 3): self._built.disables is the cite-resolved list (build_kernel /
-        # resolve_cites already applied the §4.5 local-replaces-cited rule), so
-        # there is no separate "self._disable" concept left here.
+        # Mirrors ir/triton/kdesc.py's is_functional_disabled exactly:
+        # self._built.disables is the cite-resolved list (build_kernel /
+        # resolve_cites already applied the rule that a local @ati.disable
+        # replaces the cited one), so there is no separate "self._disable"
+        # concept left here.
         for d in self._built.disables:
             try:
                 if d.holds(functional):
