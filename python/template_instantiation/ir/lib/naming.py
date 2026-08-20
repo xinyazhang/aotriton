@@ -38,19 +38,3 @@ def blake2b_hash(package_path: str, entry: str):
     raw = (package_path + entry).encode('utf-8')
     h = hashlib.blake2b(raw, digest_size=8)
     return h.hexdigest(), raw
-
-
-def render_schemaless(d: dict) -> str:
-    """Render a knob/option dict as the `#P` / `#CO` grammar: `k=v;k=v`.
-
-    Lives here beside `entry_name` because it produces a COMPONENT of the entry
-    name, and the two must agree on the grammar; splitting them across the
-    per-language ksignature modules is how the two drift apart.
-
-    `str(v)`, not `repr(v)`: for every type these dicts actually carry (int,
-    bool, None, str) the two agree except for `str`, where `repr` would add
-    quotes the measured grammar does not have -- `v_lds_layout=transposed`,
-    never `v_lds_layout='transposed'`. The C++ side (`class Schemaless`) parses
-    exactly this form, so a quote here is a parse failure there.
-    """
-    return ';'.join(f'{k}={v}' for k, v in d.items())

@@ -10,19 +10,21 @@ vocabulary (`num_warps` / `num_stages` / `waves_per_eu`, `COMPILER_OPTIONS`, the
 gfx1250 double-warps workaround) that is specific to Triton's autotune model and
 does not apply here.
 
-flyc's perf vocabulary is Design B (PLAN-PHASE2.md Task 2): no C struct, no
-psel/copt grid choice among candidate images -- every functional resolves to
-exactly one hsaco, whose distinguishing knob set (all 23 `FmhaKnobs` fields, as returned
-by the description alongside its deferred builder) is carried verbatim in the `#P` section as a schemaless
-';'-separated 'k=v' string, parsed at runtime by `class Schemaless`
-(`include/aotriton/_internal/schemaless.h`) rather than a generated struct/accessor.
+flyc's perf vocabulary has no C struct, no psel/copt grid choice among
+candidate images -- every functional resolves to exactly one hsaco, whose
+distinguishing knob set (all 23 `FmhaKnobs` fields, as returned by the
+description alongside its deferred builder) is carried verbatim in the `#P`
+section as a PON (Plain / Python Object Notation) ';'-separated 'k=v' string,
+parsed at runtime by `class Pon` (`include/aotriton/_internal/pon.h`) rather
+than a generated struct/accessor.
 `copt_section` stays permanently empty -- flyc has no compiler-option grid.
 """
 
 from functools import cached_property
 
+from aotriton.utils import render_pon as _render_pon
+
 from ..lib import naming as lib_naming
-from ..lib.naming import render_schemaless as _render_schemaless
 
 
 class KernelSignature:
@@ -43,11 +45,11 @@ class KernelSignature:
 
     @property
     def perf_section(self) -> str:
-        return _render_schemaless(self._psels)
+        return _render_pon(self._psels)
 
     @property
     def copt_section(self) -> str:
-        return _render_schemaless(self._copts)
+        return _render_pon(self._copts)
 
     @cached_property
     def hsaco_entry_name(self) -> str:
