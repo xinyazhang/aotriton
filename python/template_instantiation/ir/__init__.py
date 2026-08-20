@@ -10,7 +10,8 @@ from .override import (
     Predicate, VarRef, ValueFn, Override,
     eq, ne, lt, gt, le, ge,
 )
-from .functional import Functional, ChoiceView
+from .choices import ChoiceView, ChoiceVarAbsent, MappingChoiceView
+from .functional import Functional, FunctionalChoiceView
 # Per-language IR modules, reachable as ir.triton / ir.affine / ir.flyc
 # (e.g. `ati.ir.triton.KernelDescription`), imported last so every symbol
 # above is already available to them.
@@ -22,6 +23,7 @@ __all__ = [
     'Axis', 'assign_godel', 'godel_of',
     'Predicate', 'VarRef', 'ValueFn', 'Override',
     'eq', 'ne', 'lt', 'gt', 'le', 'ge',
-    'Functional', 'ChoiceView',
+    'Functional', 'ChoiceView', 'ChoiceVarAbsent',
+    'FunctionalChoiceView', 'MappingChoiceView',
     'triton', 'affine', 'flyc',
 ]

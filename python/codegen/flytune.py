@@ -55,14 +55,15 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         """
         f = self._f
         kdesc = f.meta_object
-        # `compact_choices` is the established accessor and, critically, the SAME
-        # one root.py:write_flyc_hsaco uses to render the `--signature` string
-        # that flyc_compile parses back. So the dict this generator hands the
-        # description is exactly the dict the build-time driver hands it -- keys
-        # and values both. `f.resolved` would be a different thing: 68 entries
-        # (every argument, strides included) rather than the 6 functional axes.
-        choices = {name: tc.triton_compile_signature
-                   for name, tc in f.compact_choices.items()}
+        # `f.choices` (a FunctionalChoiceView) is the real thing, not a dict
+        # rebuilt from it: this generator has a linked Functional, unlike
+        # python/flyc_compile.py's build-time driver, which parses `--signature`
+        # text into a MappingChoiceView instead (see ir/choices.py). The
+        # description reads scalar axes by attribute (`choices.BLOCK_DMODEL`)
+        # and real arguments via `.arg(aname)` (`choices.arg('Q')`) -- the same
+        # split root.py:write_flyc_hsaco's `--signature` string preserves
+        # (rendered from `compact_choices`, unaffected by this).
+        choices = f.choices
         hints = kdesc.hints()
         assert kdesc.builder_fn is not None, (
             f'flyc kernel {kdesc.NAME!r} has no builder_fn '

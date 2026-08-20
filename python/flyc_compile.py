@@ -36,6 +36,7 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 
 from . import flyc_bootstrap
+from .template_instantiation.ir.choices import MappingChoiceView
 from .utils import parse_pon
 
 desc = """
@@ -492,12 +493,15 @@ def do_compile(args):
     if kernel_dir not in sys.path:
         sys.path.insert(0, kernel_dir)
 
-    # `choices` is the plain dict parsed from `--signature`: `{name: literal}`,
-    # nothing else, no fabricated `Functional`. The driver runs in a separate
-    # process from the generator and has no linked IR to hand the body, and a
-    # stand-in exposing `.arch` / `.choices.<NAME>` would drift silently the
-    # moment a description reads a third attribute -- a plain dict cannot.
-    choices = parse_pon(args.signature, sep=' ')
+    # `choices` is a MappingChoiceView over the plain dict parsed from
+    # `--signature`: `{name: literal}`, nothing else, no fabricated `Functional`.
+    # The driver runs in a separate process from the generator and has no linked
+    # IR to hand the body a real one. Unlike the untyped stand-in this replaced,
+    # `MappingChoiceView` is a declared ChoiceView implementation (ir/choices.py):
+    # `.tc`/`.arg_tc` raise `NotImplementedError` naming the backing rather than
+    # drifting silently, so a description that reaches for a TypedChoice this
+    # side genuinely does not have finds out immediately, not by accident.
+    choices = MappingChoiceView(parse_pon(args.signature, sep=' '))
     hints = _build_hints(node, args.hints)
     # The description body returns (built, sidecar): `built` is the FlyDSL
     # builder's result (driven to a code object below); `sidecar` is a

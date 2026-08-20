@@ -31,7 +31,7 @@ import numpy as np
 from aotriton.autotune import BinningLessOrEqual, BinningExact
 from ..axis import assign_godel, TemplateParam
 from ..cfield import cfield
-from ..functional import ChoiceVarAbsent
+from ..choices import ChoiceVarAbsent
 from ..interface import Interface
 from ..override import VarRef, ValueFn
 from .ksignature import KernelSignature, COMPILER_OPTIONS, DEFAULT_COPT
