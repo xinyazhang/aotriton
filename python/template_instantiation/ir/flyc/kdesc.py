@@ -20,6 +20,7 @@ operator's (PLAN-PHASE1.md Task 7a: "Give flyc its own zip ... keyed by the
 description's name").
 """
 
+import ast
 from pathlib import Path
 
 from ..interface import Interface
@@ -55,7 +56,7 @@ class KernelDescription(Interface):
     ENUM_PREFIX = 'kFlyc_'
     is_tunable = False
 
-    def __init__(self, built, *, family, module_path,
+    def __init__(self, built, *, name, family, module_path,
                 functionals_source=None, tensors=None, scalars=None,
                 builder_fn=None, hints_cls=None):
         # `built` is the BuiltKernel build_kernel() lowered this kernel's
@@ -64,8 +65,20 @@ class KernelDescription(Interface):
         # variants exist?", which stays functionals_source's job below (the
         # design caveat: a BuiltKernel giving flyc its own axes would make it
         # enumerate a second, wrong functional space).
+        #
+        # NAME is `name` (the DESCRIPTION's own def name, e.g. 'flyc_attn_fwd'),
+        # deliberately NOT `built.name`: build_kernel derives its `name` from
+        # `spec.kernel.__name__`, and for flyc that is the AST-located
+        # `@flyc.kernel`-decorated function in the VENDORED file (e.g.
+        # 'flash_attn_func_aiw_kernel') -- a different identifier from the
+        # description by design (see specs/flyc.py's collect_flyc_decl). For
+        # Triton the two coincide (the placeholder def is conventionally named
+        # after the kernel it wraps), which is why ir/triton/kdesc.py can use
+        # `built.name` directly; flyc cannot borrow that shortcut. unique_path
+        # (the --selective key, aks2/DB row identity) is FAMILY/CODEGEN_MODULE/
+        # NAME (ir/interface.py) and must stay the description's identity.
         self._built = built
-        self.NAME = built.name
+        self.NAME = name
         self.FAMILY = family
         self.MODULE_PATH = module_path
         # The Operator this kernel's `functionals_of=` names, resolved by the
