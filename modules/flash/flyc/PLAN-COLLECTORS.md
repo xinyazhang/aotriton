@@ -77,11 +77,61 @@ construction are not.**
 
 ## 3. Part 1 — the unification
 
-### 3.1 `SpecBundle`: a dataclass, not a tuple
+### 3.1 Two layers, not one table
+
+The partition is **hierarchical**. A common layer knows the vocabulary every
+stack shares and nothing else; each stack has a specialised partition that
+claims its own kinds and delegates the rest.
+
+```python
+def partition(specs) -> SpecBundle:
+    """Claim every COMMON spec kind. Anything unclaimed lands in
+    bundle.unrecognized -- not an error here, because this layer cannot know
+    what the caller's stack additionally accepts."""
+
+def partition_flyc(specs) -> FlycSpecBundle:
+    b = partition(specs)               # common kinds claimed
+    ...                                # claim FlycKernelSpec / FlycHintsSpec
+                                       #   out of b.unrecognized
+    b.reject_remaining('@ati.flyc')    # whatever is still unclaimed IS an error
+```
+
+This is better than the flat `accept=[SpecKind(...)]` table an earlier draft of
+this document proposed. That version made each stack re-list the common kinds,
+which trades four copies of a `isinstance` ladder for five copies of a
+declaration table — an improvement, but the duplication survives in a new form.
+Here the common vocabulary is written once, in code, and a stack declares only
+what is *additional* to it.
+
+`unrecognized` is the seam that makes this work: the common layer cannot decide
+whether an unclaimed spec is an error, so it does not try. Only the outermost
+caller knows, and only it raises.
+
+### 3.2 Restrictions become explicit
+
+A stack may accept less than the common vocabulary. Affine takes no
+`@ati.tensor`, `@ati.scalar`, `@ati.type_var` or `@ati.derives` today — but that
+is expressed as an *absent* `elif`, which is why defect 4 (accepted vocabulary
+nowhere written down) exists at all.
+
+Under the hierarchy the common layer claims them, so the specialised layer must
+say so:
+
+```python
+    b.forbid('tensors', 'scalars', 'dtype_vars', 'overrides', what='@ati.affine')
+```
+
+An affine stack carrying an `@ati.tensor` then fails naming the kind and the
+stack, instead of falling into a generic "unexpected spec" branch or, worse,
+being silently accepted the day someone adds the field. **The restriction is
+now a line of code that has to be deleted to change the rule**, rather than the
+absence of one.
+
+### 3.3 `SpecBundle`: a dataclass, and `cite`/`disable` are NOT lists
 
 `_partition` returns an 8-tuple, unpacked positionally at its two call sites.
-Adding a spec kind means editing every unpack; mis-ordering two same-typed
-fields is silent.
+Adding a kind means editing every unpack; mis-ordering two same-typed fields is
+silent.
 
 ```python
 @dataclass
@@ -91,99 +141,96 @@ class SpecBundle:
     overrides:    list[Override]     = field(default_factory=list)
     dtype_vars:   list[ChoiceVar]    = field(default_factory=list)
     tune_records: list               = field(default_factory=list)
-    cites:        list[CiteSpec]     = field(default_factory=list)
-    disables:     list[DisableSpec]  = field(default_factory=list)
-    markers:      list               = field(default_factory=list)
+    cite:         CiteSpec | None    = None      # AT MOST ONE
+    disable:      DisableSpec | None = None      # AT MOST ONE
+    unrecognized: list               = field(default_factory=list)
 ```
 
-Always lists, uniformly — the storage should not change shape with cardinality.
-Callers that want the singular read it through one accessor that enforces the
-rule:
+`cite` and `disable` are **singular fields, not one-element lists**. A second of
+either is rejected by `partition` at decoration time, naming the stack. This is
+the earliest point at which the rule can possibly be enforced — the specs are in
+hand and nothing has been built yet.
 
-```python
-    def one(self, name):
-        """The single spec in `name`, or None. Raises if there are several."""
-```
+Storing them singly is what makes the check unavoidable. A `list` field with a
+`max_count` rule is still a list: every consumer can iterate it, so the rule has
+to be re-checked (or forgotten) wherever the plural type suggests plural is
+possible. That is precisely how `affine.py:86-87` came to drop a disable
+silently. The type should not admit the state the rule forbids.
 
-so `bundle.one('cites')` and `bundle.one('disables')` are the *only* way a
-0-or-1 concept is read. That single method is what makes defect 1 unrepeatable:
-affine's missing assertion stops being something a site can forget, because no
-site writes the check any more.
+Prefer a dataclass over `NamedTuple`: the list fields are mutable and a
+`NamedTuple` invites positional unpacking, the exact habit being removed.
 
-Prefer a dataclass over `NamedTuple`: the fields are mutable lists that
-`resolve_cites` appends to, and a `NamedTuple` invites positional unpacking —
-the exact habit being removed.
+### 3.4 Declared cardinality vs resolved cardinality
 
-### 3.2 `partition(specs, accept, what)` — kernel-type-neutral
+This is the part the current code conflates, and the reason the check ended up
+deferred to the far end of the pipeline.
 
-One function, no knowledge of triton/affine/flyc/operator/metro. What varies is
-passed in:
+**At declaration, one. After cite resolution, many — legitimately.**
+`cite.py:326` builds `cited_disables = [d for cs in cited_specs for d in
+cs.disables]`, and a *whole-metro* cite resolves to every sub-kernel's spec. So
+a kernel that declares no disable and cites a metro with three sub-kernels
+inherits three. `BuiltKernel.disables` being a list is correct.
 
-```python
-@dataclass(frozen=True)
-class SpecKind:
-    field:     str          # SpecBundle field to append to
-    type:      type         # the spec class to match
-    max_count: int | None = None   # None = unbounded; 1 = at most one
-```
+The mistake is using one field for both. `KernelSpec.cites`/`disables` are
+plural *because resolution writes into them*, and that plurality then reads
+backwards as "you may declare several" — which nothing checks, at any stage.
 
-Each stack declares its vocabulary as a tuple of `SpecKind`, next to that
-stack's `Decl`. `partition` walks `specs` once, appends by declared field, and
-raises on (a) a spec matching no accepted kind — message built from `accept`, so
-every stack gets the good diagnostic that only affine and flyc have today — and
-(b) a count exceeding `max_count`, naming the stack and the kind.
+Split them:
 
-This is where defects 1-4 are fixed at once: cardinality and vocabulary become
-**data, declared per stack in one place**, rather than control flow restated per
-stack in four.
+| | declared | after resolution |
+|---|---|---|
+| field | `KernelSpec.cite`, `KernelSpec.disable` | `KernelSpec.resolved_disables` |
+| cardinality | 0-1, enforced at partition | 0-N, legitimately |
+| written by | the collector, once | `resolve_cites` |
 
-The first `SpecKind` of each stack is its marker (`AffineKernelSpec`,
-`FlycKernelSpec`, `OperatorSpec`), which `start()` already uses as the O(1)
-discriminant; declaring it with `max_count=1` also folds in the three hand-rolled
-"multiple markers in one stack" assertions.
+`BuiltKernel.disables` keeps its list and its meaning. `is_functional_disabled`
+keeps iterating it.
 
-### 3.3 Collectors shrink to construction
+A side benefit worth noting: `resolve_cites` currently **mutates**
+`spec.disables` in place, which is a large part of why `_clone_spec` exists —
+`_clone_spec`'s own docstring claims "the spec is the source of truth; the
+linker builds from a copy". With declared and resolved separated, the declared
+fields are never written after collection, so that claim becomes structurally
+true rather than maintained by discipline. Cloning is still needed
+(tensors/scalars/overrides/dtype_vars are still appended to), but the shrinking
+of what resolution may touch is real and worth doing on its own merits.
+
+### 3.5 Collectors shrink to construction
 
 ```python
 def collect_flyc_decl(placeholder, specs):
-    b = partition(specs, accept=FLYC_SPEC_KINDS, what='@ati.flyc')
+    b = partition_flyc(specs)
     ...                                  # build FlycDecl from b
 ```
 
-Uniform `collect_*(placeholder, specs)` signature across all of them —
-placeholder ignored where unused, and flyc already needs it for
-`inspect.getfile`/`__name__`.
+Uniform `collect_*(placeholder, specs)` across all of them — ignored where
+unused, and flyc already needs it for `inspect.getfile`/`__name__`.
 
-`describe()` keeps its name and public contract, and becomes the only one with a
+`describe()` keeps its name and public contract, and is the only one with a
 middle step:
 
 ```python
 def describe(kernel, *specs, _validate=True):
-    b = partition(specs, accept=KERNEL_SPEC_KINDS, what='ati.describe')
+    b = partition_kernel(specs)
     ...                                  # annotation specs, appended to b
     if _validate: _validate_completeness(...)
     kernel.__ati_node__ = KernelSpec(...)
 ```
 
-### 3.4 Metro gets a collector
+### 3.6 Metro gets a collector
 
-`_finalize_metro` currently reads `UnionPrecedenceSpec` inline and mutates
-`plan.precedence`. Give it `collect_metro_decl(placeholder, specs)` for
-symmetry, so all five paths read the same and `start()` is five identical calls.
-This is the smallest item and the one that makes the dispatch table honest.
+`_finalize_metro` reads `UnionPrecedenceSpec` inline and mutates
+`plan.precedence`. Give it `collect_metro_decl(placeholder, specs)` so all five
+paths read the same and `start()` becomes a dispatch table. Smallest item; it is
+what makes the dispatch honest.
 
-### 3.5 What this does NOT change
-
-State plainly, so a later reader does not "finish the job" wrongly:
+### 3.7 What this does NOT change
 
 * **`describe()` is not renamed** and does not lose validation.
 * **The four `Decl` types do not merge.** `AffineDecl`, `FlycDecl`,
-  `OperatorDecl`, `KernelSpec` describe genuinely different things. Only the
+  `OperatorDecl`, `KernelSpec` describe genuinely different things; only the
   partition step is shared.
-* **Triton's `disables`/`cites` list fields on `KernelSpec` are not reshaped
-  here.** `partition` will enforce `max_count=1`, so the lists become
-  0-or-1-element by construction, but changing the field type touches
-  `resolve_cites` and `build_kernel` and belongs in its own change.
+* **`BuiltKernel.disables` stays a list.** See 3.4 — that plurality is real.
 
 ## 4. Part 2 — adjacent opportunities, ranked
 
@@ -247,26 +294,43 @@ whose inputs are still changing; it is listed here only so the plan is complete.
 
 ## 5. Ordering
 
-1. `SpecBundle` + `partition` + `SpecKind`, with `_partition`'s two call sites
+1. `SpecBundle` + the common `partition()`, with `_partition`'s two call sites
    switched over. No behavior change intended.
-2. affine/flyc/operator collectors onto `partition`. **Affine's behavior does
-   change here** — a second `@ati.disable` becomes an error instead of a silent
-   overwrite. That is the point, and it needs its own line in the commit
-   message rather than riding along as a refactor side effect.
-3. `collect_metro_decl`; `start()` becomes a dispatch table; the three
-   `_finalize_*` go.
-4. `_clone_spec` onto the constructor (4.1) — independent of 1-3, can go first
-   if convenient.
+2. The four specialised partitions (`partition_kernel`, `partition_affine`,
+   `partition_flyc`, `partition_operator`) on top of it, each with its
+   `forbid(...)` line. **Two behaviour changes land here and both need their own
+   line in the commit message rather than riding along as refactor side effects:**
+   a second `@ati.disable` becomes an error on every stack (today affine drops
+   the first silently), and an `@ati.tensor` on an affine stack becomes an error
+   naming the kind.
+3. Split declared from resolved (3.4): `KernelSpec.cite`/`disable` singular,
+   `resolved_disables` added, `resolve_cites` writing only the latter. This is
+   the largest step and the one that touches the shared Triton path, so it
+   stands alone.
+4. `collect_metro_decl`; `start()` becomes a dispatch table; the three
+   `_finalize_*` one-liners go.
 5. 4.3 and 4.4 as separate later changes. 4.5 stays filed.
+
+Item 4.1 (`_clone_spec` via the constructor) is **done** — it was promoted onto
+the critical path by the `KernelSpec.name` change, since adding a
+`__post_init__`-derived field to a class whose clones bypassed `__post_init__`
+would have dropped it from every clone.
 
 ## 6. Gates
 
-* Triton hsaco entry names **byte-identical** across steps 1-4. This is a
-  description-layer refactor; nothing generated may move.
-* flyc ZIP names and `#P` sections unchanged; 288 functionals, same godel
-  numbers.
+* Triton hsaco entry names **byte-identical** across every step. This is a
+  description-layer refactor; nothing generated may move. Use the CLI
+  (`--selective 'flash/triton/attn_fwd'`, 872 files) and diff with embedded
+  build paths normalised — an internal-API check does not exercise
+  `unique_path` and will miss an identity regression, as it did once already.
+* flyc: `--selective 'flash/flyc/flyc_attn_fwd'`, 584 files, byte-identical;
+  288 functionals with unchanged godel numbers.
 * Suite green at each step.
-* A new test asserting a second `@ati.disable` raises on **every** stack kind —
-  the regression that motivates the whole change, and the one thing no current
-  test covers.
+* **A test asserting a second `@ati.disable` raises on every stack kind**, and a
+  second `@ati.cite` likewise. This is the regression that motivates the change
+  and nothing covers it today.
+* A test asserting an `@ati.tensor` on an affine stack raises — the `forbid`
+  path, which is new behaviour rather than a restored invariant.
+* A test that a whole-metro cite still inherits N disables (3.4's plural side),
+  so the singular declaration does not quietly cap resolution.
 * `grep` finds one `isinstance(s, TensorSpec)` ladder in the tree, not four.
