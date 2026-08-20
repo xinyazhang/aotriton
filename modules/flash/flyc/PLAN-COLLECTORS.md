@@ -394,3 +394,67 @@ would have dropped it from every clone.
 * After the rename: no bare `KernelSpec` remains, `AffineKernelSpec` and
   `FlycKernelSpec` still exist with 8 occurrences each, and every collection
   attached as `fn.__ati_node__` is named `*Decl`.
+
+---
+
+## 7. How this work is carried out
+
+### Branch
+
+```
+git switch -c flyc-codegen-rewrite-unify-collectors flyc-codegen-rewrite
+```
+
+**Not `flyc-codegen-rewrite/unify-collectors`.** Git refuses it:
+
+```
+fatal: cannot lock ref 'refs/heads/flyc-codegen-rewrite/unify-collectors':
+'refs/heads/flyc-codegen-rewrite' exists; cannot create ...
+```
+
+A ref is a file, so a branch name cannot also be a directory prefix while the
+parent branch exists. The hyphenated form keeps the intended reading. (If the
+slash namespace is wanted later, the parent has to move out of the way first —
+e.g. rename it to `flyc-codegen-rewrite/base` — which is not worth doing for
+this.)
+
+### Loop
+
+1. Branch from `flyc-codegen-rewrite` HEAD, as above.
+2. Implement on the branch, following the §5 ordering.
+3. Review happens on the branch; fixes land as **incremental commits on top**,
+   never as rewrites of earlier ones. Anything already reviewed stays
+   addressable by sha.
+4. When complete: **squash merge** back into `flyc-codegen-rewrite`.
+
+### Why squash, and what that means for §5 and §6
+
+The unification is atomic in effect — a partial application leaves two
+partitioning schemes live at once, which is worse than either. And the point of
+the change is deduplication, which reads as one diff and does not read at all
+when spread across six commits plus review fixes.
+
+So the granularity in §5 is for **doing and reviewing**, not for the final
+history. That is not a licence to skip it:
+
+* Every §5 step still lands as its own commit on the branch, and every §6 gate
+  still runs at each step. Bisecting a byte-identity failure across the whole
+  unification is exactly the situation the step boundaries exist for, and the
+  branch is where that bisect would happen.
+* The two steps with intended **behaviour** changes — step 2 (a second
+  `@ati.disable` becomes an error; `@ati.tensor` on an affine stack becomes an
+  error) and step 3 (declared/resolved split) — must each be a distinct commit
+  on the branch, so review can see them separately from the mechanical moves.
+* The squash message must carry those behaviour changes explicitly. A squash
+  that reads "unify the collectors" and silently contains two new error
+  conditions is a worse artifact than the six commits it replaced. List them.
+
+### Before the squash
+
+* Full §6 gate set green on the branch tip, not merely at the last step.
+* `git diff flyc-codegen-rewrite..HEAD` reviewed as one diff — that is what the
+  merge will look like, and it is the first time the deduplication is visible
+  as a whole.
+* Confirm the branch is a fast-forward candidate (no unrelated commits landed
+  on `flyc-codegen-rewrite` meanwhile); if any did, rebase the branch first so
+  the squash diff is only this work.
