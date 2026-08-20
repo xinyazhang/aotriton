@@ -114,7 +114,30 @@ def _flyc_fwd_disabled(f):
 
 
 @ati.start
-@ati.disable(when=_flyc_fwd_disabled)
+# The cited attn_fwd's own disable, _attn_fwd_disabled(f) = flash_disabled(f,
+# gfx950_bad_hdims={16}), is a SUPERSET of nothing this predicate already covers
+# -- it is the WEAKER of the two, not the one being weakened, despite the kwarg's
+# name. _attn_fwd_disabled can only return True for one of three reasons
+# (_common.py's flash_disabled):
+#   1. causal+matrix-bias unsupported (`causal != 0 and bias_type != 0`) -- this
+#      predicate calls flash_disabled(f) too, so it fires here identically.
+#   2. gfx11 + hdim>256 -- 'gfx1201'.startswith('gfx11') is False (gfx12, not
+#      gfx11); unreachable once `f.arch != 'gfx1201'` above has already returned
+#      True for every arch that could hit it.
+#   3. gfx950 + hdim==16 (the gfx950-specific tweak `attn_fwd` passes that this
+#      predicate does not) -- also gated behind an arch this predicate already
+#      rejects.
+# So _attn_fwd_disabled(f) implies _flyc_fwd_disabled(f) for every functional:
+# nothing the cited disable would catch slips through. Verified by measurement,
+# not just by this argument: op_attn_fwd enumerates 576 functionals for gfx1201;
+# _attn_fwd_disabled is True for 144 of them, and _flyc_fwd_disabled is True for
+# every one of those 144 (0 counterexamples), disabling 288 of the 576 in total
+# (matching the operator's known survivor count). If flyc ever widens past
+# `f.arch != 'gfx1201'` above, this justification expires -- branches 2 and 3
+# become reachable again and must be re-checked (or the cited disable re-inherited
+# instead of overridden).
+@ati.disable(when=_flyc_fwd_disabled,
+             I_understand_this_overrides_cited_disable=True)
 # `cite` fills the GAPS: any argument below that this description does not fully
 # claim (dtype variables, strideless operands) is cloned from the triton kernel by
 # apparel name, so the two backends cannot drift on a shared operand's type.
