@@ -35,7 +35,14 @@ class FlycDecl(AtiNode):
     """Passive record of an @ati.flyc stack (a flyc kernel's "object file"): the
     marker + @ati.flyc.* metadata + the inert tensor/scalar kernarg-ABI specs +
     optional @ati.cite/@ati.disable. NO build in Phase 1. Attached to the def as
-    `fn.__ati_node__`."""
+    `fn.__ati_node__`.
+
+    `cites`/`disables`/`params`/`dtype_vars`/`tune`/`overrides` give FlycDecl the
+    same shape `resolve_cites`/`build_kernel` read off a Triton `KernelSpec`
+    (specs/kernel.py) -- PLAN-PON.md Part 3. `collect_flyc_decl` below still only
+    populates `cites`/`disables` (each still limited to at most one entry, same
+    as before this shape change); the other four fields are inert placeholders
+    until a later step widens what the collector accepts."""
 
     name: str                          # the placeholder def's __name__
     module_path: Path                  # resolved vendored-kernel-file path
@@ -45,8 +52,12 @@ class FlycDecl(AtiNode):
     fn: object                         # the placeholder def itself (the builder)
     tensors: list = field(default_factory=list)     # inert list[TensorSpec]
     scalars: list = field(default_factory=list)     # inert list[ScalarSpec]
-    cite: 'CiteSpec | None' = None
-    disable: 'DisableSpec | None' = None
+    overrides: list = field(default_factory=list)   # list[Override], unused until a later step
+    cites: list = field(default_factory=list)       # list[CiteSpec], >=1 entries eventually
+    disables: list = field(default_factory=list)    # list[DisableSpec]
+    dtype_vars: list = field(default_factory=list)  # unused until a later step
+    tune: object = None                             # TuneSpec | None, unused until a later step
+    params: list = field(default_factory=list)      # unused until a later step
 
     def hints(self):
         """A default-constructed instance of the registered hints dataclass, or
@@ -101,4 +112,6 @@ def collect_flyc_decl(placeholder, specs):
     return FlycDecl(name=placeholder.__name__, module_path=marker.module_path,
                     desc_path=desc_path, functionals_of=marker.functionals_of,
                     hints_cls=hints_cls, fn=placeholder, tensors=tensors,
-                    scalars=scalars, cite=cite, disable=disable)
+                    scalars=scalars,
+                    cites=[cite] if cite is not None else [],
+                    disables=[disable] if disable is not None else [])

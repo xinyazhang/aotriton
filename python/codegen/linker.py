@@ -175,7 +175,8 @@ def _build_flycs(compiled, operators):
             f'but no such operator was built in family {compiled.family!r}; '
             f'operators: {sorted(operators)}')
         kdesc = KernelDescription(name=name, family=compiled.family,
-                                  module_path=decl.module_path, disable=decl.disable,
+                                  module_path=decl.module_path,
+                                  disable=decl.disables[0] if decl.disables else None,
                                   functionals_source=op,
                                   tensors=decl.tensors, scalars=decl.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
