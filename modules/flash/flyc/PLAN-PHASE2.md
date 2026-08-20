@@ -701,6 +701,115 @@ The generated launcher will be the same shape as `launcher_for_kMetro_Triton`
 one stream, and `debug_simulate_encoded_softmax`'s `launch_condition` already carries the
 `encoded_softmax != nullptr` guard.
 
+### 8.1 Exposing the backend index as a named constant
+
+Fixing the backend against the literal `2` is right — the index *is* the ABI, and
+`@ati.backend(2, ...)` pins it deliberately. What is wrong is that `2` then has to be
+retyped by hand everywhere it is used. Selecting the flyc backend from a test means
+`force_backend_index = 2`, and nothing anywhere connects that `2` back to the
+declaration that created it.
+
+**This is not a hypothetical drift risk. It has already happened three times in this
+exact corner of the codebase:**
+
+1. `attn_options::KernelSlot` (`flash.h:46-59`) carries the comment *"Automatically
+   generated from kernel NAMEs / See v3python/rules/flash/__init__.py"*. It is **not**
+   generated — it is hand-maintained — and the path in the comment no longer exists
+   (that tree is now `modules/flash/aot/`). The provenance note rotted before the
+   values did.
+2. `CausalType` is declared twice: `flash.h:77-82` and, by hand,
+   `modules/flash/tests/aotriton_flash.py:20-24`. **They already disagree.** The Python
+   copy has `TOP_LEFT = 1` and `BOTTOM_RIGHT = 2`; both are commented out on the C++
+   side. The spellings differ too (`NONE`/`WINDOWED` vs `None`/`WindowedAttention`).
+3. `VarlenType` (`flash.h:89-94`) is re-spelled as the dict `IVARLEN_TYPE`
+   (`aotriton_flash.py:31-35`).
+
+Meanwhile the backend numbering already *is* generated, from one loop —
+`codegen_backend_enums` (`python/codegen/operator.py:84-89`) walks
+`iface.list_backends()` and emits `{backend.enum_name} = {i}`. So the numbers have a
+single source of truth today; they are simply not published anywhere a caller can
+reach. Adding a fourth hand-copy for flyc would be the avoidable mistake.
+
+**Design: publish from the loop that already numbers them.** `codegen_backend_enums`
+gains two more emission targets beside the internal enum it writes now:
+
+| target | today | proposed |
+|---|---|---|
+| `OpAttnFwdContext::BackendEnum` (internal, `v3src/flash/iface.op_attn_fwd.h`) | generated | unchanged |
+| a **public** C++ header | — | generated, installed beside `config.h` |
+| the Python binding | — | generated into `modules/flash/bindings/v3.cc`'s table |
+
+`include/aotriton/config.h.in` → `configure_file` → `install(FILES ...)`
+(`CMakeLists.txt:184-185`) is the precedent for a public header that does not exist in
+the source tree.
+
+**Naming.** The sketch in the request was `attn_options::fwd::kBackendTriton`. Two
+reasons to put it at namespace scope instead, as sibling structs:
+
+```cpp
+struct AOTRITON_API FwdBackend {
+  static constexpr int32_t kMetro_Triton              = 0;
+  static constexpr int32_t kSlimAffine_AiterFmhaV3Fwd = 1;
+  static constexpr int32_t kMetro_Flyc                = 2;
+  static constexpr int32_t Max                        = 3;
+};
+
+struct AOTRITON_API BwdBackend {
+  static constexpr int32_t kMetro_TritonSplit         = 0;
+  static constexpr int32_t kShim_BwdKernelFuse        = 1;
+  static constexpr int32_t kSlimAffine_AiterFmhaV3Bwd = 2;
+  static constexpr int32_t Max                        = 3;
+};
+```
+
+* **It answers the fwd/bwd question by dissolving it.** The struct is shared between
+  fwd and bwd precisely because it is a *runtime request*; the backend vocabularies are
+  not shared, so they should not live inside the shared thing. Two types, no nesting,
+  no `struct fwd {}` inside an options struct.
+* **`attn_options` is hand-written in the main public header; these values are
+  generated.** Nesting them there forces one of two bad outcomes: `flash.h` becomes a
+  generated file, or the values get hand-copied into it — which is failure mode 1
+  above, verbatim.
+
+This also matches the existing house idiom exactly — `CausalType`, `WindowValue`,
+`VarlenType` (`flash.h:77-94`) are all `struct AOTRITON_API X { static constexpr ... }`
+at namespace scope. Plain `static constexpr int32_t`, **not** `enum class`: `flash.h:68-73`
+already records why (an `enum class` will not convert to `int32_t` without a cast), and
+`force_backend_index` is a plain `int`.
+
+Take the member names verbatim from `backend.enum_name`, the same string the internal
+enum uses. That is what makes the two provably unable to disagree, and it costs a name
+mapping nobody has to maintain. `kMetro_`/`kShim_`/`kSlimAffine_` encode the dispatch
+shape and are worth keeping; the redundant `Backend` in `kBackendTriton` is not, since
+the enclosing type already says it.
+
+**Python.** Bind as two classes with plain int attributes (`FwdBackend.kMetro_Flyc`),
+not `py::enum_` — `aotriton_flash.py:18-19` already records the reason the codebase
+avoids enums here: reading the integer needs `.value`, which makes call sites verbose.
+
+**UT fallout, kept minimal.** The `FWD_IMPL`/`BWD_IMPL` env vars stay as raw ints —
+they are a debugging affordance and need no change. Two things become derived rather
+than typed:
+
+- `level_op.py:89,96` currently carry the mapping **as comments**
+  (`# kMetro_Triton=0, kSlimAffine_AiterFmhaV3Fwd=1 (gfx942/gfx950 only)`). Those
+  comments become code.
+- `BACKEND_COUNT` (`level_op.py:91-93`) is a hand-maintained
+  `2 if arch in ('gfx942','gfx950') else 1`. It becomes `FwdBackend.Max`.
+
+**One thing to verify before building this.** The `BACKEND_COUNT` arch conditional
+implies the backend set is arch-dependent, but the generated enum in the gfx1201+gfx950
+reference build lists `kMetro_Triton=0, kSlimAffine_AiterFmhaV3Fwd=1, Max=2` — i.e. the
+union across the build's arches, with arch-dependence handled at *runtime availability*
+rather than in the numbering. **Confirm what a gfx1201-only build emits.** If the
+numbering really is per-build, generated constants handle it correctly by construction
+and hand-written ones cannot — which strengthens the case; but the answer changes what
+`Max` means to a caller, so establish it rather than assuming.
+
+**Scope note.** This subsection is a design, not a Task 7 blocker. Task 7 can land with
+the literal `2` and adopt the constant immediately after; the two are independent
+commits. It is written up here because Task 7 is what creates the third caller.
+
 **Files.**
 
 | | path |
@@ -708,6 +817,10 @@ one stream, and `debug_simulate_encoded_softmax`'s `launch_condition` already ca
 | MOD | `python/codegen/parser.py` — `_node_kind`, `visit_flyc` as a backend visitor, metro step relaxation |
 | MOD | `python/codegen/linker.py` — build flyc kdescs for backend refs, not only from `flyc_kernels` |
 | MOD | `modules/flash/aot/__init__.py` — `metro_fwd_flyc`, `@ati.backend(2, ...)` |
+| MOD | `python/codegen/operator.py` — `codegen_backend_enums` also emits the public header + binding table (8.1) |
+| ADD | generated public backend-constants header, installed beside `config.h` (8.1) |
+| MOD | `modules/flash/bindings/v3.cc` — bind `FwdBackend`/`BwdBackend` (8.1) |
+| MOD | `modules/flash/tune/level_op.py` — `BACKEND_COUNT` from `FwdBackend.Max`; drop the mapping comments (8.1) |
 
 ---
 
