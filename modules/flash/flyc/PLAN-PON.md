@@ -1,4 +1,4 @@
-# Unifying the assignment-list format, and the `builder_fn(choices, …)` interface
+# PON — Plain Object Notation, and the `builder_fn(choices, …)` interface
 
 Two related interface cleanups. Both are about the same thing: one spelling for
 one concept, instead of several that agree by luck.
@@ -22,7 +22,7 @@ matters — **two incompatible dialects**.
 | ↳ callers | `tune/flash/module.py:37` `FlashEntry.parse_text`, `:73` `FlashInputMetadata.parse_text` | |
 | `python/utils/kv.py` `parse_kv` (to be renamed, see Plan 0) | `split(sep)` then `ast.literal_eval` | yes, and `sep` is configurable |
 | ↳ callers | `python/flyc_compile.py` (`sep=' '` for `--signature` / `--hints`) | |
-| `v3src/schemaless/schemaless.cc` | `std::from_chars`, bounded | yes (C++ side) |
+| `v3src/schemaless/schemaless.cc` `Schemaless` | `std::from_chars`, bounded | yes (C++ side); rename to `Pon` |
 
 **Writers** — six, no two sharing code
 
@@ -75,36 +75,57 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
 
 ### Plan
 
-0. **Rename the module.** `kv.py` is a bad name *in this repository*: `KV` here
-   means keys/values in attention, and a file called `kv.py` sitting next to a
-   flash-attention codegen reads as KV-cache. The thing is a list of
-   `name=<python literal>` assignments, and "assignment" is already the word the
-   existing code uses for one element (`for assignment in args:` in
-   `parse_python`, and the loop variable in `parse_kv`).
+0. **Name the language: PON.**
 
-   **`python/utils/assignments.py`**, with `parse_assignments` /
-   `render_assignments`. Alternatives considered: `literal_map.py` (accurate
-   about the value grammar, vague about the shape), `sigtext.py` (describes one
-   of several uses), `pairlist.py` (loses the literal-ness), `wire.py`
-   (describes the role, not the format, and it is no longer only a wire).
+   By analogy with JSON — JavaScript Object Notation — this is **PON**, which
+   reads two ways, both true:
+
+   * **Plain** Object Notation — the primary gloss. It exists for the cases
+     where JSON is already too much ceremony: a filename component, a CLI
+     argument, one column of a database row, something a C++ parser must read
+     without linking a JSON library, something a human must read at a glance in
+     a log.
+   * **Python** Object Notation — the secondary gloss, and technically exact:
+     the values are Python literals.
+
+   `python/utils/pon.py`, with `parse_pon()` / `render_pon()`. In prose: "a PON
+   string", "PON-encoded", "the `#P` section is PON".
+
+   **`FON` (Flat Object Notation) was the runner-up** and is accurate about the
+   grammar being nesting-free, but it is harder to say, and "flat" describes the
+   Chomsky class while "plain" describes the purpose. The purpose is what a
+   reader needs.
+
+   Rejected earlier, recorded so they are not revisited: `kv.py` (KV means
+   keys/values in an attention codebase), anything `nv` (NVIDIA), `lite`
+   (sqlite3), `assignments`, `flatspec`, `slimspec`.
+
+   **One caution the name must not carry.** The "Python Object Notation" gloss
+   invites the thought *"so I can just `eval()` it"* — which is exactly the hole
+   Plan step 4 exists to close. `parse_python`'s `eval()` is a
+   remote-code-execution shape, because the strings reach the tuner from the
+   database. PON is parsed with `ast.literal_eval` and **never** `eval`. The
+   Python in the name refers to the *literal grammar*, not to the evaluator; say
+   so in the module docstring, where someone reaching for the shortcut will read
+   it.
 
 1. **That module becomes the one home**, gaining the writer beside the parser:
 
    ```python
-   def render_assignments(d: dict, sep: str = ';') -> str: ...
+   def render_pon(d: dict, sep: str = ';') -> str: ...
    ```
 
    `repr()` per value, not `str()` — that is what makes
-   `parse_assignments(render_assignments(d)) == d` hold, and it is the property
+   `parse_pon(render_pon(d)) == d` hold, and it is the property
    the split dialects lack. Add that round-trip as a test.
 
 2. **Delete `render_schemaless`** from `ir/lib/naming.py` (added in `54e644f4`;
-   it was the right instinct in the wrong place) and call `render_assignments`. Keep
+   it was the right instinct in the wrong place) and call `render_pon`. Keep
    `entry_name` where it is — it owns the `;;#F;…;;#P;…` frame, not the `k=v`
    grammar inside a section.
 
 3. **Fold the three `tr()` writers** — `module.py:45`, `module.py:56`,
-   `flash_entry.py:40` — onto `render_assignments`. The comma one passes `sep=','`.
+   `flash_entry.py:40` — onto `render_pon`. The comma one passes `sep=','`.
    `flash_entry.py:40` and `module.py:56` are currently byte-identical
    duplicates.
 
@@ -112,7 +133,7 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    security fix as much as a cleanup: `eval()` on a line that reaches the tuner
    from the database is a remote-code-execution shape.
 
-5. **`Schemaless::get_str` strips one pair of single quotes** — and the writer
+5. **`Pon::get_str` (renamed from `Schemaless`) strips one pair of single quotes** — and the writer
    guarantees that is sufficient. `get_int`/`get_bool` are unaffected.
 
    **The concern, stated properly.** A C++ parser that faithfully accepted
@@ -128,7 +149,7 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    Both quote styles plus escape decoding is exactly the kind of parser that is
    subtly wrong for years. **Do not build it.**
 
-   **Constrain the writer instead.** `render_assignments` asserts, for every
+   **Constrain the writer instead.** `render_pon` asserts, for every
    `str` value, that `repr(v) == "'" + v + "'"` — single-quoted, nothing
    escaped. Every value the codebase actually carries satisfies this
    (`transposed`, `auto`, `noninf`, and Triton's psel/copt have no strings at
@@ -141,7 +162,7 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
 
    On the Python-vs-C++ boolean spelling: the generator emits Python's
    `True`/`False`, not C++'s `true`/`false`. That is already handled and needs
-   no change — `Schemaless::get_bool` (`v3src/schemaless/schemaless.cc:82-95`)
+   no change — `Pon::get_bool` (`v3src/schemaless/schemaless.cc:82-95`, to be renamed)
    exact-matches `"True"`/`"False"` deliberately, case-sensitively, treating
    `"true"` as a miss rather than silently accepting it. It also survives this
    unification untouched, because `repr(True) == str(True) == 'True'`: booleans
@@ -151,10 +172,16 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    alternative — teaching the *writer* to emit `true`/`false` — would break
    the round-trip property the whole unification is for.
 
+6. **Rename the C++ side to match the language.** `class Schemaless` →
+   `class Pon` (`v3src/pon/pon.cc`, `include/aotriton/_internal/pon.h`).
+   `Schemaless` names how it stores; `Pon` names what it reads, which is what a
+   caller needs to know. Cheap now — the class has no callers outside the flyc
+   shim yet — and awkward later.
+
 **Ordering.** 1 → 5 → 2 (C++ before the producer changes, so no build sees an
 unparsable `#P`), then 3 and 4 independently.
 
-**Gate.** `parse_assignments(render_assignments(d)) == d` over the knob dict and
+**Gate.** `parse_pon(render_pon(d)) == d` over the knob dict and
 a `FlashEntry`; a string needing escapes raises at render time;
 Triton hsaco entry names byte-identical before and after; flyc ZIP names
 unchanged while flyc `#P` gains quotes; suite green.
