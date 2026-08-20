@@ -225,7 +225,7 @@ def _build_flycs(compiled, operators, built_kernels):
         resolve_cites(spec, family=compiled.family, lookup=lookup,
                       inherit_tune=False)
         bk = build_kernel(spec)
-        kdesc = KernelDescription(bk, family=compiled.family,
+        kdesc = KernelDescription(bk, name=name, family=compiled.family,
                                   module_path=decl.module_path,
                                   functionals_source=op,
                                   tensors=spec.tensors, scalars=spec.scalars,
