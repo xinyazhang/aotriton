@@ -25,6 +25,27 @@ def test_round_trip_tuple_and_list():
     assert parse_pon(render_pon(d)) == d
 
 
+def test_render_pon_emits_no_spaces():
+    # THE wire-protocol invariant. ExaidProxy.write joins its arguments with
+    # ' ' and testrun's first() splits them back on ' ', so one space inside a
+    # PON token does not corrupt that value -- it re-tokenizes the whole
+    # command. repr((1, 2)) would have produced '(1, 2)'.
+    text = render_pon({'shape': (1, 2), 'items': [0, 1, 2],
+                       'nested': (('a', 'b'), 3), 'name': 'transposed'})
+    assert ' ' not in text, text
+
+
+def test_render_pon_single_element_tuple_keeps_comma():
+    # '(1)' would read back as the int 1, silently changing the type.
+    assert render_pon({'t': (1,)}) == 't=(1,)'
+    assert parse_pon(render_pon({'t': (1,)})) == {'t': (1,)}
+
+
+def test_render_pon_rejects_string_with_space():
+    with pytest.raises(ValueError, match='spacey'):
+        render_pon({'spacey': 'two words'})
+
+
 def test_round_trip_custom_separator():
     d = {'BLOCK_M': 64, 'CAUSAL': True}
     text = render_pon(d, sep=' ')
@@ -43,7 +64,7 @@ def test_render_pon_rejects_unrepresentable_string():
     # contains a single quote itself) cannot be represented by this grammar --
     # render_pon must raise, naming the offending key, rather than silently
     # emitting text the C++ reader cannot parse.
-    with pytest.raises(AssertionError, match='bad_key'):
+    with pytest.raises(ValueError, match='bad_key'):
         render_pon({'bad_key': "can't"})
 
 
