@@ -69,16 +69,25 @@ class FlycDecl(AtiNode):
 
 def collect_flyc_decl(placeholder, specs):
     """Partition an @ati.flyc stack into a passive FlycDecl (no build, no
-    describe() validation)."""
+    describe() validation).
+
+    Mirrors specs/finalize.py's `_partition` (the Triton stacked-@ collector):
+    cites/disables/overrides/dtype_vars all accumulate as lists with no
+    cardinality limit here -- @ati.cite resolution (ir/ops/cite.py) and
+    build_kernel (builder/kernel.py) are what actually consume them, and
+    both already accept a list of any length."""
     from ..decorators.flyc import FlycKernelSpec, FlycHintsSpec
-    from ..decorators import TensorSpec, ScalarSpec, DisableSpec, CiteSpec
+    from ..decorators import TensorSpec, ScalarSpec, DisableSpec, CiteSpec, ChoiceVar
+    from ..ir import Override
 
     marker = None
     hints_cls = None
     tensors = []
     scalars = []
-    cite = None
-    disable = None
+    overrides = []
+    cites = []
+    disables = []
+    dtype_vars = []
     for s in specs:
         if isinstance(s, FlycKernelSpec):
             assert marker is None, 'multiple @ati.flyc.kernel markers in one stack'
@@ -90,15 +99,19 @@ def collect_flyc_decl(placeholder, specs):
             tensors.append(s)
         elif isinstance(s, ScalarSpec):
             scalars.append(s)
+        elif isinstance(s, ChoiceVar):
+            dtype_vars.append(s)
         elif isinstance(s, CiteSpec):
-            assert cite is None, 'multiple @ati.cite on one @ati.flyc stack'
-            cite = s
+            cites.append(s)
+        elif isinstance(s, Override):
+            overrides.append(s)
         elif isinstance(s, DisableSpec):
-            disable = s
+            disables.append(s)
         else:
             raise AssertionError(
                 f'unexpected spec {s!r} in an @ati.flyc stack; flyc kernels accept '
-                f'@ati.flyc.*, @ati.tensor/@ati.scalar, @ati.cite and @ati.disable only')
+                f'@ati.flyc.*, @ati.tensor/@ati.scalar, @ati.cite, @ati.disable, '
+                f'@ati.derives and @ati.type_var/@ati.scalar_var only')
     assert marker is not None, '@ati.start flyc path without an @ati.flyc.kernel marker'
     assert marker.functionals_of is not None, (
         f'@ati.flyc.kernel on {placeholder.__name__!r} is missing functionals_of=; '
@@ -112,6 +125,5 @@ def collect_flyc_decl(placeholder, specs):
     return FlycDecl(name=placeholder.__name__, module_path=marker.module_path,
                     desc_path=desc_path, functionals_of=marker.functionals_of,
                     hints_cls=hints_cls, fn=placeholder, tensors=tensors,
-                    scalars=scalars,
-                    cites=[cite] if cite is not None else [],
-                    disables=[disable] if disable is not None else [])
+                    scalars=scalars, overrides=overrides, cites=cites,
+                    disables=disables, dtype_vars=dtype_vars)
