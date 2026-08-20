@@ -173,13 +173,22 @@ def _resolve_one_cite(c, family, name, lookup, metro_lookup=None, op_lookup=None
     return [_kernel_spec_of(kdesc, name, c.target)]
 
 
-def resolve_cites(spec, *, family, lookup=None, metro_lookup=None, op_lookup=None):
+def resolve_cites(spec, *, family, lookup=None, metro_lookup=None, op_lookup=None,
+                   inherit_tune=True):
     """Augment a citing KernelSpec in place from its @ati.cite targets, BEFORE
     build_kernel. Each target resolves (via metro_lookup, the ops registry, else the
     flat kernel registry) to one or more cited KernelSpecs whose practices fill the
     citing kernel's gaps. `lookup(family, kernel_name)` overrides the flat-registry
     lookup; `metro_lookup(family, op_name, metro_name)` resolves a whole-metro cite to
-    its sub-kernels' specs directly (the linker's header/extern path)."""
+    its sub-kernels' specs directly (the linker's header/extern path).
+
+    `inherit_tune=False` suppresses step 0 below (inheriting the cited kernel's
+    whole `tune` when the citing kernel has none of its own) while leaving every
+    other cite-inheritance channel (gap arguments, dtype vars, overrides,
+    disables) untouched. flyc kernels pass this: PLAN-PON.md Part 3 excludes
+    flyc from inheriting a cited Triton kernel's tune -- flyc has no perf-tuning
+    concept of its own to receive it. Every other caller keeps the default
+    (`True`), so this is not a behavior change for the Triton path."""
     if not spec.cites:
         return spec
     name = getattr(spec.kernel, '__name__', 'kernel')
@@ -210,7 +219,7 @@ def resolve_cites(spec, *, family, lookup=None, metro_lookup=None, op_lookup=Non
     # ...). A kernel that wants its OWN perf — e.g. a schema-only untunable aux
     # kernel (schema, no configs) — declares it and is left untouched. Done BEFORE
     # the gap-fill so an inherited schema's perf-param names count as claimed.
-    if spec.tune is None:
+    if inherit_tune and spec.tune is None:
         for cs in cited_specs:
             if cs.tune is not None:
                 spec.tune = cs.tune
