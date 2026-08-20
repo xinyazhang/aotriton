@@ -14,14 +14,13 @@ namespace { // Anonymous namespace
 
 using namespace std::literals::string_view_literals;
 
-// flyc has no LUT and no PerfFields struct (PLAN-PHASE2.md Task 2, Design B;
-// Task 3): every functional resolves to exactly one hsaco (there is no
-// autotune choice among multiple candidate kernel images the way Triton's
-// shim has), so this table entry is a degenerate single-candidate
-// dispatcher. There is no `kernel_psels`/`kernel_copts` JSON string array
-// either -- the perf/copt knob set lives in the single hsaco's `#P` section
-// and is read back via `Schemaless` from `context.perf()` after
-// `lookup_optimal()`, not duplicated here.
+// flyc has no LUT and no PerfFields struct: every functional resolves to
+// exactly one hsaco (there is no autotune choice among multiple candidate
+// kernel images the way Triton's shim has), so this table entry is a
+// degenerate single-candidate dispatcher. There is no
+// `kernel_psels`/`kernel_copts` JSON string array either -- the perf/copt
+// knob set lives in the single hsaco's `#P` section and is read back via
+// `Pon` from `context.perf()` after `lookup_optimal()`, not duplicated here.
 
 // u8R generates char8_t which is poorly supported almost everywhere.
 constexpr pstring_view FLATZIP_PATH

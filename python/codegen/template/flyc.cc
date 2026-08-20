@@ -101,11 +101,11 @@ hipError_t
     }
     if (!kernel_on_device)
         return hipErrorSharedObjectSymbolNotFound;
-    // Design B (PLAN-PHASE2.md Task 2): the perf/copt knob set is a schemaless
-    // string, not a struct. Parse once here -- lookup_optimal already runs
-    // exactly once before launch and already touches the selected kernel --
-    // so grid_calculator() never parses on the launch path.
-    perf_ = Schemaless(kernel_on_device->psel());
+    // The perf/copt knob set is a PON (Plain / Python Object Notation) string,
+    // not a struct. Parse once here -- lookup_optimal already runs exactly
+    // once before launch and already touches the selected kernel -- so
+    // grid_calculator() never parses on the launch path.
+    perf_ = Pon(kernel_on_device->psel());
 
 #if AOTRITON_BUILD_FOR_TUNING && [[shared_iface]]
     if (call_options) {

@@ -1,7 +1,7 @@
 // Copyright © 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#include <aotriton/_internal/schemaless.h>
+#include <aotriton/_internal/pon.h>
 #include <aotriton/_internal/log.h>
 
 #include <charconv>
@@ -13,11 +13,11 @@ namespace AOTRITON_NS {
 namespace {
 
 // Find the value substring of the FIRST 'key=value' pair matching `key` in
-// `text` (';'-separated). Duplicate keys: first wins, per PLAN-PHASE2.md Task
-// 2. Matches on the FULL key -- 'block_m' must not match a pair keyed
-// 'block_mask'. Never reads outside [text.begin(), text.end()); if `text` is a
-// sub-view deliberately cut out of a larger buffer (no NUL at its own end),
-// this still only ever inspects text[0, text.size()).
+// `text` (';'-separated). Duplicate keys: first wins. Matches on the FULL key
+// -- 'block_m' must not match a pair keyed 'block_mask'. Never reads outside
+// [text.begin(), text.end()); if `text` is a sub-view deliberately cut out of
+// a larger buffer (no NUL at its own end), this still only ever inspects
+// text[0, text.size()).
 std::optional<std::string_view> find_value(std::string_view text, std::string_view key) noexcept {
   size_t pos = 0;
   while (pos <= text.size()) {
@@ -40,14 +40,14 @@ std::optional<std::string_view> find_value(std::string_view text, std::string_vi
 }
 
 // Unconditional (not gated by AOTRITON_DEBUG_LEVEL) fatal report: a missing or
-// unparsable Schemaless key with no `dflt` is a generator/description bug, not
+// unparsable Pon key with no `dflt` is a generator/description bug, not
 // a routine diagnostic, and NDEBUG release builds turn a bare assert() into a
 // no-op -- which would let execution fall through to a silently wrong launch
 // geometry, exactly the failure mode this class exists to avoid. So this
 // always prints to stderr and aborts, regardless of build type or log level.
 [[noreturn]] void fatal(const char* accessor, std::string_view key) {
   std::fprintf(stderr,
-               "[FATAL] Schemaless::%s: key \"%.*s\" is missing, unparsable, "
+               "[FATAL] Pon::%s: key \"%.*s\" is missing, unparsable, "
                "or None, and no default was given\n",
                accessor, int(key.size()), key.data());
   std::abort();
@@ -55,15 +55,15 @@ std::optional<std::string_view> find_value(std::string_view text, std::string_vi
 
 }  // anonymous namespace
 
-bool Schemaless::contains(std::string_view key) const noexcept {
+bool Pon::contains(std::string_view key) const noexcept {
   return find_value(text_, key).has_value();
 }
 
-std::optional<std::string_view> Schemaless::find(std::string_view key) const noexcept {
+std::optional<std::string_view> Pon::find(std::string_view key) const noexcept {
   return find_value(text_, key);
 }
 
-int64_t Schemaless::get_int(std::string_view key, std::optional<int64_t> dflt) const {
+int64_t Pon::get_int(std::string_view key, std::optional<int64_t> dflt) const {
   auto v = find_value(text_, key);
   if (v) {
     int64_t out = 0;
@@ -79,7 +79,7 @@ int64_t Schemaless::get_int(std::string_view key, std::optional<int64_t> dflt) c
   fatal("get_int", key);
 }
 
-bool Schemaless::get_bool(std::string_view key, std::optional<bool> dflt) const {
+bool Pon::get_bool(std::string_view key, std::optional<bool> dflt) const {
   auto v = find_value(text_, key);
   if (v) {
     // Exact, case-sensitive match on Python's True/False -- not "1"/"0", not
@@ -94,10 +94,18 @@ bool Schemaless::get_bool(std::string_view key, std::optional<bool> dflt) const 
   fatal("get_bool", key);
 }
 
-std::string_view Schemaless::get_str(std::string_view key, std::optional<std::string_view> dflt) const {
+std::string_view Pon::get_str(std::string_view key, std::optional<std::string_view> dflt) const {
   auto v = find_value(text_, key);
-  if (v && *v != "None")
+  if (v && *v != "None") {
+    // render_pon (python/utils/pon.py) emits every str value through repr(),
+    // which -- for every string this grammar carries -- is exactly one pair
+    // of surrounding single quotes and nothing escaped (render_pon asserts
+    // this at build time). Recovering the original string is therefore
+    // always this plain two-character strip, never a general repr unescaper.
+    if (v->size() >= 2 && v->front() == '\'' && v->back() == '\'')
+      return v->substr(1, v->size() - 2);
     return *v;
+  }
   if (dflt)
     return *dflt;
   fatal("get_str", key);
