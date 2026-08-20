@@ -1,4 +1,9 @@
-# PON — Plain Object Notation, and the `builder_fn(choices, …)` interface
+# Interface unification: PON, `ChoiceView`, `BuiltKernel`
+
+Three cleanups with one motive: make the flyc processing path *look like* the
+Triton one, so that where the two genuinely differ — and they do, the languages
+diverged a lot — the difference is visible instead of buried in a parallel
+implementation that drifted.
 
 Two related interface cleanups. Both are about the same thing: one spelling for
 one concept, instead of several that agree by luck.
@@ -257,3 +262,124 @@ duck-typed stand-in that drifted silently as descriptions read more attributes;
 this is a declared interface where the gap is part of the type, and adding a
 method to the ABC forces both implementations to answer for it.
 
+
+
+---
+
+## Part 3 — `BuiltKernel` for flyc too
+
+**Verdict: do it. Pros clearly outweigh cons, and one of the "pros" is a latent
+bug already sitting in the duplicate.**
+
+### Why flyc diverged
+
+`ir/triton/kdesc.py`'s `KernelDescription.__init__(built, …)` takes a
+`BuiltKernel` from the shared ATI builder, which already carries axes,
+overrides, `arguments` (full signature order), wiring, disables. flyc bypasses
+`build_kernel` entirely: `linker._build_flycs` hand-assembles the kdesc from the
+`FlycDecl`, threading `tensors=`/`scalars=`/`builder_fn=`/`hints_cls=`
+explicitly. That threading exists *only* because the builder was skipped.
+
+### The duplicate is already worse than the original
+
+flyc's `_real_param_order` and Triton's `_ast_kernel_param_names`
+(`decorators/source.py:56`) are the same operation — AST-parse the kernel file
+for the def's parameter names, no import, no execution — differing only in how
+they find the def:
+
+| | Triton `_ast_kernel_param_names` | flyc `_real_param_order` |
+|---|---|---|
+| locates the def | by name, top-level only | by `@*.kernel` decorator, `ast.walk` |
+| rejects `*args`/`**kwargs` | yes, `SourceError` with guidance | **no** |
+| collects | `posonlyargs + args + kwonlyargs` | **`args` only** |
+| failure style | named error explaining the fix | bare `assert` |
+
+Measured on today's kernel: 44 plain args, 0 posonly, 0 kwonly, no varargs — so
+the two agree **right now**. But the flyc copy silently drops a keyword-only
+parameter where the Triton one would collect it, and silently mis-collects
+`*args` where the Triton one refuses. A dropped kernarg is a misordered buffer
+that runs and returns wrong numbers. Latent, not live — and exactly the class of
+divergence this unification removes.
+
+### What flyc must supply to `build_kernel`
+
+`build_kernel(kernel_spec)` reads exactly six attributes:
+`.kernel`, `.params`, `.tensors`, `.scalars`, `.overrides`, `.tune`
+(plus `.disables` for the result). `FlycDecl` can supply all of them:
+
+| needed | flyc has |
+|---|---|
+| `.kernel` | a stub carrying the `@flyc.kernel` def name |
+| `.params` | the AST walk — generalise Triton's, do not keep a second copy |
+| `.tensors` / `.scalars` | already on `FlycDecl` |
+| `.overrides` | none today → `[]` |
+| `.tune` | none → `None` (already optional) |
+| `.disables` | `decl.disable` |
+
+`BuiltKernel.arguments` is then the real signature order, which **deletes
+`_real_param_order` outright**.
+
+### The one design caveat, and it is important
+
+**flyc must keep inheriting the operator's functional space.** flyc's kdesc
+currently forwards ~12 methods (`axes_multi`, `_axes_overrides`, `godel_number`,
+`axes_all_ordered`, `apparel_of`, …) to `functionals_source`, and inherits
+`Interface.gen_functionals` unchanged. If a `BuiltKernel` gave flyc *its own*
+axes and those reached enumeration, flyc would enumerate a second, wrong
+functional space.
+
+So the split has to be explicit, and it is a clarification rather than a
+compromise:
+
+* **`BuiltKernel` answers "what are this kernel's arguments?"** — order, types,
+  wiring. flyc uses it for exactly this.
+* **`functionals_source` answers "which variants exist?"** — flyc keeps
+  delegating that to the operator.
+
+Triton happens to use one object for both because its kernel owns its own
+functional space. flyc using it for one half is not a hack; it is the same
+object read for the part that applies.
+
+### Pros
+
+1. Deletes the weaker duplicate AST walker, closing the kwonly/vararg gap.
+2. `BuiltKernel.arguments` replaces `_real_param_order`.
+3. `linker._build_flycs` stops hand-threading operands — it constructs a kdesc
+   the way the Triton path does.
+4. Wiring (`_collect_wiring`) becomes shared, including the `ContextHelper`
+   `wires_to` case, which is currently flyc-only handling of a generic concept.
+5. The stated architectural goal: one processing shape, so real differences
+   stand out.
+6. A future backend gets the path for free rather than copying flyc's copy.
+
+### Cons, and their weight
+
+1. **`build_kernel` must be generalised** — the "find the kernel def" step is
+   currently name-based and Triton-specific; it needs a predicate (name, or
+   decorator) supplied by the caller. Contained, one function.
+2. **It touches the Triton path**, shared by every other backend. This is the
+   real risk and sets the gate below.
+3. **`KernelSpec` and `FlycDecl` are different spec types.** `build_kernel`
+   would accept either — duck-typed on the six attributes, or via a small shared
+   protocol. Prefer the protocol so the requirement is written down.
+
+Cons 1 and 3 are ordinary refactoring. Con 2 is real but bounded, and entirely
+testable: Triton's generated output must not move.
+
+### Gate
+
+- Every Triton hsaco entry name **byte-identical** before and after — that is
+  the whole blast radius of touching `build_kernel`.
+- flyc `BuiltKernel.arguments` equals today's `_real_param_order` output for all
+  44 parameters, in order.
+- flyc still enumerates the operator's functional space: 288 functionals,
+  unchanged godel numbers.
+- `_real_param_order` deleted; `grep` finds no second AST parameter walker.
+- suite green.
+
+### Ordering
+
+After Part 2 (`ChoiceView`), which is smaller and independent, and after the
+flyc shape stops moving. This is a consolidation of something that works, not a
+prerequisite for anything — so it should be scheduled where a Triton-path
+regression would be cheapest to catch, not squeezed in beside feature work.
