@@ -18,12 +18,14 @@ tensor/scalar specs as an inert list — nothing here is built or validated.
 
 from __future__ import annotations
 
+import ast
 import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .node import AtiNode
+from ..ast_params import find_one_function, has_decorator_attr, collect_params
 
 if TYPE_CHECKING:
     from ..decorators.disable import DisableSpec
@@ -39,10 +41,14 @@ class FlycDecl(AtiNode):
 
     `cites`/`disables`/`params`/`dtype_vars`/`tune`/`overrides` give FlycDecl the
     same shape `resolve_cites`/`build_kernel` read off a Triton `KernelSpec`
-    (specs/kernel.py) -- PLAN-PON.md Part 3. `collect_flyc_decl` below still only
-    populates `cites`/`disables` (each still limited to at most one entry, same
-    as before this shape change); the other four fields are inert placeholders
-    until a later step widens what the collector accepts."""
+    (specs/kernel.py) -- PLAN-PON.md Part 3. `kernel`/`params` are populated
+    from an AST walk of `module_path` (the vendored kernel file) that finds the
+    unique `@flyc.kernel`-decorated function -- the same operation
+    `@ati.source` performs for a Triton kernel, reusing the same
+    `ast_params`/`introspect` machinery rather than keeping a second AST
+    walker (this is what replaces `ir/flyc/kdesc.py`'s `_real_param_order`).
+    `dtype_vars`/`tune` remain inert placeholders: nothing populates or
+    consumes them yet."""
 
     name: str                          # the placeholder def's __name__
     module_path: Path                  # resolved vendored-kernel-file path
@@ -50,6 +56,7 @@ class FlycDecl(AtiNode):
     functionals_of: str                # operator NAME this kernel's functionals come from (Task 5a)
     hints_cls: type | None             # the @ati.flyc.hints dataclass, or None
     fn: object                         # the placeholder def itself (the builder)
+    kernel: object = None              # KernelStub for the AST-located @flyc.kernel def
     tensors: list = field(default_factory=list)     # inert list[TensorSpec]
     scalars: list = field(default_factory=list)     # inert list[ScalarSpec]
     overrides: list = field(default_factory=list)   # list[Override], unused until a later step
@@ -57,7 +64,7 @@ class FlycDecl(AtiNode):
     disables: list = field(default_factory=list)    # list[DisableSpec]
     dtype_vars: list = field(default_factory=list)  # unused until a later step
     tune: object = None                             # TuneSpec | None, unused until a later step
-    params: list = field(default_factory=list)      # unused until a later step
+    params: list = field(default_factory=list)      # list[ParamSpec], real kernel signature order
 
     def hints(self):
         """A default-constructed instance of the registered hints dataclass, or
@@ -65,6 +72,25 @@ class FlycDecl(AtiNode):
         if self.hints_cls is None:
             return None
         return self.hints_cls()
+
+
+def _flyc_kernel_stub(module_path, name):
+    """AST-parse `module_path` (the vendored kernel file) for the unique
+    `@flyc.kernel`-decorated function and wrap it as a `KernelStub` -- the same
+    non-importing stand-in `@ati.source` builds for a Triton kernel
+    (decorators/source.py). Unlike a Triton kernel (looked up by NAME,
+    top-level only), the flyc kernel def is looked up by DECORATOR and may sit
+    in a nested scope, so this walks every scope (`walk=True`) and requires the
+    match to be unique."""
+    from ..decorators.source import KernelStub
+
+    path = Path(module_path)
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    what = f'flyc kernel {name!r}: {path}'
+    fn = find_one_function(tree, lambda n: has_decorator_attr(n, 'kernel'),
+                           walk=True, what=what)
+    params = collect_params(fn, what=what)
+    return KernelStub(fn.name, params, str(path))
 
 
 def collect_flyc_decl(placeholder, specs):
@@ -122,8 +148,11 @@ def collect_flyc_decl(placeholder, specs):
     # This is what codegen/root.py's Fly.compile DESC column feeds to
     # `aotriton.flyc_compile <desc_path> --kernel_name ...` (Task 5c).
     desc_path = Path(inspect.getfile(placeholder)).resolve()
+    from ..introspect import kernel_params
+    stub = _flyc_kernel_stub(marker.module_path, placeholder.__name__)
     return FlycDecl(name=placeholder.__name__, module_path=marker.module_path,
                     desc_path=desc_path, functionals_of=marker.functionals_of,
-                    hints_cls=hints_cls, fn=placeholder, tensors=tensors,
+                    hints_cls=hints_cls, fn=placeholder, kernel=stub,
+                    params=kernel_params(stub), tensors=tensors,
                     scalars=scalars, overrides=overrides, cites=cites,
                     disables=disables, dtype_vars=dtype_vars)

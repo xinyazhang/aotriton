@@ -55,3 +55,32 @@ def collect_params(fn, *, what):
             f"{what} uses *args/**kwargs, which ATI cannot introspect into a "
             f"fixed ARGUMENTS order")
     return [p.arg for p in (a.posonlyargs + a.args + a.kwonlyargs)]
+
+
+def find_one_function(tree, predicate, *, walk=False, what):
+    """`find_functions(tree, predicate, walk=walk)`, requiring the match to be
+    unique. Raises `AstParamError` naming `what` and how many matches were
+    found (0 or more than 1) -- used by a caller that locates its def by a
+    predicate with no independent way to disambiguate multiple hits (e.g.
+    flyc's `@flyc.kernel` decorator search, which -- unlike a Triton kernel
+    looked up by name -- walks every nested scope and so can plausibly hit
+    more than one function)."""
+    matches = find_functions(tree, predicate, walk=walk)
+    if len(matches) != 1:
+        raise AstParamError(
+            f"{what}: expected exactly one matching function definition, "
+            f"found {len(matches)}")
+    return matches[0]
+
+
+def has_decorator_attr(node, attr):
+    """True if one of `node`'s decorators is (or calls) `<something>.<attr>`
+    -- e.g. `@flyc.kernel` or `@flyc.kernel(...)` both match `attr='kernel'`.
+    Matches on the decorator's trailing attribute name only, not the module/
+    object it hangs off of (mirroring `ir/flyc/kdesc.py`'s prior
+    `_is_kernel_decorator`, which only ever checked `.attr == 'kernel'`)."""
+    for dec in node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Attribute) and target.attr == attr:
+            return True
+    return False
