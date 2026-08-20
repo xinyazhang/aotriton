@@ -37,8 +37,9 @@ Three consequences, each handled below:
 2. **No functional axes are declared here.** They belong to the operator (owned by
    the default triton backend); this backend inherits them and narrows with
    `@ati.disable`, exactly as `aiter_fwd.py` does. `flyc_attn_fwd` then reads
-   `choices['NAME']` — the OPERATOR's choices, parsed from `--signature` text by
-   the driver — and maps them to builder knobs. This is also why the axes cannot
+   `choices.NAME` (a `ChoiceView`) — the OPERATOR's choices, parsed from
+   `--signature` text by the driver — and maps them to builder knobs. This is
+   also why the axes cannot
    be re-declared as `@ati.scalar`: they are not arguments of the flyc kernel at
    all, they are build-time Python values.
 
@@ -287,14 +288,18 @@ def flyc_attn_fwd(choices, hints):
 
     TWO objects, because they are two kinds of fact (PLAN.md 6.9):
 
-      choices  what the kernel must SUPPORT: `{name: literal}`, parsed straight
-               from `--signature` text. The compile-time identity, in the one
-               vocabulary that genuinely round-trips through the driver, which
-               runs in a separate process from the generator and has no linked
-               IR to hand this function a real `ir.Functional`. Everything
-               here is an ATI axis; nothing else -- see `jit2aot.md`
-               "Correction 2" for why this is a plain dict rather than a
-               `Functional` stand-in.
+      choices  what the kernel must SUPPORT: a `ChoiceView` (`ir/choices.py`)
+               over the compile-time identity. Two call sites hand this
+               function two different backings, and the function reads neither
+               one directly -- only the interface: the generator has a linked
+               `ir.Functional` and passes the real thing, `f.choices`
+               (`FunctionalChoiceView`); the driver (`flyc_compile.py`) has
+               only `--signature` text in a separate process with no linked
+               IR, and passes a `MappingChoiceView` over the parsed dict (see
+               `jit2aot.md` "Correction 2" for why a `Functional` cannot be
+               rebuilt from that text). `choices.NAME` reads a choice variable
+               by attribute; `choices.arg('Q')` reads a real argument name
+               that is not one (`T_io` is the variable governing `Q`).
       hints    what the kernel should be OPTIMIZED FOR. Declared by
                `@ati.flyc.hints` above. Not axes, and deliberately so —
                `seqlen_q` is a tune BINNING dimension
@@ -325,7 +330,7 @@ def flyc_attn_fwd(choices, hints):
     # function but never the callable -- never imports flydsl.
     from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
 
-    tile = choices['BLOCK_DMODEL']
+    tile = choices.BLOCK_DMODEL
     meta = FmhaInputMetadata(
         # `num_heads` reaches the emitted kernel ONLY through STRIDE_TOKEN, which is
         # read exclusively under STRIDES_CONSTEXPR — a dense-only diagnostic arm the
@@ -337,16 +342,16 @@ def flyc_attn_fwd(choices, hints):
         # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
         # 2 bottom-right / 3 window), and the kernel only ever emits {0, 3} — the
         # same pair the operator's CAUSAL_TYPE axis offers. 1:1, no mapping.
-        causal=choices['CAUSAL_TYPE'] != 0,
-        causal_type=choices['CAUSAL_TYPE'],
-        dtype_str='bf16' if '*bf16' in choices['Q'] else 'f16',
-        bias=bool(choices['BIAS_TYPE']),
-        dropout=bool(choices['ENABLE_DROPOUT']),
+        causal=choices.CAUSAL_TYPE != 0,
+        causal_type=choices.CAUSAL_TYPE,
+        dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
+        bias=bool(choices.BIAS_TYPE),
+        dropout=bool(choices.ENABLE_DROPOUT),
     )
-    # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with choices['BLOCK_DMODEL']
+    # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with choices.BLOCK_DMODEL
     knobs = resolve_knobs(meta, FmhaKnobs(
         block_dmodel=tile,
-        padded_head=choices['PADDED_HEAD'],
+        padded_head=choices.PADDED_HEAD,
         # AOT cannot bake strides: one binary must serve every layout. This is also
         # what makes `num_heads` above irrelevant to the emitted code.
         strides_constexpr=False,
