@@ -1,10 +1,10 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""A safe, separator-configurable replacement for `v3python/tune/utils.py`'s
+"""A safe, separator-configurable replacement for `aotriton.tune.utils`'s
 `parse_python`.
 
-`parse_python` (`v3python/tune/utils.py:43-50`) splits a line on `;`, then on
+`parse_python` (`python/tune/utils.py`) splits a line on `;`, then on
 `=` with `maxsplit=1`, then calls `eval(v)` on the value. Two problems: the
 `eval` can execute arbitrary code, and the separator is hard-coded to `;` so
 nothing that needs a different one (e.g. flyc's `--signature`/`--hints`

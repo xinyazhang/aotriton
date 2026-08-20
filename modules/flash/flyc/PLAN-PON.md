@@ -19,26 +19,61 @@ matters — **two incompatible dialects**.
 
 ### Survey
 
+*Re-run against `upstream/main` (`30ae9671`) after the Tuner v3.5 modularization
+(#212/#213/#214/#216), which renamed `v3python/tune/*` → `python/tune/*` and
+`v3python/tune/flash/*` → `modules/flash/tune/*` — 69 files. The rename moved
+every site below; it added no new PON producer or consumer. What it did add is
+one **adjacent** grammar and one **free regression gate**, both recorded after
+the tables.*
+
 **Readers**
 
 | where | how | safe? |
 |---|---|---|
-| `v3python/tune/utils.py:43` `parse_python` | `split(';')` then **`eval(v)`** | **no** — arbitrary code execution |
-| ↳ callers | `tune/flash/module.py:37` `FlashEntry.parse_text`, `:73` `FlashInputMetadata.parse_text` | |
+| `python/tune/utils.py:42` `parse_python` | `split(';')` then **`eval(v)`** | **no** — arbitrary code execution |
+| ↳ callers | `modules/flash/tune/entry.py:34` `FlashEntry.parse_text`, `:75` `FlashInputMetadata.parse_text` | |
+| ↳ ↳ reached from | `.tune/bin/retry_missing_entries:73` (a report **file**), `.tune/webui/tasks.py:279` (a pasted line), `python/tune/testrun.py:127,133` (the **wire**) | |
 | `python/utils/kv.py` `parse_kv` (to be renamed, see Plan 0) | `split(sep)` then `ast.literal_eval` | yes, and `sep` is configurable |
-| ↳ callers | `python/flyc_compile.py` (`sep=' '` for `--signature` / `--hints`) | |
+| ↳ callers | `python/flyc_compile.py:95,500` (`sep=' '` for `--signature` / `--hints`) | |
 | `v3src/schemaless/schemaless.cc` `Schemaless` | `std::from_chars`, bounded | yes (C++ side); rename to `Pon` |
 
 **Writers** — six, no two sharing code
 
 | where | separator | strings |
 |---|---|---|
-| `tune/flash/module.py:45` `as_posix` | `,` | bare |
-| `tune/flash/module.py:56` `as_text` | `;` | **quoted**, via a local `tr()` |
-| `modules/flash/aot/flash_entry.py:40` | `;` | **quoted**, `tr()` duplicated verbatim |
+| `modules/flash/tune/entry.py:44` `as_posix` | `,` | bare |
+| `modules/flash/tune/entry.py:46` `as_text` | `;` | **quoted**, via a local `tr()` |
+| `modules/flash/aot/flash_entry.py:32` | `;` | **quoted**, `tr()` duplicated verbatim |
 | `ir/triton/ksignature.py:58` `perf_section` | `;` | n/a (see below) |
 | `ir/triton/ksignature.py:66` `copt_section` | `;` | n/a |
 | `ir/lib/naming.py:56` `render_schemaless` | `;` | bare |
+
+**One composite, worth naming so it is not mistaken for plain PON.**
+`modules/flash/tune/sancheck.py:144` emits `f'arch={arch} {entry.as_text()}'` —
+a **bare** `arch=gfx1201` pair, a space, then a **quoted** PON body. Its two
+readers both hand-split on the first space and take the arch value raw
+(`retry_missing_entries:71-73`, `webui/tasks.py:278-279`) before handing the
+tail to `parse_text`. So the composite is a PON body with an ad-hoc prefix, not
+a PON string; `render_pon` should not be pointed at the whole line, and the
+prefix stays hand-written. Recorded because "unify the last k=v" is exactly the
+kind of tidying that would break both readers.
+
+**One adjacent grammar that is deliberately *not* PON.** Tuner v3.5 added
+`python/tune/tdesc.py:98` `ImplSelector.as_text` → `op.attn_fwd=1`, parsed back
+by `:92 parse_text` with `split('=')` + `int()`. It is a single pair with no
+separator, and its key is **dotted** — `op.attn_fwd` is not a Python
+identifier, so the whole string is not a Python assignment and never round-trips
+through `literal_eval` as PON. Leave it alone. It is a two-field selector DSL
+that happens to spell itself with an `=`, and it already has round-trip tests
+(`test_tune_infra.py:80-119`).
+
+**One free regression gate.** Upstream now *pins* the duplication that Plan
+step 3 removes: `modules/flash/tune/entry.py:47-49` carries a `KEEP
+BYTE-IDENTICAL` comment pointing at the codegen-side copy, and
+`python/test/test_tune_infra.py:305 test_flash_entry_as_text_matches_codegen_copy`
+asserts `a.as_text() == b.as_text()` for two entries. That test is the gate for
+step 3 for free — but it also means **both copies must move in the same
+commit**, or it goes red.
 
 ### The two dialects, and why it matters
 
@@ -60,8 +95,9 @@ ambiguous with an identifier, which is precisely why the safe parser rejects it.
 ### Blast radius: smaller than it looks
 
 Quoting only changes *string* values, so the question is which producers ever
-emit one. Measured across every Triton psel/copt in the reference shim build,
-the complete set of distinct values is:
+emit one. Re-measured post-rebase across **38,368** entry names in the reference
+shim build (`build-0.14-shim-gfx1201_gfx950`), the complete set of distinct
+psel/copt values is:
 
 ```
 0 1 2 3 4 8 16 32 64 128 256 False True
@@ -146,14 +182,45 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    `entry_name` where it is — it owns the `;;#F;…;;#P;…` frame, not the `k=v`
    grammar inside a section.
 
-3. **Fold the three `tr()` writers** — `module.py:45`, `module.py:56`,
-   `flash_entry.py:40` — onto `render_pon`. The comma one passes `sep=','`.
-   `flash_entry.py:40` and `module.py:56` are currently byte-identical
-   duplicates.
+3. **Fold the three `tr()` writers** — `modules/flash/tune/entry.py:44`
+   (`as_posix`), `:46` (`as_text`), and `modules/flash/aot/flash_entry.py:32` —
+   onto `render_pon`. The comma one passes `sep=','`. The latter two are
+   byte-identical duplicates, and upstream now enforces that
+   (`test_flash_entry_as_text_matches_codegen_copy`), so change both together.
 
-4. **Retire `parse_python`.** Its two callers become `parse_kv`. This is a
-   security fix as much as a cleanup: `eval()` on a line that reaches the tuner
-   from the database is a remote-code-execution shape.
+   **The duplication cannot simply be deleted**, and the reason is a real
+   constraint rather than an oversight: `modules/flash/aot/flash_entry.py` is
+   the codegen-side copy and must stay importable without torch *or* dacite,
+   while `modules/flash/tune/entry.py` is the tuning-side one. Folding both onto
+   `render_pon` is therefore only correct if `python/utils/pon.py` has **no
+   heavy imports** — `ast` and nothing else. Treat that as a hard requirement of
+   the module, not a stylistic preference; it is what lets one shared writer
+   replace two copies that exist precisely to avoid a dependency.
+
+4. **Retire `parse_python`.** Its two callers (`FlashEntry.parse_text`,
+   `FlashInputMetadata.parse_text`) become `parse_pon`; that covers all four
+   entry points in the Readers table transitively.
+
+   This is a security fix as much as a cleanup, and the path is no longer
+   hypothetical — it was traced end to end during this survey:
+
+   ```
+   im.as_text()                      .tune/libexec/broken_entries_to_db:243
+     -> SQLite   extra_uts.im_text
+     -> _load_extra_uts              .tune/libexec/reset_broken_to_pending:61
+     -> insert_extra_uts             python/tune/pq/extra_uts.py:17
+     -> Postgres task_extra_uts.im_text
+     -> get_extra_uts                python/tune/localq/pg_reader_worker.py:251
+     -> task_config['extra_im_texts']
+     -> exaid.prepare_data           python/tune/exaid.py:156   (wire token)
+     -> testrun parse_text           python/tune/testrun.py:133
+     -> parse_python                 python/tune/utils.py:48    ** eval() **
+   ```
+
+   A string transits **two** databases and a socket, then is `eval()`'d on the
+   GPU worker. Anyone who can write `task_extra_uts` runs code there. Note the
+   whole chain carries only dataclass field values, so `parse_pon` is a
+   drop-in — `literal_eval` accepts every value this path legitimately moves.
 
 5. **`Pon::get_str` (renamed from `Schemaless`) strips one pair of single quotes** — and the writer
    guarantees that is sufficient. `get_int`/`get_bool` are unaffected.
