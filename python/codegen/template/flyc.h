@@ -6,7 +6,7 @@
 
 #include <aotriton/config.h>
 #include <aotriton/_internal/triton_kernel.h>
-#include <aotriton/_internal/schemaless.h>
+#include <aotriton/_internal/pon.h>
 #include <aotriton/dtypes.h>
 #include <aotriton/runtime.h>
 #include <aotriton/util.h>
@@ -48,12 +48,12 @@ struct [[context_class_name]] {
         call_options = pcontext.call_options;
 #endif
     }
-    // flyc has no perf struct (PLAN-PHASE2.md Task 2, Design B): the perf/copt
-    // knob set is a schemaless ';'-separated string, not a C struct. `perf_` is
+    // flyc has no perf struct: the perf/copt knob set is a PON (Plain / Python
+    // Object Notation) ';'-separated string, not a C struct. `perf_` is
     // populated once in lookup_optimal(), after the image is chosen and before
     // any launch, so grid_calculator() never parses on the launch path.
-    Schemaless perf_;
-    Schemaless perf() const { return perf_; }
+    Pon perf_;
+    Pon perf() const { return perf_; }
 
     // Context helpers: host-side computations a plain operand rename cannot
     // express (`ati.context_helper(...)` on an @ati.scalar/@ati.tensor). The

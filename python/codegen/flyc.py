@@ -35,7 +35,7 @@ from .flytune import FlycTuneCodeGenerator
 #
 # Unify once flyc stops moving. The divergences are all parameterisable: the
 # header name, the PP_FUNC signature (flyc has no TritonAuxiliaryArguments),
-# one Schemaless line in lookup_optimal, and the tune namespace.
+# one Pon line in lookup_optimal, and the tune namespace.
 
 class FlycShimGenerator(InterfaceGenerator):
     HEADER_TEMPLATE = get_template('flyc.h')
