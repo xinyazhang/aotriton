@@ -171,7 +171,8 @@ cs.disables]`, and a *whole-metro* cite resolves to every sub-kernel's spec. So
 a kernel that declares no disable and cites a metro with three sub-kernels
 inherits three. `BuiltKernel.disables` being a list is correct.
 
-The mistake is using one field for both. `KernelSpec.cites`/`disables` are
+The mistake is using one field for both. The declared fields (`cites`/
+`disables` on what 3.5 renames to `KernelDecl`) are
 plural *because resolution writes into them*, and that plurality then reads
 backwards as "you may declare several" — which nothing checks, at any stage.
 
@@ -179,7 +180,7 @@ Split them:
 
 | | declared | after resolution |
 |---|---|---|
-| field | `KernelSpec.cite`, `KernelSpec.disable` | `KernelSpec.resolved_disables` |
+| field | `KernelDecl.cite`, `KernelDecl.disable` | `KernelDecl.resolved_disables` |
 | cardinality | 0-1, enforced at partition | 0-N, legitimately |
 | written by | the collector, once | `resolve_cites` |
 
@@ -195,7 +196,59 @@ true rather than maintained by discipline. Cloning is still needed
 (tensors/scalars/overrides/dtype_vars are still appended to), but the shrinking
 of what resolution may touch is real and worth doing on its own merits.
 
-### 3.5 Collectors shrink to construction
+### 3.5 One vocabulary: `Spec` is a record, `Decl` is a collection
+
+The names should say which layer a type belongs to, and today one of them does
+not. The rule the codebase already mostly follows:
+
+* **`*Spec`** — the record ONE `@ati.*` decorator produces. `TensorSpec`,
+  `ScalarSpec`, `CiteSpec`, `DisableSpec`, `Override`, `ChoiceVar`, and the
+  three stack markers `AffineKernelSpec` / `FlycKernelSpec` / `OperatorSpec`.
+* **`*Decl`** — the finalized per-stack collection of those records, attached
+  as `fn.__ati_node__`. `AffineDecl`, `FlycDecl`, `OperatorDecl`.
+
+By that rule **`KernelSpec` is misnamed**: it is a collection, not a record, and
+it is the only collection not called `*Decl`. Rename it **`KernelDecl`**.
+
+`SpecBundle` fits the rule as-is — it is a bundle of `Spec` records, and it is
+not attached to anything, so it is not a `Decl`.
+
+**The existing objection is answered by step 3.4, and only by it.** The class
+docstring currently argues the name difference is deliberate:
+
+> There is no separate KernelDecl because KernelSpec must be CLONED AND MUTATED
+> during linking: cite resolution appends gap tensors/scalars/overrides onto a
+> per-link mutable copy of this record. OperatorDecl / AffineDecl carry no
+> unresolved cross-kernel references, so the linker reads them verbatim.
+
+That was a real distinction when written. It is already weaker than it reads —
+`FlycDecl` is a `Decl` and *is* adapted into a mutable per-link copy
+(`_flyc_kernel_spec`) — and 3.4 removes what is left of it: once resolution
+writes `resolved_disables` instead of mutating declared fields, the declared
+record is passive exactly like the other three. **So the rename is not a
+cosmetic sweep; it is the step that records a design change that already
+happened.** Sequence it after 3.4, delete that docstring paragraph with it, and
+say in the commit message which invariant made the old name obsolete.
+
+Knock-on renames, all mechanical (48 bare `KernelSpec` references; the 16
+`AffineKernelSpec` / `FlycKernelSpec` occurrences are markers and must NOT be
+swept up by a blind substitution):
+
+| now | after |
+|---|---|
+| `KernelSpec` | `KernelDecl` |
+| `get_kernel_spec()` | `get_kernel_decl()` |
+| `kdesc.kernel_spec` attribute | `kdesc.kernel_decl` |
+| `cite._kernel_spec_of` | `cite._kernel_decl_of` |
+| `tools.sancheck_kernel_spec` | `tools.sancheck_kernel_decl` |
+| `build_kernel(kernel_spec)` param | `build_kernel(decl)` |
+| `linker._clone_spec` | `linker._clone_kernel_decl` |
+| `linker._flyc_kernel_spec` | `linker._flyc_kernel_decl` |
+
+`describe()` keeps its name regardless — it is public API and names an action,
+not a type.
+
+### 3.6 Collectors shrink to construction
 
 ```python
 def collect_flyc_decl(placeholder, specs):
@@ -214,21 +267,21 @@ def describe(kernel, *specs, _validate=True):
     b = partition_kernel(specs)
     ...                                  # annotation specs, appended to b
     if _validate: _validate_completeness(...)
-    kernel.__ati_node__ = KernelSpec(...)
+    kernel.__ati_node__ = KernelDecl(...)
 ```
 
-### 3.6 Metro gets a collector
+### 3.7 Metro gets a collector
 
 `_finalize_metro` reads `UnionPrecedenceSpec` inline and mutates
 `plan.precedence`. Give it `collect_metro_decl(placeholder, specs)` so all five
 paths read the same and `start()` becomes a dispatch table. Smallest item; it is
 what makes the dispatch honest.
 
-### 3.7 What this does NOT change
+### 3.8 What this does NOT change
 
 * **`describe()` is not renamed** and does not lose validation.
 * **The four `Decl` types do not merge.** `AffineDecl`, `FlycDecl`,
-  `OperatorDecl`, `KernelSpec` describe genuinely different things; only the
+  `OperatorDecl`, `KernelDecl` describe genuinely different things; only the
   partition step is shared.
 * **`BuiltKernel.disables` stays a list.** See 3.4 — that plurality is real.
 
@@ -303,13 +356,17 @@ whose inputs are still changing; it is listed here only so the plan is complete.
    a second `@ati.disable` becomes an error on every stack (today affine drops
    the first silently), and an `@ati.tensor` on an affine stack becomes an error
    naming the kind.
-3. Split declared from resolved (3.4): `KernelSpec.cite`/`disable` singular,
+3. Split declared from resolved (3.4): `KernelDecl.cite`/`disable` singular,
    `resolved_disables` added, `resolve_cites` writing only the latter. This is
    the largest step and the one that touches the shared Triton path, so it
    stands alone.
-4. `collect_metro_decl`; `start()` becomes a dispatch table; the three
+4. Rename `KernelSpec` -> `KernelDecl` and its knock-ons (3.5). Mechanical, but
+   it must come AFTER step 3 -- that is the step that makes the name true, and
+   the commit message should say so rather than presenting it as tidying. Watch
+   that `AffineKernelSpec`/`FlycKernelSpec` are markers and survive unchanged.
+5. `collect_metro_decl`; `start()` becomes a dispatch table; the three
    `_finalize_*` one-liners go.
-5. 4.3 and 4.4 as separate later changes. 4.5 stays filed.
+6. 4.3 and 4.4 as separate later changes. 4.5 stays filed.
 
 Item 4.1 (`_clone_spec` via the constructor) is **done** — it was promoted onto
 the critical path by the `KernelSpec.name` change, since adding a
@@ -334,3 +391,6 @@ would have dropped it from every clone.
 * A test that a whole-metro cite still inherits N disables (3.4's plural side),
   so the singular declaration does not quietly cap resolution.
 * `grep` finds one `isinstance(s, TensorSpec)` ladder in the tree, not four.
+* After the rename: no bare `KernelSpec` remains, `AffineKernelSpec` and
+  `FlycKernelSpec` still exist with 8 occurrences each, and every collection
+  attached as `fn.__ati_node__` is named `*Decl`.
