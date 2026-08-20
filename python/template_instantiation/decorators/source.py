@@ -61,7 +61,7 @@ def _ast_kernel_param_names(src, sym, path):
     Raises SourceError if the file has no such top-level function.
 
     Locating the def (by name, top-level only) and reading its parameter names
-    are the shared `ast_params` mechanics (ir/flyc/kdesc.py's `_real_param_order`
+    are the shared `ast_params` mechanics (specs/flyc.py's `_flyc_kernel_stub`
     does the same two operations with a different predicate — by decorator,
     anywhere in the module)."""
     tree = ast.parse(src.read_text(encoding='utf-8'), filename=str(src))

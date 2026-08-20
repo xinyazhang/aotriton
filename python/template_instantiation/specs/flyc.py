@@ -44,9 +44,9 @@ class FlycDecl(AtiNode):
     below. The builder pipeline (`resolve_cites`, `build_kernel`) reads the
     list-valued `cites`/`disables` off a Triton `KernelSpec`, but that is the
     BUILDER's contract, not a fact about a description; the singular-to-list
-    adaptation happens once, in the linker's spec clone, rather than being
-    pushed back into the declaration where it would misstate what a user can
-    write.
+    adaptation happens once, in the linker's `_flyc_kernel_spec`, rather than
+    being pushed back into the declaration where it would misstate what a user
+    can write.
 
     `overrides`/`dtype_vars`/`tune`/`params` are genuinely plural (or genuinely
     optional) and exist for the builder pipeline.
@@ -55,9 +55,11 @@ class FlycDecl(AtiNode):
     vendored kernel file) that finds the unique `@flyc.kernel`-decorated
     function -- the same operation `@ati.source` performs for a Triton kernel,
     reusing the same `ast_params`/`introspect` machinery rather than keeping a
-    second AST walker (this is what replaces `ir/flyc/kdesc.py`'s
-    `_real_param_order`). `dtype_vars`/`tune` remain inert placeholders:
-    nothing populates or consumes them yet."""
+    second AST walker (`ir/flyc/kdesc.py`'s `_real_param_order` did the same
+    walk a second time and has since been deleted -- `iter_launch_arguments`
+    reads `self._built.arguments`, sourced from these `params` via
+    `build_kernel`). `dtype_vars`/`tune` remain inert placeholders: nothing
+    populates or consumes them yet."""
 
     name: str                          # the placeholder def's __name__
     module_path: Path                  # resolved vendored-kernel-file path
