@@ -36,7 +36,7 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 
 from . import flyc_bootstrap
-from .utils import parse_kv
+from .utils import parse_pon
 
 desc = """
 FlyDSL ahead-of-time compiler: cross-compiles one @ati.flyc.kernel description
@@ -92,7 +92,7 @@ def _build_hints(node, hints_str: str):
     defaults = node.hints()
     if not hints_str:
         return defaults
-    overrides = parse_kv(hints_str, sep=' ')
+    overrides = parse_pon(hints_str, sep=' ')
     valid = {f.name for f in dataclasses.fields(defaults)}
     unknown = sorted(set(overrides) - valid)
     if unknown:
@@ -497,7 +497,7 @@ def do_compile(args):
     # process from the generator and has no linked IR to hand the body, and a
     # stand-in exposing `.arch` / `.choices.<NAME>` would drift silently the
     # moment a description reads a third attribute -- a plain dict cannot.
-    choices = parse_kv(args.signature, sep=' ')
+    choices = parse_pon(args.signature, sep=' ')
     hints = _build_hints(node, args.hints)
     # The description body returns (built, sidecar): `built` is the FlyDSL
     # builder's result (driven to a code object below); `sidecar` is a
