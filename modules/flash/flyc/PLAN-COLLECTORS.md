@@ -402,10 +402,10 @@ would have dropped it from every clone.
 ### Branch
 
 ```
-git switch -c flyc-codegen-rewrite-unify-collectors flyc-codegen-rewrite
+git switch -c flyc-codegen-rewrite.unify-collectors flyc-codegen-rewrite
 ```
 
-**Not `flyc-codegen-rewrite/unify-collectors`.** Git refuses it:
+A **dot**, not a slash. Git refuses the slash form outright:
 
 ```
 fatal: cannot lock ref 'refs/heads/flyc-codegen-rewrite/unify-collectors':
@@ -413,10 +413,8 @@ fatal: cannot lock ref 'refs/heads/flyc-codegen-rewrite/unify-collectors':
 ```
 
 A ref is a file, so a branch name cannot also be a directory prefix while the
-parent branch exists. The hyphenated form keeps the intended reading. (If the
-slash namespace is wanted later, the parent has to move out of the way first —
-e.g. rename it to `flyc-codegen-rewrite/base` — which is not worth doing for
-this.)
+parent branch exists. The dot carries the same "child of" reading without
+creating a ref-path conflict.
 
 ### Loop
 
@@ -452,7 +450,7 @@ history. That is not a licence to skip it:
 ### Before the squash
 
 * Full §6 gate set green on the branch tip, not merely at the last step.
-* `git diff flyc-codegen-rewrite..HEAD` reviewed as one diff — that is what the
+* `git diff flyc-codegen-rewrite...HEAD` reviewed as one diff — that is what the
   merge will look like, and it is the first time the deduplication is visible
   as a whole.
 * Confirm the branch is a fast-forward candidate (no unrelated commits landed
