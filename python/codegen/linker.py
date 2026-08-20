@@ -81,20 +81,27 @@ def _clone_spec(spec):
     """A shallow copy of a KernelSpec with FRESH mutable lists, so the linker's
     resolve_cites (which appends gap tensors/scalars/overrides/dtype_vars and may set
     tune/disables) never mutates the module-level passive spec — making linking
-    idempotent (the spec is the source of truth; the linker builds from a copy)."""
+    idempotent (the spec is the source of truth; the linker builds from a copy).
+
+    Built through the real constructor, NOT `KernelSpec.__new__` + hand-assigned
+    attributes. The `__new__` form skipped `__post_init__`, so every field that
+    class derives rather than stores had to be re-derived here by hand, and a
+    field added there later would be silently absent from every clone the linker
+    builds from — while the original spec, which tests read directly, still
+    looked right.
+    """
     from aotriton.template_instantiation.specs.kernel import KernelSpec
-    clone = KernelSpec.__new__(KernelSpec)
-    clone.kernel = spec.kernel
-    clone.params = spec.params              # immutable signature; shared is fine
-    clone.tensors = list(spec.tensors)
-    clone.scalars = list(spec.scalars)
-    clone.overrides = list(spec.overrides)
-    clone.tune = spec.tune                  # replaced wholesale by resolve_cites if None
-    clone.disables = list(spec.disables)
-    clone.source_path = spec.source_path
-    clone.dtype_vars = list(spec.dtype_vars)
-    clone.cites = list(spec.cites)
-    return clone
+    return KernelSpec(
+        kernel=spec.kernel,
+        params=spec.params,                 # immutable signature; sharing is fine
+        tensors=list(spec.tensors),
+        scalars=list(spec.scalars),
+        overrides=list(spec.overrides),
+        tune=spec.tune,                     # replaced wholesale by resolve_cites if None
+        disables=list(spec.disables),
+        dtype_vars=list(spec.dtype_vars),
+        cites=list(spec.cites),
+    )
 
 
 def _flyc_kernel_spec(decl):
