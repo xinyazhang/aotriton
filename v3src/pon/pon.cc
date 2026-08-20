@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 #include <aotriton/_internal/pon.h>
-#include <aotriton/_internal/log.h>
 
 #include <charconv>
-#include <cstdio>
-#include <cstdlib>
 
 namespace AOTRITON_NS {
 
@@ -39,20 +36,6 @@ std::optional<std::string_view> find_value(std::string_view text, std::string_vi
   return std::nullopt;
 }
 
-// Unconditional (not gated by AOTRITON_DEBUG_LEVEL) fatal report: a missing or
-// unparsable Pon key with no `dflt` is a generator/description bug, not
-// a routine diagnostic, and NDEBUG release builds turn a bare assert() into a
-// no-op -- which would let execution fall through to a silently wrong launch
-// geometry, exactly the failure mode this class exists to avoid. So this
-// always prints to stderr and aborts, regardless of build type or log level.
-[[noreturn]] void fatal(const char* accessor, std::string_view key) {
-  std::fprintf(stderr,
-               "[FATAL] Pon::%s: key \"%.*s\" is missing, unparsable, "
-               "or None, and no default was given\n",
-               accessor, int(key.size()), key.data());
-  std::abort();
-}
-
 }  // anonymous namespace
 
 bool Pon::contains(std::string_view key) const noexcept {
@@ -63,52 +46,58 @@ std::optional<std::string_view> Pon::find(std::string_view key) const noexcept {
   return find_value(text_, key);
 }
 
-int64_t Pon::get_int(std::string_view key, std::optional<int64_t> dflt) const {
+std::optional<int64_t> Pon::get_int(std::string_view key) const noexcept {
   auto v = find_value(text_, key);
-  if (v) {
-    int64_t out = 0;
-    const char* begin = v->data();
-    const char* end = v->data() + v->size();
-    auto [ptr, ec] = std::from_chars(begin, end, out);
-    // Bounded, no trailing garbage, overflow (result_out_of_range) is a miss.
-    if (ec == std::errc() && ptr == end)
-      return out;
-  }
-  if (dflt)
-    return *dflt;
-  fatal("get_int", key);
+  if (!v)
+    return std::nullopt;
+  int64_t out = 0;
+  const char* begin = v->data();
+  const char* end = v->data() + v->size();
+  auto [ptr, ec] = std::from_chars(begin, end, out);
+  // Bounded, no trailing garbage, overflow (result_out_of_range) is a miss.
+  // "None" fails here too: from_chars rejects it, so it needs no special case.
+  if (ec == std::errc() && ptr == end)
+    return out;
+  return std::nullopt;
 }
 
-bool Pon::get_bool(std::string_view key, std::optional<bool> dflt) const {
+std::optional<bool> Pon::get_bool(std::string_view key) const noexcept {
   auto v = find_value(text_, key);
-  if (v) {
-    // Exact, case-sensitive match on Python's True/False -- not "1"/"0", not
-    // case-insensitive. A typo (e.g. "true") is a miss, not silently accepted.
-    if (*v == "True")
-      return true;
-    if (*v == "False")
-      return false;
-  }
-  if (dflt)
-    return *dflt;
-  fatal("get_bool", key);
+  if (!v)
+    return std::nullopt;
+  // Exact, case-sensitive match on Python's True/False -- not "1"/"0", not
+  // case-insensitive. A typo (e.g. "true") is a miss, not silently accepted.
+  if (*v == "True")
+    return true;
+  if (*v == "False")
+    return false;
+  return std::nullopt;
 }
 
-std::string_view Pon::get_str(std::string_view key, std::optional<std::string_view> dflt) const {
+std::optional<std::string_view> Pon::get_str(std::string_view key) const noexcept {
   auto v = find_value(text_, key);
-  if (v && *v != "None") {
-    // render_pon (python/utils/pon.py) emits every str value through repr(),
-    // which -- for every string this grammar carries -- is exactly one pair
-    // of surrounding single quotes and nothing escaped (render_pon asserts
-    // this at build time). Recovering the original string is therefore
-    // always this plain two-character strip, never a general repr unescaper.
-    if (v->size() >= 2 && v->front() == '\'' && v->back() == '\'')
-      return v->substr(1, v->size() - 2);
-    return *v;
-  }
-  if (dflt)
-    return *dflt;
-  fatal("get_str", key);
+  if (!v || *v == "None")
+    return std::nullopt;
+  // render_pon (python/utils/pon.py) emits every str value through repr(),
+  // which -- for every string this grammar carries -- is exactly one pair of
+  // surrounding single quotes and nothing escaped (render_pon raises at build
+  // time otherwise). Recovering the original string is therefore always this
+  // plain two-character strip, never a general repr unescaper.
+  if (v->size() >= 2 && v->front() == '\'' && v->back() == '\'')
+    return v->substr(1, v->size() - 2);
+  return *v;
+}
+
+int64_t Pon::get_int(std::string_view key, int64_t dflt) const noexcept {
+  return get_int(key).value_or(dflt);
+}
+
+bool Pon::get_bool(std::string_view key, bool dflt) const noexcept {
+  return get_bool(key).value_or(dflt);
+}
+
+std::string_view Pon::get_str(std::string_view key, std::string_view dflt) const noexcept {
+  return get_str(key).value_or(dflt);
 }
 
 }
