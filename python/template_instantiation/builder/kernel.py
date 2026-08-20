@@ -338,7 +338,7 @@ def _synthesize_stride_overrides(functional_overrides, nonunit_strides) -> list:
 
 def build_kernel(kernel_spec) -> BuiltKernel:
     """Lower a KernelSpec (from describe()) into Axis + Override IR."""
-    name = getattr(kernel_spec.kernel, '__name__', 'kernel')
+    name = kernel_spec.name
     param_index = {p.name: i for i, p in enumerate(kernel_spec.params)}
     _resolve_named_dtypes(kernel_spec, name)
 

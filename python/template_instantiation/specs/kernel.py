@@ -52,6 +52,19 @@ class KernelSpec(AtiNode):
     # are NOT here — they ride on the spec's dtype.
     dtype_vars: list[ChoiceVar] | None = None
     cites: list[CiteSpec] | None = None    # @ati.cite targets
+    # The DESCRIPTION's identity -- what FAMILY/CODEGEN_MODULE/NAME (and hence
+    # --selective, the aks2 row, the DB key) is built from. Defaults to the
+    # kernel object's __name__, which is correct wherever the description and
+    # the GPU entry symbol are the same identifier: a Triton kernel's
+    # placeholder def is conventionally named after the kernel it wraps.
+    #
+    # They are NOT the same for every backend. A flyc description
+    # ('flyc_attn_fwd') names an AST-located @flyc.kernel def in a vendored file
+    # ('flash_attn_func_aiw_kernel'); the two identifiers are independent by
+    # design. Carrying the identity here, rather than letting each consumer
+    # decide whether __name__ means the description or the symbol, is what keeps
+    # `BuiltKernel.name` usable verbatim by every kdesc.
+    name: str | None = None
     # The kernel's own Triton source file (set by @ati.source on the kernel object,
     # copied here in __post_init__). The linker reads it instead of the family file
     # passing source_path to a builder. NOT a constructor arg — derived from kernel.
@@ -61,6 +74,7 @@ class KernelSpec(AtiNode):
         self.disables = self.disables or []
         self.dtype_vars = self.dtype_vars or []
         self.cites = self.cites or []
+        self.name = self.name or getattr(self.kernel, '__name__', 'kernel')
         from ..decorators.source import KernelStub
         self.source_path = self.kernel.source_path if isinstance(self.kernel, KernelStub) else None
 

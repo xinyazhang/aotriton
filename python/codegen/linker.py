@@ -123,6 +123,7 @@ def _flyc_kernel_spec(decl):
     """
     from aotriton.template_instantiation.specs.kernel import KernelSpec
     return KernelSpec(
+        name=decl.name,           # the DESCRIPTION's identity, not the vendored symbol
         kernel=decl.kernel,
         params=decl.params,                 # immutable signature; sharing is fine
         tensors=list(decl.tensors),
@@ -232,7 +233,7 @@ def _build_flycs(compiled, operators, built_kernels):
         resolve_cites(spec, family=compiled.family, lookup=lookup,
                       inherit_tune=False)
         bk = build_kernel(spec)
-        kdesc = KernelDescription(bk, name=name, family=compiled.family,
+        kdesc = KernelDescription(bk, family=compiled.family,
                                   module_path=decl.module_path,
                                   functionals_source=op,
                                   tensors=spec.tensors, scalars=spec.scalars,

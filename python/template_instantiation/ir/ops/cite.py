@@ -191,7 +191,7 @@ def resolve_cites(spec, *, family, lookup=None, metro_lookup=None, op_lookup=Non
     (`True`), so this is not a behavior change for the Triton path."""
     if not spec.cites:
         return spec
-    name = getattr(spec.kernel, '__name__', 'kernel')
+    name = spec.name
     param_names = [p.name for p in spec.params]
 
     cited_specs = []
