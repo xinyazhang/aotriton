@@ -1,4 +1,4 @@
-# Unifying the `k=v` wire format, and the `builder_fn(choices, …)` interface
+# Unifying the assignment-list format, and the `builder_fn(choices, …)` interface
 
 Two related interface cleanups. Both are about the same thing: one spelling for
 one concept, instead of several that agree by luck.
@@ -20,7 +20,7 @@ matters — **two incompatible dialects**.
 |---|---|---|
 | `v3python/tune/utils.py:43` `parse_python` | `split(';')` then **`eval(v)`** | **no** — arbitrary code execution |
 | ↳ callers | `tune/flash/module.py:37` `FlashEntry.parse_text`, `:73` `FlashInputMetadata.parse_text` | |
-| `python/utils/kv.py` `parse_kv` | `split(sep)` then `ast.literal_eval` | yes, and `sep` is configurable |
+| `python/utils/kv.py` `parse_kv` (to be renamed, see Plan 0) | `split(sep)` then `ast.literal_eval` | yes, and `sep` is configurable |
 | ↳ callers | `python/flyc_compile.py` (`sep=' '` for `--signature` / `--hints`) | |
 | `v3src/schemaless/schemaless.cc` | `std::from_chars`, bounded | yes (C++ side) |
 
@@ -75,24 +75,36 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
 
 ### Plan
 
-1. **`python/utils/kv.py` becomes the one home**, gaining the writer to sit
-   beside `parse_kv`:
+0. **Rename the module.** `kv.py` is a bad name *in this repository*: `KV` here
+   means keys/values in attention, and a file called `kv.py` sitting next to a
+   flash-attention codegen reads as KV-cache. The thing is a list of
+   `name=<python literal>` assignments, and "assignment" is already the word the
+   existing code uses for one element (`for assignment in args:` in
+   `parse_python`, and the loop variable in `parse_kv`).
+
+   **`python/utils/assignments.py`**, with `parse_assignments` /
+   `render_assignments`. Alternatives considered: `literal_map.py` (accurate
+   about the value grammar, vague about the shape), `sigtext.py` (describes one
+   of several uses), `pairlist.py` (loses the literal-ness), `wire.py`
+   (describes the role, not the format, and it is no longer only a wire).
+
+1. **That module becomes the one home**, gaining the writer beside the parser:
 
    ```python
-   def render_kv(d: dict, sep: str = ';') -> str: ...   # quoted dialect, round-trips
+   def render_assignments(d: dict, sep: str = ';') -> str: ...
    ```
 
-   `repr()` per value, not `str()` — that is exactly what makes
-   `parse_kv(render_kv(d)) == d` hold, and it is the property the split dialects
-   lack. Add that round-trip as a test.
+   `repr()` per value, not `str()` — that is what makes
+   `parse_assignments(render_assignments(d)) == d` hold, and it is the property
+   the split dialects lack. Add that round-trip as a test.
 
 2. **Delete `render_schemaless`** from `ir/lib/naming.py` (added in `54e644f4`;
-   it was the right instinct in the wrong place) and call `render_kv`. Keep
+   it was the right instinct in the wrong place) and call `render_assignments`. Keep
    `entry_name` where it is — it owns the `;;#F;…;;#P;…` frame, not the `k=v`
    grammar inside a section.
 
 3. **Fold the three `tr()` writers** — `module.py:45`, `module.py:56`,
-   `flash_entry.py:40` — onto `render_kv`. The comma one passes `sep=','`.
+   `flash_entry.py:40` — onto `render_assignments`. The comma one passes `sep=','`.
    `flash_entry.py:40` and `module.py:56` are currently byte-identical
    duplicates.
 
@@ -100,8 +112,32 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
    security fix as much as a cleanup: `eval()` on a line that reaches the tuner
    from the database is a remote-code-execution shape.
 
-5. **`Schemaless::get_str` strips quotes**; `get_int`/`get_bool` are unaffected.
-   Extend its unit tests with a quoted value and an unterminated quote.
+5. **`Schemaless::get_str` strips one pair of single quotes** — and the writer
+   guarantees that is sufficient. `get_int`/`get_bool` are unaffected.
+
+   **The concern, stated properly.** A C++ parser that faithfully accepted
+   `repr()` output would need a real string unescaper, because `repr` is not the
+   simple "wrap in quotes" it looks like:
+
+   ```
+   repr("it's")  ->  "it's"     switches to DOUBLE quotes
+   repr('a\nb')  ->  'a\nb'     backslash escape
+   repr('a\\b')  ->  'a\\b'     backslash escape
+   ```
+
+   Both quote styles plus escape decoding is exactly the kind of parser that is
+   subtly wrong for years. **Do not build it.**
+
+   **Constrain the writer instead.** `render_assignments` asserts, for every
+   `str` value, that `repr(v) == "'" + v + "'"` — single-quoted, nothing
+   escaped. Every value the codebase actually carries satisfies this
+   (`transposed`, `auto`, `noninf`, and Triton's psel/copt have no strings at
+   all). If a value ever stops satisfying it, the **build** fails loudly naming
+   the key, instead of the C++ misparsing silently at runtime.
+
+   That makes the C++ side provably a two-character strip, and moves an
+   unbounded parsing problem to a one-line precondition on the producer. Test
+   the precondition on the Python side and the strip on the C++ side.
 
    On the Python-vs-C++ boolean spelling: the generator emits Python's
    `True`/`False`, not C++'s `true`/`false`. That is already handled and needs
@@ -113,13 +149,13 @@ flyc entry names change (ZIP names do not — they are the functional layer), an
 
    Keep the C++ side as the place that knows about the Python spelling. The
    alternative — teaching the *writer* to emit `true`/`false` — would break
-   `parse_kv(render_kv(d)) == d`, which is the property the whole unification
-   is for.
+   the round-trip property the whole unification is for.
 
 **Ordering.** 1 → 5 → 2 (C++ before the producer changes, so no build sees an
 unparsable `#P`), then 3 and 4 independently.
 
-**Gate.** `parse_kv(render_kv(d)) == d` over the knob dict and a `FlashEntry`;
+**Gate.** `parse_assignments(render_assignments(d)) == d` over the knob dict and
+a `FlashEntry`; a string needing escapes raises at render time;
 Triton hsaco entry names byte-identical before and after; flyc ZIP names
 unchanged while flyc `#P` gains quotes; suite green.
 
@@ -148,36 +184,49 @@ variable — the dtype variable is `T_io`. Use `choices.arg('Q')` rather than
 `@ati.tensor('Q', 'T_io', …)`, so it does not depend on knowing the dtype
 variable's name.
 
-### The obstacle, and it is real
+### The obstacle, and the resolution: `ChoiceView` becomes an interface
 
 **`ChoiceView` is constructed from a `Functional`, and the build-time driver has
 none.** `ChoiceView.__init__` reads `functional.choice` and `functional.resolved`
-(TypedChoice-valued); `flyc_compile` has only the `--signature` text it parsed,
-and no linked IR to rebuild a Functional from — that is the same constraint
-recorded as "Correction 2" in `jit2aot.md`, and the reason the plain dict was
-chosen originally.
+(TypedChoice-valued); `flyc_compile` has only the `--signature` text it parsed
+and no linked IR to rebuild a Functional from — the constraint recorded as
+"Correction 2" in `jit2aot.md`, and the original reason for the plain dict.
 
-So both call sites must present one interface, and only one of them can
-construct the real thing. Options:
+So both call sites must present one interface while only one of them can build
+the real object. **Make that literal: `ChoiceView` becomes an ABC with two
+implementations.**
 
-- **(a) A dict-backed `ChoiceView`.** A classmethod
-  `ChoiceView.from_values({name: literal})` used by the driver, storing raw
-  values instead of TypedChoices. One class, one interface, both sides satisfy
-  it. Needs `__getattr__` and `arg()` to tolerate both backings — small, but it
-  widens a core IR class for a build-tool caller.
-- **(b) A duck-typed shim in the driver.** `SimpleNamespace(**parsed)` plus an
-  `arg()` method. Cheapest, but it is exactly the `_FunctionalStandIn` that was
-  deleted in the jit2aot work for drifting the moment a description reads a
-  third attribute.
-- **(c) Restrict the contract** to what both can honestly provide — i.e. keep a
-  mapping, but make it `compact_choices` keyed and documented as the contract
-  rather than an ad-hoc dict.
+```
+ir/choices.py                     ChoiceView(ABC)      the interface
+  .tc(var) .arg(aname) .arg_tc(aname) .__getattr__(var)
 
-**Recommendation: (a).** It is the only one that gives a single interface
-without reintroducing a stand-in, and the widening is confined to one
-constructor. (b) is a known-bad shape here. (c) is the status quo with better
-documentation, which is worth doing only if (a) is judged too invasive for the
-IR layer.
+ir/functional.py                  FunctionalChoiceView  backed by a Functional
+python/flyc_compile.py (or ir/)   MappingChoiceView     backed by the parsed dict
+```
 
-This needs a decision before implementation, because it changes what
-`flyc_compile` passes as well as what the description reads.
+**Move the interface out of `functional.py`.** It is reused by something that is
+not a Functional — that is the definition of belonging elsewhere — and leaving
+it there forces the driver to import the Functional module for a type it cannot
+construct. `ir/choices.py` is the natural home; `functional.py` keeps only the
+concrete implementation and the `Functional.choices` property that returns it.
+
+What each implementation can honestly answer differs, and the ABC should say so
+rather than pretend:
+
+| method | Functional-backed | Mapping-backed |
+|---|---|---|
+| `__getattr__(var)` | choice variable → signature | key → parsed literal |
+| `arg(aname)` | resolved argument → signature | same, when the name is a key |
+| `tc(var)` / `arg_tc(aname)` | the raw `TypedChoice` | **cannot** — no TypedChoice exists |
+
+`tc`/`arg_tc` should therefore raise a clear `NotImplementedError` naming the
+backing, not return `None`. A description that reaches for a raw TypedChoice is
+asking for something the build-time path genuinely does not have, and it should
+find that out immediately rather than at the point the value is used.
+
+This is strictly better than the three options an earlier draft of this document
+weighed. It is not the deleted `_FunctionalStandIn`: that was an untyped
+duck-typed stand-in that drifted silently as descriptions read more attributes;
+this is a declared interface where the gap is part of the type, and adding a
+method to the ABC forces both implementations to answer for it.
+
