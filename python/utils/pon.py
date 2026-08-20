@@ -4,19 +4,21 @@
 """PON (Plain / Python Object Notation): a safe, separator-configurable
 `k=v;k=v` wire format, and the one home for both reading and writing it.
 
-`aotriton.tune.utils.parse_python` -- the format's original reader -- splits a
-line on `;`, then on `=` with `maxsplit=1`, then calls `eval(v)` on the value.
-Two problems: the `eval` can execute arbitrary code, and the separator is
-hard-coded to `;` so nothing that needs a different one (e.g. flyc's
-`--signature`/`--hints` strings, which use a space) can reuse it.
+`aotriton.tune.utils.parse_python` -- the format's original reader, since
+retired -- split a line on `;`, then on `=` with `maxsplit=1`, then called
+`eval(v)` on the value. Two problems: the `eval` could execute arbitrary
+code, and the separator was hard-coded to `;` so nothing that needed a
+different one (e.g. flyc's `--signature`/`--hints` strings, which use a
+space) could reuse it.
 
 `parse_pon` keeps the shape and fixes both: `ast.literal_eval` accepts exactly
 the forms build inputs use -- ints, floats, quoted strings, tuples, lists,
 `True`/`False`/`None` -- and raises on anything else, including bare
-identifiers. `sep` defaults to `';'` so this is a drop-in for every existing
-`parse_python` caller (`FlashEntry.parse_text`, `FlashInputMetadata.parse_text`);
-callers that use a different wire separator (`flyc_compile` passes `sep=' '`)
-get one parser instead of two spellings of one.
+identifiers. `sep` defaults to `';'` so this was a drop-in for every
+`parse_python` caller (`FlashEntry.parse_text`, `FlashInputMetadata.parse_text`,
+now switched over); callers that use a different wire separator
+(`flyc_compile` passes `sep=' '`) get one parser instead of two spellings of
+one.
 
 `render_pon` is the matching writer: `repr()` per value, not `str()`, so every
 value it emits is exactly what `ast.literal_eval` (hence `parse_pon`) would
