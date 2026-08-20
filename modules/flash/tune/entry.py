@@ -1,8 +1,7 @@
 # Copyright © 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-from aotriton.tune.utils import parse_python
-from aotriton.utils import render_pon
+from aotriton.utils import parse_pon, render_pon
 from dataclasses import dataclass, asdict
 
 '''
@@ -32,7 +31,7 @@ class FlashEntry:
 
     @staticmethod
     def parse_text(line: str) -> "FlashEntry":
-        d = parse_python(line)
+        d = parse_pon(line)
         return FlashEntry(**d)
 
     @staticmethod
@@ -65,7 +64,7 @@ class FlashInputMetadata(FlashEntry):
 
     @staticmethod
     def parse_text(line: str) -> "FlashEntry":
-        d = parse_python(line)
+        d = parse_pon(line)
         return FlashInputMetadata(**d)
 
     @staticmethod
