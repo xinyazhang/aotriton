@@ -185,9 +185,9 @@ def resolve_cites(spec, *, family, lookup=None, metro_lookup=None, op_lookup=Non
     `inherit_tune=False` suppresses step 0 below (inheriting the cited kernel's
     whole `tune` when the citing kernel has none of its own) while leaving every
     other cite-inheritance channel (gap arguments, dtype vars, overrides,
-    disables) untouched. flyc kernels pass this: PLAN-PON.md Part 3 excludes
-    flyc from inheriting a cited Triton kernel's tune -- flyc has no perf-tuning
-    concept of its own to receive it. Every other caller keeps the default
+    disables) untouched. flyc kernels pass this: a flyc kernel must not inherit
+    a cited Triton kernel's tune -- it has no perf-tuning concept of its own to
+    receive it. Every other caller keeps the default
     (`True`), so this is not a behavior change for the Triton path."""
     if not spec.cites:
         return spec

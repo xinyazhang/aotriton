@@ -193,13 +193,13 @@ def _build_affines(compiled):
 
 def _build_flycs(compiled, operators, built_kernels):
     """Build every flyc KernelDescription from its parsed FlycDecl, resolving
-    `functionals_of` against the already-built operators (PLAN-PHASE1.md Task 5a).
+    `functionals_of` against the already-built operators.
     Must run AFTER `_build_operators` -- unlike affine kernels (bound to an
     operator only as a listed backend), a flyc kernel's functional space is
     resolved by NAME against the finished operators dict.
 
-    This is also where a flyc kernel's own @ati.cite is finally activated
-    (PLAN-PON.md Part 3): the same `resolve_cites` + `build_kernel` pipeline
+    This is also where a flyc kernel's own @ati.cite is finally activated:
+    the same `resolve_cites` + `build_kernel` pipeline
     `_build_kernels` runs for Triton, with `inherit_tune=False` -- flyc has no
     perf-tuning concept of its own and must NOT inherit the cited Triton
     kernel's tune. `built_kernels` (the already-built Triton
