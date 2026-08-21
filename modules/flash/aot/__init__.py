@@ -71,6 +71,11 @@ def metro_bwd(params):
 @ati.tune.fallback(PADDED_HEAD=False)
 @ati.tune.binning(Max_seqlen_q=ati.tune.binning.le,
                   Max_seqlen_k=ati.tune.binning.le)
+# flyc, index 2. A flyc kernel is a backend like any other now; the linker
+# builds its kdesc before the operators and binds its functional space back
+# afterwards (codegen/linker.py's bind_flyc_functionals), because a flyc kernel
+# both IS a backend and BORROWS this operator's functional space.
+@ati.backend(2, flyc_attn_fwd, 'flyc')
 @ati.backend(1, aiter_fmha_v3_fwd, 'aiter')
 @ati.backend(0, metro_fwd, 'triton')
 @ati.operator(call_options_name='attn_options')
@@ -90,9 +95,10 @@ def op_attn_bwd():
 
 
 operators = [op_attn_fwd, op_attn_bwd]
-# Kept separate from `operators`: flyc is not an @ati.backend yet (Phase 2 change),
-# so it is not reachable by walking a backend tree. `flyc_attn_fwd` declares
-# `functionals_of='op_attn_fwd'` instead (PLAN-PHASE1.md Task 5a) and
-# `codegen/parser.py` reads this list directly.
+# flyc_attn_fwd is now reachable BOTH ways: as op_attn_fwd's index-2 backend and
+# through this list. The list predates it being dispatchable and exists so a flyc
+# kernel can be built without anything launching it; recording is idempotent, so
+# appearing twice records once. Delete this once no flyc kernel needs the
+# build-only route.
 flyc_kernels = [flyc_attn_fwd]
 __all__ = ['operators', 'flyc_kernels']

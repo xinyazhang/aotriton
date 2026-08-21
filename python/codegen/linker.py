@@ -140,7 +140,7 @@ def _build_affines(compiled):
     return out
 
 
-def _build_flycs(compiled, operators, built_kernels):
+def _build_flycs(compiled, built_kernels):
     """Build every flyc KernelDescription from its parsed FlycDecl, resolving
     `functionals_of` against the already-built operators.
     Must run AFTER `_build_operators` -- unlike affine kernels (bound to an
@@ -165,24 +165,47 @@ def _build_flycs(compiled, operators, built_kernels):
 
     out = {}
     for name, decl in compiled.flycs.items():
-        op = operators.get(decl.functionals_of)
-        assert op is not None, (
-            f'flyc kernel {name!r} declares functionals_of={decl.functionals_of!r} '
-            f'but no such operator was built in family {compiled.family!r}; '
-            f'operators: {sorted(operators)}')
         spec = decl.clone()
         resolve_cites(spec, family=compiled.family, lookup=lookup,
                       inherit_tune=False)
         bk = build_kernel(spec)
         kdesc = KernelDescription(bk, family=compiled.family,
                                   source_path=decl.source_path,
-                                  functionals_source=op,
                                   tensors=spec.tensors, scalars=spec.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
+        kdesc.functionals_of = decl.functionals_of   # bound below, see bind_flyc_functionals
         kdesc.kernel_decl = spec       # the cite-resolved clone
         out[name] = kdesc
     return out
+
+
+def bind_flyc_functionals(flycs, operators, family):
+    """Late second half of flyc construction: attach each kdesc's
+    `functionals_source`, the Operator its `functionals_of=` names.
+
+    Split from `_build_flycs` because the two halves sit on opposite sides of a
+    cycle. A flyc kernel can be an operator BACKEND, so `_build_operators` has to
+    be able to resolve one -- but a flyc kernel also borrows that same operator's
+    functional space, so it cannot be finished until the operator exists. The
+    kdesc anticipates this: `_functionals_source` is documented as None "only
+    transiently, between __new__ and the linker's assignment".
+
+    Everything `_build_operators` reads off a backend is safe while unbound --
+    `is_tunable` is a class attribute and `func_cfields` returns [] without
+    consulting the source. `infer_shared_iface` is NOT: it does
+    `getattr(sub, 'SHARED_IFACE', None)`, and flyc's `SHARED_IFACE` is a property
+    that asserts rather than returning None. So this must run after
+    `_build_operators` and BEFORE `infer_shared_iface`, which is the one ordering
+    constraint that is not obvious from either call site.
+    """
+    for name, kdesc in flycs.items():
+        op = operators.get(kdesc.functionals_of)
+        assert op is not None, (
+            f'flyc kernel {name!r} declares functionals_of={kdesc.functionals_of!r} '
+            f'but no such operator was built in family {family!r}; '
+            f'operators: {sorted(operators)}')
+        kdesc._functionals_source = op
 
 
 def _build_metros(compiled, built_kernels):
@@ -195,7 +218,7 @@ def _build_metros(compiled, built_kernels):
     return out
 
 
-def _backend_objs(op_shell, built_kernels, metros, affines):
+def _backend_objs(op_shell, built_kernels, metros, affines, flycs):
     """Resolve an operator shell's index-sorted backend refs to built IR objects."""
     objs = []
     for index, kind, name in op_shell.backend_refs:
@@ -203,6 +226,8 @@ def _backend_objs(op_shell, built_kernels, metros, affines):
             objs.append(metros[name])
         elif kind == 'kernel':
             objs.append(built_kernels[name])
+        elif kind == 'flyc':
+            objs.append(flycs[name])
         else:
             objs.append(affines[name])
     return objs
@@ -244,7 +269,7 @@ def _derive_struct_cfields(backends, default_kdesc):
     return build_merged_struct_cfields(contributors)
 
 
-def _build_operators(compiled, built_kernels, metros, affines):
+def _build_operators(compiled, built_kernels, metros, affines, flycs):
     """Build every Operator with derived default_kdesc + struct (A1/A3)."""
     from aotriton.template_instantiation.ir.operator import Operator
     out = {}
@@ -254,7 +279,7 @@ def _build_operators(compiled, built_kernels, metros, affines):
         indices = [i for i, _k, _n in shell.backend_refs]
         assert indices == list(range(len(indices))), (
             f'operator {name!r} backend indices must be dense 0..n-1, got {indices}')
-        backends = _backend_objs(shell, built_kernels, metros, affines)
+        backends = _backend_objs(shell, built_kernels, metros, affines, flycs)
         default_kdesc = _derive_default_kdesc(backends)
         struct_cfields = _derive_struct_cfields(backends, default_kdesc)
         out[name] = Operator(
@@ -316,15 +341,18 @@ class Linker:
         built_kernels = _build_kernels(compiled)
         _check_unresolved_arguments(built_kernels)
         affines = _build_affines(compiled)
+        # flyc kdescs are built here, BEFORE the operators, so a flyc kernel can
+        # be an operator backend -- but they are only half-built: their
+        # `functionals_source` is the operator, which does not exist yet. See
+        # bind_flyc_functionals for the other half and the ordering it needs.
+        flycs = _build_flycs(compiled, built_kernels)
         metros = _build_metros(compiled, built_kernels)
-        operators = _build_operators(compiled, built_kernels, metros, affines)
+        operators = _build_operators(compiled, built_kernels, metros, affines,
+                                     flycs)
+        bind_flyc_functionals(flycs, operators, compiled.family)
 
         op_list = [operators[n] for n in compiled.op_order]
         infer_shared_iface(op_list)
-
-        # Resolves `functionals_of` against the just-built operators (Task 5a) --
-        # must run after _build_operators, unlike affines (bound as backends).
-        flycs = _build_flycs(compiled, operators, built_kernels)
 
         return FamilyArtifacts(
             family,
