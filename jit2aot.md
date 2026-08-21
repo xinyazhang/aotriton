@@ -85,7 +85,9 @@ table** — no kernel-specific knowledge at all.
 Then the driver extracts from `jf._last_compiled[1]`:
 - `._ir_text` → post-lowering module → walk for `gpu.binary` → `gpu.ObjectAttr(...).object` → the ELF.
   Two objects appear (`#rocdl.target<chip=…>` plus the `no_wave64` one `rocdl-attach-target`
-  adds); they are byte-identical.
+  adds). They are two independent LLVM codegen runs, so they are *not* guaranteed
+  byte-identical — the driver ships the first and warns when they differ. See
+  `_extract_hsaco`.
 - `._source_ir` → pre-lowering module → `gpu.func`'s `known_block_size` → BLOCK_SIZE.
 
 `flyc.compile()` is **not** usable: it ends in `artifact._get_func_exe()`, which builds an
