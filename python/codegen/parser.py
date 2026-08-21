@@ -224,33 +224,52 @@ class FamilyCompiler:
             assert sub_def is not None, (
                 f'{self.family}: metro {b.name!r} calls sub-kernel '
                 f'{sub_name!r} not found in the aot module')
-            self._record_kernel(sub_def)
+            # Dispatched, not assumed: a metro step is whatever kind of kernel
+            # the def describes. This used to call _record_kernel directly,
+            # which asserts a triton KernelDecl, so a metro with a flyc step
+            # failed on the assert rather than anywhere informative.
+            self.record(sub_def, f'metro {b.name!r} sub-kernel')
         if b.name not in self.compiled.metros:
             self.compiled.metros[b.name] = MetroShell(b.name, plan, sub_names,
                                                       precedence=plan.precedence)
         return (b.index, 'metro', b.name)
 
     def visit_kernel(self, b):
-        kname = self._record_kernel(b.obj)
-        return (b.index, 'kernel', kname)
+        return (b.index, 'kernel', self.record_kernel(b.obj))
 
     def visit_affine(self, b):
-        adecl = b.obj.__ati_node__   # AffineDecl
+        return (b.index, 'affine', self.record_affine(b.obj))
+
+    # --- recording, dispatched by node kind ----------------------------------
+    #
+    # Two shapes reach a description: an operator BACKEND (a Backend record with
+    # an index, handled by visit_*) and a metro STEP (a bare def, handled here).
+    # Both need the same recording, so it lives in record_* and both dispatch on
+    # _node_kind. Keeping the two apart is what let visit_metro hard-code the
+    # triton recorder.
+
+    def record(self, def_obj, what):
+        """Record `def_obj` as whatever kind it is; return its NAME."""
+        kind = _node_kind(def_obj)
+        recorder = getattr(self, f'record_{kind}', None)
+        assert recorder is not None, (
+            f'{self.family}: {what} is a {kind!r} description, which cannot be '
+            f'recorded in this position')
+        return recorder(def_obj)
+
+    def record_metro(self, _def_obj):
+        raise AssertionError(
+            'a metro cannot be a step of another metro; @ati.metro_kernel '
+            'bodies call concrete kernels only')
+
+    def record_affine(self, def_obj):
+        adecl = def_obj.__ati_node__   # AffineDecl
         if adecl.name not in self.compiled.affines:
             self.compiled.affines[adecl.name] = adecl
-        return (b.index, 'affine', adecl.name)
+        return adecl.name
 
     def visit_flyc(self, b):
-        """Record a flyc description and report it like any other backend
-        (dedup by name, same pattern as visit_affine)."""
-        from aotriton.template_instantiation.specs.flyc import FlycDecl
-        node = getattr(b.obj, '__ati_node__', None)
-        assert isinstance(node, FlycDecl), (
-            f'{self.family}: {b.obj!r} has no FlycDecl '
-            f'(not a passive @ati.flyc.kernel def)')
-        if node.name not in self.compiled.flycs:
-            self.compiled.flycs[node.name] = node
-        return (b.index, 'flyc', node.name)
+        return (b.index, 'flyc', self.record_flyc(b.obj))
 
     # --- metro sub-plan descent (Call | Cond tree) ---------------------------
 
@@ -267,7 +286,13 @@ class FamilyCompiler:
 
     # --- kernel recording (dedup by name) ------------------------------------
 
-    def _record_kernel(self, def_obj):
+    def record_flyc(self, def_obj):
+        node = def_obj.__ati_node__   # FlycDecl
+        if node.name not in self.compiled.flycs:
+            self.compiled.flycs[node.name] = node
+        return node.name
+
+    def record_kernel(self, def_obj):
         """Record a triton-kernel def as a KernelShell (no-op if already recorded).
         Returns the kernel def-name."""
         from aotriton.template_instantiation.specs.finalize import get_kernel_decl
