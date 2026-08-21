@@ -174,38 +174,37 @@ def _build_flycs(compiled, built_kernels):
                                   tensors=spec.tensors, scalars=spec.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
-        kdesc.functionals_of = decl.functionals_of   # bound below, see bind_flyc_functionals
+        kdesc.functionals_of = decl.functionals_of   # checked by _check_flyc_functionals_of
         kdesc.kernel_decl = spec       # the cite-resolved clone
         out[name] = kdesc
     return out
 
 
-def bind_flyc_functionals(flycs, operators, family):
-    """Late second half of flyc construction: attach each kdesc's
-    `functionals_source`, the Operator its `functionals_of=` names.
+def _check_flyc_functionals_of(compiled, flycs):
+    """Verify every flyc kdesc got the operator its `functionals_of=` names.
 
-    Split from `_build_flycs` because the two halves sit on opposite sides of a
-    cycle. A flyc kernel can be an operator BACKEND, so `_build_operators` has to
-    be able to resolve one -- but a flyc kernel also borrows that same operator's
-    functional space, so it cannot be finished until the operator exists. The
-    kdesc anticipates this: `_functionals_source` is documented as None "only
-    transiently, between __new__ and the linker's assignment".
-
-    Everything `_build_operators` reads off a backend is safe while unbound --
-    `is_tunable` is a class attribute and `func_cfields` returns [] without
-    consulting the source. `infer_shared_iface` is NOT: it does
-    `getattr(sub, 'SHARED_IFACE', None)`, and flyc's `SHARED_IFACE` is a property
-    that asserts rather than returning None. So this must run after
-    `_build_operators` and BEFORE `infer_shared_iface`, which is the one ordering
-    constraint that is not obvious from either call site.
+    The binding itself is `infer_shared_iface`'s, done by walking the operator's
+    backends -- so a flyc kernel reachable as a backend is bound without anyone
+    consulting `functionals_of`. This checks the two agree, and catches the one
+    case the walk cannot reach: a flyc kernel listed only in `aot.flyc_kernels`,
+    which no operator names as a backend and which therefore ends linking
+    unbound. That used to be the only route flyc had; it is now the exception,
+    and an unbound kdesc fails here rather than at whichever delegating property
+    a code generator happens to touch first.
     """
     for name, kdesc in flycs.items():
-        op = operators.get(kdesc.functionals_of)
-        assert op is not None, (
-            f'flyc kernel {name!r} declares functionals_of={kdesc.functionals_of!r} '
-            f'but no such operator was built in family {family!r}; '
-            f'operators: {sorted(operators)}')
-        kdesc._functionals_source = op
+        want = kdesc.functionals_of
+        got = kdesc.SHARED_IFACE
+        assert got is not None, (
+            f'flyc kernel {name!r} was never bound to an operator: it declares '
+            f'functionals_of={want!r} but is not reachable as a backend of any '
+            f'operator in family {compiled.family!r}. Either add it as an '
+            f'@ati.backend, or extend the binding to cover build-only flyc '
+            f'kernels.')
+        assert got.NAME == want, (
+            f'flyc kernel {name!r} declares functionals_of={want!r} but was '
+            f'bound to operator {got.NAME!r} by its backend position; one of '
+            f'the two is wrong.')
 
 
 def _build_metros(compiled, built_kernels):
@@ -342,17 +341,22 @@ class Linker:
         _check_unresolved_arguments(built_kernels)
         affines = _build_affines(compiled)
         # flyc kdescs are built here, BEFORE the operators, so a flyc kernel can
-        # be an operator backend -- but they are only half-built: their
-        # `functionals_source` is the operator, which does not exist yet. See
-        # bind_flyc_functionals for the other half and the ordering it needs.
+        # be an operator backend. They are HEADERS at this point -- argument
+        # surface known, functional space not yet bound -- which is the same
+        # split that lets bwd_kernel_fuse cite three kernels that are still
+        # being linked. infer_shared_iface below supplies the other half.
         flycs = _build_flycs(compiled, built_kernels)
         metros = _build_metros(compiled, built_kernels)
         operators = _build_operators(compiled, built_kernels, metros, affines,
                                      flycs)
-        bind_flyc_functionals(flycs, operators, compiled.family)
 
         op_list = [operators[n] for n in compiled.op_order]
+        # Binds every kernel that borrows an operator's surface, flyc included:
+        # a flyc kdesc's SHARED_IFACE IS its functionals_source, so the same
+        # `sub.SHARED_IFACE = op` walk finishes it. See _build_flycs for why it
+        # is only half-built until here.
         infer_shared_iface(op_list)
+        _check_flyc_functionals_of(compiled, flycs)
 
         return FamilyArtifacts(
             family,

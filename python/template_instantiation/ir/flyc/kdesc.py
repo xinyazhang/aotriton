@@ -130,7 +130,21 @@ class KernelDescription(Interface):
 
     @property
     def SHARED_IFACE(self):
-        return self._require_functionals_source()
+        """The Operator this kernel borrows everything from -- the same object as
+        `functionals_source`, because for flyc they ARE the same relationship:
+        the operator owns the params struct AND the functional space, and this
+        kernel has neither of its own.
+
+        Readable before binding (returns None) and settable, so
+        `ir/ops/infer.py`'s `infer_shared_iface` can bind it by the same
+        `sub.SHARED_IFACE = op` it uses for every other kernel that borrows an
+        operator's surface. Without that, flyc would need a second, bespoke
+        binding pass for what is the same relationship under a different name."""
+        return self._functionals_source
+
+    @SHARED_IFACE.setter
+    def SHARED_IFACE(self, op):
+        self._functionals_source = op
 
     @property
     def param_class_name(self):
