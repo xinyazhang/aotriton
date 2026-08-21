@@ -166,6 +166,7 @@ def _node_kind(ref):
     from aotriton.template_instantiation.specs.metro import MetroSpec
     from aotriton.template_instantiation.specs.kernel import KernelDecl
     from aotriton.template_instantiation.specs.affine import AffineDecl
+    from aotriton.template_instantiation.specs.flyc import FlycDecl
     node = getattr(ref, '__ati_node__', None)
     if not isinstance(node, AtiNode):
         raise AssertionError(
@@ -174,6 +175,7 @@ def _node_kind(ref):
     if isinstance(node, MetroSpec):  return 'metro'
     if isinstance(node, KernelDecl): return 'kernel'
     if isinstance(node, AffineDecl): return 'affine'
+    if isinstance(node, FlycDecl):   return 'flyc'
     raise AssertionError(f'unrecognised AtiNode type {type(node)!r} on {ref!r}')
 
 
@@ -200,7 +202,7 @@ class FamilyCompiler:
         # as one) -- `aot.flyc_kernels` is the second root modules/<family>/aot
         # exposes just for this.
         for flyc_def in getattr(self.aot, 'flyc_kernels', []):
-            self.visit_flyc(flyc_def)
+            self._record_flyc(flyc_def)
         return self.compiled
 
     # --- operator + backend dispatch -----------------------------------------
@@ -244,17 +246,30 @@ class FamilyCompiler:
             self.compiled.affines[adecl.name] = adecl
         return (b.index, 'affine', adecl.name)
 
-    def visit_flyc(self, flyc_def):
-        """Record a flyc description from `aot.flyc_kernels` (dedup by name, same
-        pattern as visit_affine). Not dispatched through `_node_kind` / backend_refs
-        -- flyc is not a backend in Phase 1 (Task 5a)."""
+    def visit_flyc(self, b):
+        """Backend-ref form: record the flyc description and report it like any
+        other backend. Dispatched via `_node_kind`, same as visit_metro/kernel/
+        affine."""
+        return (b.index, 'flyc', self._record_flyc(b.obj))
+
+    def _record_flyc(self, flyc_def):
+        """Record a flyc description (dedup by name, same pattern as
+        visit_affine) and return its name.
+
+        Two entry points reach this: `visit_flyc` above, for a flyc def listed as
+        an operator backend, and the `aot.flyc_kernels` sweep, which predates
+        flyc being dispatchable and exists so a flyc kernel can be BUILT before
+        anything launches it. The second one can go once every flyc kernel is
+        reachable as a backend; recording is idempotent, so a kernel appearing in
+        both lists is recorded once."""
         from aotriton.template_instantiation.specs.flyc import FlycDecl
         node = getattr(flyc_def, '__ati_node__', None)
         assert isinstance(node, FlycDecl), (
-            f'{self.family}: flyc_kernels entry {flyc_def!r} has no FlycDecl '
+            f'{self.family}: {flyc_def!r} has no FlycDecl '
             f'(not a passive @ati.flyc.kernel def)')
         if node.name not in self.compiled.flycs:
             self.compiled.flycs[node.name] = node
+        return node.name
 
     # --- metro sub-plan descent (Call | Cond tree) ---------------------------
 
