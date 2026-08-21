@@ -41,7 +41,7 @@ from ..specs.base import StackedSpec
 
 
 class FlycKernelSpec(StackedSpec):
-    """@ati.flyc.kernel(path, functionals_of=...): the innermost marker that makes
+    """@ati.flyc.kernel(path): the innermost marker that makes
     the def a flyc-kernel description (the flyc analogue of @ati.affine.aiter_asm /
     @ati.source). `module_path` is the vendored kernel-directory FILE `path`
     resolved relative to the caller's __file__ (the description module) — same
@@ -52,21 +52,21 @@ class FlycKernelSpec(StackedSpec):
     lazily, at build-drive time (flyc_compile.py puts the vendored directory on
     sys.path first).
 
-    `functionals_of` is the NAME of the operator whose enumerated functionals this
-    flyc kernel inherits and filters (PLAN-PHASE1.md Task 5a): a read-only
-    reference the generator (codegen/linker.py) resolves against the linked IR.
-    Deliberately NOT an `@ati.backend` registration — Phase 2 replaces this with
-    one."""
+    The operator whose functionals this kernel inherits is NOT declared here.
+    It used to be, as `functionals_of=`, when a flyc kernel was reachable no
+    other way. It is now an `@ati.backend` of that operator, so the operator
+    declares the relationship and `ir/ops/infer.py` binds it — the same
+    inference every triton kernel already relies on, and for the reason stated
+    there: which operator a kernel serves is the operator's fact, not the
+    kernel's."""
 
-    __slots__ = ('module_path', 'functionals_of')
+    __slots__ = ('module_path',)
 
-    def __init__(self, module_path, functionals_of=None):
+    def __init__(self, module_path):
         self.module_path = module_path
-        self.functionals_of = functionals_of
 
     def __repr__(self):
-        return (f'FlycKernelSpec({self.module_path!r}, '
-                f'functionals_of={self.functionals_of!r})')
+        return f'FlycKernelSpec({self.module_path!r})'
 
 
 class FlycHintsSpec(StackedSpec):
@@ -93,19 +93,14 @@ class FlycHintsSpec(StackedSpec):
 # --- public decorator namespace (ati.flyc.*) --------------------------------
 
 
-def kernel(path, *, functionals_of=None):
-    """@ati.flyc.kernel(path, functionals_of='op_attn_fwd'): innermost marker.
+def kernel(path):
+    """@ati.flyc.kernel(path): innermost marker.
     `path` is resolved relative to the DESCRIPTION file (the caller's __file__),
-    not cwd — matches decorators/source.py's `source()`.
-
-    `functionals_of` names the operator this flyc kernel inherits its functional
-    axes from (PLAN-PHASE1.md Task 5a). Required in Phase 1 — there is no other
-    route to a functional space, since flyc declares none of its own and is not
-    registered as an operator backend yet."""
+    not cwd — matches decorators/source.py's `source()`."""
     caller_file = inspect.stack()[1].filename
     base = Path(caller_file).resolve().parent
     module_path = (base / path).resolve()
-    return FlycKernelSpec(module_path, functionals_of=functionals_of)
+    return FlycKernelSpec(module_path)
 
 
 def hints(hints_cls):

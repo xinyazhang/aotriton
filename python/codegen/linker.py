@@ -142,7 +142,7 @@ def _build_affines(compiled):
 
 def _build_flycs(compiled, built_kernels):
     """Build every flyc KernelDescription from its parsed FlycDecl, resolving
-    `functionals_of` against the already-built operators.
+    the operator that lists it as an @ati.backend.
     Must run AFTER `_build_operators` -- unlike affine kernels (bound to an
     operator only as a listed backend), a flyc kernel's functional space is
     resolved by NAME against the finished operators dict.
@@ -174,37 +174,25 @@ def _build_flycs(compiled, built_kernels):
                                   tensors=spec.tensors, scalars=spec.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
-        kdesc.functionals_of = decl.functionals_of   # checked by _check_flyc_functionals_of
         kdesc.kernel_decl = spec       # the cite-resolved clone
         out[name] = kdesc
     return out
 
 
-def _check_flyc_functionals_of(compiled, flycs):
-    """Verify every flyc kdesc got the operator its `functionals_of=` names.
+def _check_flycs_bound(compiled, flycs):
+    """Every flyc kdesc must have been bound to its operator by
+    `infer_shared_iface`, which walks operator -> backends.
 
-    The binding itself is `infer_shared_iface`'s, done by walking the operator's
-    backends -- so a flyc kernel reachable as a backend is bound without anyone
-    consulting `functionals_of`. This checks the two agree, and catches the one
-    case the walk cannot reach: a flyc kernel listed only in `aot.flyc_kernels`,
-    which no operator names as a backend and which therefore ends linking
-    unbound. That used to be the only route flyc had; it is now the exception,
-    and an unbound kdesc fails here rather than at whichever delegating property
-    a code generator happens to touch first.
-    """
+    A flyc kernel that is not any operator's `@ati.backend` is never reached by
+    that walk and ends linking with no functional space, no params struct and no
+    identity to borrow. Fail here, where the cause is one sentence, rather than
+    at whichever delegating property a code generator touches first."""
     for name, kdesc in flycs.items():
-        want = kdesc.functionals_of
-        got = kdesc.SHARED_IFACE
-        assert got is not None, (
-            f'flyc kernel {name!r} was never bound to an operator: it declares '
-            f'functionals_of={want!r} but is not reachable as a backend of any '
-            f'operator in family {compiled.family!r}. Either add it as an '
-            f'@ati.backend, or extend the binding to cover build-only flyc '
-            f'kernels.')
-        assert got.NAME == want, (
-            f'flyc kernel {name!r} declares functionals_of={want!r} but was '
-            f'bound to operator {got.NAME!r} by its backend position; one of '
-            f'the two is wrong.')
+        assert kdesc.SHARED_IFACE is not None, (
+            f'flyc kernel {name!r} is not reachable as an @ati.backend of any '
+            f'operator in family {compiled.family!r}, so nothing binds its '
+            f'functional space. Add it with @ati.backend(<index>, {name}, '
+            f'<enum name>) on the operator it belongs to.')
 
 
 def _build_metros(compiled, built_kernels):
@@ -356,7 +344,7 @@ class Linker:
         # `sub.SHARED_IFACE = op` walk finishes it. See _build_flycs for why it
         # is only half-built until here.
         infer_shared_iface(op_list)
-        _check_flyc_functionals_of(compiled, flycs)
+        _check_flycs_bound(compiled, flycs)
 
         return FamilyArtifacts(
             family,
