@@ -688,12 +688,88 @@ Six functions is the whole hand-written surface. Two of them are one-liners
 (`flyc_batch_size`, `flyc_dropout_scale`); the description's own comment accepts that cost
 in exchange for one mechanism in one file.
 
-**The `num_seqlens`/`batch_size` pair carries a known hazard.** Phase 1 recorded a
-follow-up that was never closed: the mapping must be checked against `flyc_varlen_bits`
-for the `< 0` padded case. The three-way `Num_seqlens` encoding is exactly the kind of
-thing a C++ expression in the description could not have documented, which is why these
-are functions. **Write that check as a comment at the point of decoding, and add a unit
-test** — this is the single most likely source of a silent wrong answer in Phase 2.
+### 7.1 The varlen translation, resolved
+
+Phase 1 left this open: the `num_seqlens`/`batch_size` pair had to be checked
+against `flyc_varlen_bits` for the `< 0` padded case, and nothing had been
+written down. It is the single most likely source of a silent wrong answer in
+Phase 2, so it is settled here rather than at the keyboard.
+
+**Strategic direction, stated so the tactical choice reads as deliberate.**
+`varlen_bits` is the better API and it will eventually be ported *back* into the
+Triton kernel, giving both backends one layout descriptor. That is not this
+change. Touching the Triton kernel while landing flyc integration would put two
+uncontrolled variables in the same experiment. So for now this shim translates
+AOTriton's existing encoding into `varlen_bits`, one-way, and the translation
+lives entirely in `flyc_attn_fwd.cc`.
+
+**What the shim actually receives.** `VarlenType` does not survive into the
+params struct. `modules/flash/csrc/attn_fwd.cc:99` collapses it:
+
+```cpp
+.Num_seqlens = in.varlen_type == VarlenType::PaddedVarlen ? -num_seqlens : num_seqlens,
+```
+
+so by the time `FlycAttnFwdContext` sees it, the four-way enum has become **a
+signed three-way count plus the nullness of `seq_strides_q/k`**. Compact and
+Strided are distinguished *only* by whether `seq_strides_q` is a null tensor.
+That is the fact the translation has to be written against, and it is why
+reading `VarlenType` here is not an option.
+
+**The mapping.** From `sdpa-varlen-plan.md` §1.3 (AOTriton's four types
+decomposed onto the three axes) and §2 (the bit layout), in the FlyDSL repo at
+`kernels/attention/parity/`:
+
+| params state | is | `varlen_bits` | `batch_size` | `num_seqlens` |
+|---|---|---|---|---|
+| `Num_seqlens == 0` | dense | `0x0000` | `Q->size(0)` (= B) | `0` |
+| `> 0`, `seq_strides_q` null | compact | `0x0B0B` | `Q->size(0)` (= 1) | `Num_seqlens` |
+| `< 0` | padded | `0x0202` | `Q->size(0)` (= N) | `0` |
+| `> 0`, `seq_strides_q` non-null | strided | `0x1313` | `Q->size(0)` (= 1) | `Num_seqlens` |
+
+Per-side byte, from §2 — one byte for Q, the same byte again for K, because
+AOTriton never expresses a per-side difference:
+
+```
+bit  0     STACKED   0 = BHSD          1 = 1THD
+bits 2:1   LENGTH    0 = MAX           1 = CUMULATIVE   2 = INDIVIDUAL
+bits 4:3   POSITION  0 = IMPLIED       1 = REUSE        2 = ARRAY
+bits 17:16 LSE_LAYOUT 0 = HT  <- AOTriton's layout, so always 0 here
+```
+
+Derive the constants rather than pasting the hex: `0x0B` is
+`STACKED | CUMULATIVE<<1 | REUSE<<3`, and writing it that way is what makes the
+padded row (`0x02` = `CUMULATIVE<<1`, no STACKED, IMPLIED position) obviously
+different from the compact one.
+
+**Why `num_seqlens` is 0 for padded and not `-Num_seqlens`.** The two operands
+mean different things in the two ABIs. FlyDSL's `num_seqlens` answers "how many
+sequences are packed into a 1THD tensor", and padded varlen packs nothing — it
+is BHSD with one sequence per batch slot. The count still reaches the kernel,
+via `batch_size`, because `Q->size(0)` *is* N in that layout. AOTriton overloads
+one signed field to carry both the count and the mode; FlyDSL separates them,
+and `varlen_bits` takes the mode half.
+
+**The assertion that makes it safe.** The kernel computes
+`nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)`, and AOTriton
+independently computes `.Batch = Num_seqlens == 0 ? batch : Num_seqlens`
+(`sdpa-varlen-plan.md` V6 notes the two are the same quantity). **Assert in the
+shim that they agree**, and assert it unconditionally rather than under
+`NDEBUG`:
+
+```
+nseq_idx  ==  (Num_seqlens == 0 ? Q->size(0) : abs(Num_seqlens))
+```
+
+This is the one check that catches every row of the table being wrong in the
+same way. The failure it prevents is the one FlyDSL's own `varlen_args`
+docstring describes: *"it launches N programs over a tensor whose batch axis is
+1, and every one of them addresses a plausible row"* — a wrong answer with no
+fault, no out-of-bounds, and no tolerance failure.
+
+**Test it per row, not in aggregate.** Four cases, one per table row, asserting
+the triple `(varlen_bits, batch_size, num_seqlens)`. A single dense test passes
+for three of the four wrong implementations.
 
 **Files.**
 
