@@ -4,6 +4,7 @@
 #include <aotriton/config.h>
 #include <aotriton/dtypes.h>
 #include <aotriton/flash.h>
+#include <aotriton/flash/backends.h>
 #include <aotriton/runtime.h>
 #include <aotriton/util.h>
 #include <aotriton/cpp_tune.h>
@@ -23,6 +24,30 @@ namespace pyaotriton::v3 {
       using aotriton::v3::flash::attn_bwd_params;
       using aotriton::v3::flash::attn_options;
       void setup_module(py::module_& m) {
+        // Backend-index constants, from the generated
+        // <aotriton/flash/backends.h>. Plain int attributes rather than
+        // py::enum_, for the reason modules/flash/tests/aotriton_flash.py
+        // records about CausalType: reading an enum's integer needs `.value`,
+        // which makes every call site verbose. These feed
+        // attn_options.force_backend_index, which is an int.
+        //
+        // The constant NAMES are not written here -- they expand from the
+        // generator's X-macro, so this binding cannot fall out of step with
+        // BackendEnum the way the hand-copied CausalType did. Only the two
+        // STRUCT names are named, and adding an operator is what adds one.
+#define AOTRITON_BIND_BACKENDS(Struct)                                        \
+        {                                                                     \
+          using T = aotriton::v3::flash::Struct;                              \
+          py::class_<T> c(m, #Struct);                                        \
+          AOTRITON_BACKENDS_##Struct(AOTRITON_BIND_ONE)                       \
+          c.attr("Max") = T::Max;                                             \
+        }
+#define AOTRITON_BIND_ONE(Name) c.attr(#Name) = T::Name;
+        AOTRITON_BIND_BACKENDS(OpAttnFwdBackend)
+        AOTRITON_BIND_BACKENDS(OpAttnBwdBackend)
+#undef AOTRITON_BIND_ONE
+#undef AOTRITON_BIND_BACKENDS
+
         auto attn_options_class = py::class_<attn_options>(m, "attn_options")
           .def(py::init<>())
           .def_readwrite("force_backend_index", &attn_options::force_backend_index)

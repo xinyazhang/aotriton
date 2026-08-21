@@ -891,20 +891,20 @@ the source tree.
 reasons to put it at namespace scope instead, as sibling structs:
 
 ```cpp
-struct AOTRITON_API FwdBackend {
+struct AOTRITON_API OpAttnFwdBackend {
   static constexpr int32_t kMetro_Triton              = 0;
   static constexpr int32_t kSlimAffine_AiterFmhaV3Fwd = 1;
   static constexpr int32_t kMetro_Flyc                = 2;
   static constexpr int32_t Max                        = 3;
 };
 
-struct AOTRITON_API BwdBackend {
-  static constexpr int32_t kMetro_TritonSplit         = 0;
-  static constexpr int32_t kShim_BwdKernelFuse        = 1;
-  static constexpr int32_t kSlimAffine_AiterFmhaV3Bwd = 2;
-  static constexpr int32_t Max                        = 3;
-};
+struct AOTRITON_API OpAttnBwdBackend { /* ... */ };
 ```
+
+Named `<Op>Backend`, not `FwdBackend`/`BwdBackend` as an earlier draft had it:
+`OpAttnFwdBackend` is *derived* from the operator (the same CamelCase step that
+produces `OpAttnFwdParams` and `OpAttnFwdContext`), so a new operator needs no
+naming decision and the four names it contributes stay one family.
 
 * **It answers the fwd/bwd question by dissolving it.** The struct is shared between
   fwd and bwd precisely because it is a *runtime request*; the backend vocabularies are
@@ -939,7 +939,12 @@ than typed:
   (`# kMetro_Triton=0, kSlimAffine_AiterFmhaV3Fwd=1 (gfx942/gfx950 only)`). Those
   comments become code.
 - `BACKEND_COUNT` (`level_op.py:91-93`) is a hand-maintained
-  `2 if arch in ('gfx942','gfx950') else 1`. It becomes `FwdBackend.Max`.
+  `2 if arch in ('gfx942','gfx950') else 1`. **It does NOT become
+  `<Op>Backend.Max`** -- an earlier draft of this section said it would, and that
+  is wrong. `Max` is how many backends the LIBRARY was generated with; this is
+  how many are AVAILABLE on the arch in hand, and aiter is gfx942/gfx950-only. A
+  tuner driven by `Max` would probe a backend that cannot run. The arch
+  conditional stays; only the index comments become code.
 
 **One thing to verify before building this.** The `BACKEND_COUNT` arch conditional
 implies the backend set is arch-dependent, but the generated enum in the gfx1201+gfx950
