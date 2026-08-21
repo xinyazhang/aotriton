@@ -88,6 +88,7 @@ class OperatorGenerator(InterfaceGenerator):
         ALIGN = ',\n' + ' ' * nalign
         return ALIGN.join(stmt)
 
+
     def codegen_launchers(self, nalign):
         iface = self._iface
         stmt = []
@@ -185,3 +186,68 @@ class OperatorGenerator(InterfaceGenerator):
             stmt.append('}')
             stmt.append('')
         return '\n'.join(stmt)
+
+
+# --- the same numbering, published -------------------------------------------
+#
+# `OperatorGenerator.codegen_backend_enums` writes BackendEnum into the INTERNAL
+# iface.<op>.h. The index is also an ABI: `attn_options::force_backend_index`
+# takes it, so tests and tuning tools name it too -- and until now they named it
+# as a bare integer, with the mapping living in comments
+# (modules/flash/tune/level_op.py) that nothing checked. Three constants in this
+# codebase went that way and drifted: CausalType is declared in
+# include/aotriton/flash.h AND by hand in modules/flash/tests/aotriton_flash.py,
+# and the two disagree about which members exist.
+#
+# So the numbering is published from the same list that assigns it, and every
+# other spelling derives from this one.
+#
+# Free functions over an Operator, not methods on the generator: a full build
+# fans out per-operator workers, each generating with --selective, so the parent
+# process never runs the generator loop and could not collect these from it. The
+# operator itself is all they need.
+
+
+def backend_constants_struct_name(op):
+    """`OpAttnFwdBackend` for operator `op_attn_fwd` -- the same derivation
+    `param_class_name`/`context_class_name` use, so the names an operator
+    contributes stay recognisably one family."""
+    return op.context_class_name.removesuffix('Context') + 'Backend'
+
+
+def codegen_backend_constants(op):
+    """The public `struct <Op>Backend { static constexpr int32_t ... }`.
+
+    A struct of `static constexpr int32_t`, not an `enum class`, matching
+    CausalType / VarlenType / WindowValue in include/aotriton/flash.h and for the
+    reason recorded there: an enum class needs a cast to reach its underlying
+    type, and `force_backend_index` is a plain int.
+
+    Member names are `backend.enum_name` verbatim -- the same string BackendEnum
+    uses -- so the published constant and the internal enum cannot disagree about
+    a name any more than about a value."""
+    name = backend_constants_struct_name(op)
+    lines = [f'struct AOTRITON_API {name} {{']
+    for i, backend in enumerate(op.list_backends()):
+        lines.append(f'  static constexpr int32_t {backend.enum_name} = {i};')
+    lines.append(f'  static constexpr int32_t Max = {op.nbackends};')
+    lines.append('};')
+    return '\n'.join(lines)
+
+
+def codegen_backend_constant_xmacro(op):
+    """A per-struct X-macro listing that operator's constant NAMES.
+
+    Per struct rather than one list of (struct, name) pairs: a binding expanding
+    a mixed list would have to pick the right target per row, and the targets are
+    different C++ types, so no single expression does it. One macro per struct
+    expands against one already-chosen target.
+
+    An X-macro rather than generated pybind: the binding stays hand-written in
+    modules/<family>/bindings/, which is where a reader looks for it, but the
+    NAMES come from here. A binding listing them literally would be the fourth
+    copy of this list, and the third one drifted.
+    """
+    name = backend_constants_struct_name(op)
+    rows = ' \\\n'.join(f'  X({backend.enum_name})' for backend in op.list_backends())
+    return f'#define AOTRITON_BACKENDS_{name}(X) \\\n{rows}'
