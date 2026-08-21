@@ -195,12 +195,25 @@ def _check_flycs_bound(compiled, flycs):
             f'<enum name>) on the operator it belongs to.')
 
 
-def _build_metros(compiled, built_kernels):
-    """Build every MetroKernel, binding its sub-kernels by name to built kdescs."""
+def _build_metros(compiled, built_kernels, flycs):
+    """Build every MetroKernel, binding its sub-kernels by name to built kdescs.
+
+    The lookup spans triton AND flyc kernels: a metro step is whatever kind of
+    kernel the description names, and a metro mixing the two is the point of the
+    flyc backend -- one launcher, two DSLs, one stream. The two name spaces are
+    disjoint (both key on the def name within a family), so one merged dict is
+    the whole binding.
+
+    flyc kdescs are only half-built here -- `infer_shared_iface` binds their
+    functional space later -- but `lower_plan` stores the object and reads
+    nothing off it, so a metro can hold one before it is finished. That is the
+    same header/implementation split that lets a kernel cite a metro containing
+    it."""
     from aotriton.template_instantiation.builder import build_metro
+    kernel_map = {**built_kernels, **flycs}
     out = {}
     for name, shell in compiled.metros.items():
-        out[name] = build_metro(shell.plan, built_kernels, name,
+        out[name] = build_metro(shell.plan, kernel_map, name,
                                 family=compiled.family)
     return out
 
@@ -334,7 +347,7 @@ class Linker:
         # split that lets bwd_kernel_fuse cite three kernels that are still
         # being linked. infer_shared_iface below supplies the other half.
         flycs = _build_flycs(compiled, built_kernels)
-        metros = _build_metros(compiled, built_kernels)
+        metros = _build_metros(compiled, built_kernels, flycs)
         operators = _build_operators(compiled, built_kernels, metros, affines,
                                      flycs)
 

@@ -42,6 +42,25 @@ def metro_fwd(params):
         debug_simulate_encoded_softmax(params)
 
 
+# The same shape as metro_fwd with the FlyDSL kernel in place of the triton one,
+# and the SAME triton debug kernel after it. That mix is the point rather than a
+# convenience: one metro launcher, two DSLs, two hsacos, one stream. It is also
+# the only thing in the tree that exercises a cross-DSL metro, so it is what
+# would catch a launcher that quietly assumes every step is triton.
+#
+# debug_simulate_encoded_softmax stays triton deliberately. FlyDSL has no
+# equivalent, the kernel is a debugging aid rather than a performance path, and
+# porting it would remove exactly the cross-DSL property this metro exists to
+# test. Its launch_condition already carries the encoded_softmax != nullptr
+# guard, so the conditional step needs nothing flyc-specific.
+@ati.start
+@ati.metro_kernel
+def metro_fwd_flyc(params):
+    flyc_attn_fwd(params)
+    if params.encoded_softmax.data_ptr() != 0:
+        debug_simulate_encoded_softmax(params)
+
+
 # union_precedence: the KEY kernels (dk_dv, dq) own the canonical operand bindings;
 # the preprocess kernels name some shared strides differently (dO's 4th stride is
 # `stride_don` there vs `stride_dok` on the key kernels). When bwd_kernel_dq @ati.cites
@@ -71,11 +90,12 @@ def metro_bwd(params):
 @ati.tune.fallback(PADDED_HEAD=False)
 @ati.tune.binning(Max_seqlen_q=ati.tune.binning.le,
                   Max_seqlen_k=ati.tune.binning.le)
-# flyc, index 2. A flyc kernel is a backend like any other now; the linker
-# builds its kdesc before the operators and binds its functional space back
-# afterwards (codegen/linker.py's bind_flyc_functionals), because a flyc kernel
-# both IS a backend and BORROWS this operator's functional space.
-@ati.backend(2, flyc_attn_fwd, 'flyc')
+# flyc, index 2 -- the metro, not the bare kernel, so the encoded_softmax debug
+# step runs on this backend too. The linker builds flyc kdescs before the
+# operators and binds their functional space afterwards (ir/ops/infer.py), because
+# a flyc kernel both IS reachable as a backend and BORROWS this operator's
+# functional space.
+@ati.backend(2, metro_fwd_flyc, 'flyc')
 @ati.backend(1, aiter_fmha_v3_fwd, 'aiter')
 @ati.backend(0, metro_fwd, 'triton')
 @ati.operator(call_options_name='attn_options')
