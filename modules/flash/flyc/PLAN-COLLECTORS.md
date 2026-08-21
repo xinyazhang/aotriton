@@ -127,7 +127,7 @@ being silently accepted the day someone adds the field. **The restriction is
 now a line of code that has to be deleted to change the rule**, rather than the
 absence of one.
 
-### 3.3 `SpecBundle`: a dataclass, and `cite`/`disable` are NOT lists
+### 3.3 `SpecBundle`: a dataclass, and `disable` is NOT a list
 
 `_partition` returns an 8-tuple, unpacked positionally at its two call sites.
 Adding a kind means editing every unpack; mis-ordering two same-typed fields is
@@ -141,21 +141,49 @@ class SpecBundle:
     overrides:    list[Override]     = field(default_factory=list)
     dtype_vars:   list[ChoiceVar]    = field(default_factory=list)
     tune_records: list               = field(default_factory=list)
-    cite:         CiteSpec | None    = None      # AT MOST ONE
+    cites:        list[CiteSpec]     = field(default_factory=list)
     disable:      DisableSpec | None = None      # AT MOST ONE
     unrecognized: list               = field(default_factory=list)
 ```
 
-`cite` and `disable` are **singular fields, not one-element lists**. A second of
-either is rejected by `partition` at decoration time, naming the stack. This is
-the earliest point at which the rule can possibly be enforced — the specs are in
-hand and nothing has been built yet.
+`disable` is a **singular field, not a one-element list**. A second one is
+rejected by `partition` at decoration time, naming the stack — the earliest
+point the rule can possibly be enforced, with the specs in hand and nothing
+built yet.
 
-Storing them singly is what makes the check unavoidable. A `list` field with a
+Storing it singly is what makes the check unavoidable. A `list` field with a
 `max_count` rule is still a list: every consumer can iterate it, so the rule has
 to be re-checked (or forgotten) wherever the plural type suggests plural is
 possible. That is precisely how `affine.py:86-87` came to drop a disable
 silently. The type should not admit the state the rule forbids.
+
+**`cites` stays plural, and that is not a concession.** Stacking several
+`@ati.cite` on one kernel is a named, deliberate pattern — "citation mode (b)",
+rev0 §4.4 — and `modules/flash/aot/bwd_kernel_fuse.py:65-67` is a live
+registered backend (`@ati.backend(1, ...)` on `op_attn_bwd`) that stacks three
+to pull merged operand vocabulary out of three `triton_split` sub-kernels.
+`python/test/fakefamily/flash/aot/bwd_kernel_fuse.py` mirrors it and is
+exercised by the suite. An earlier draft of this plan required "a second
+`@ati.cite` raises"; that would have broken a shipping backend on the first
+commit.
+
+**Precedence: the OUTER cite overrides the inner ones.** This already holds and
+is merely undocumented, so the work here is to state and pin it, not to change
+it. The chain: decorators apply bottom-up, so `pending` ends
+innermost-first; `start()` does `specs = list(reversed(pending))`, restoring
+source order; `partition` preserves that order; and `resolve_cites` merges with
+`cited_apparel.setdefault(...)`, i.e. first-wins. So `cites[0]` is the topmost
+decorator in the source and it wins. For `bwd_kernel_fuse` that means
+`bwd_kernel_dk_dv` (line 65) overrides `bwd_kernel_dq` and `bwd_preprocess`.
+
+Order is therefore load-bearing, which makes `cites` a **sequence, not a set** —
+another reason the field is a list. Any reordering inside `partition` silently
+changes which cited operand wins.
+
+**flyc's `assert cite is None` goes away.** `specs/flyc.py` rejects a second
+`@ati.cite` today; that is an artifact of flyc's collector having been written
+narrowly, not a flyc-specific rule. Adopting the common vocabulary widens it,
+which cannot break existing descriptions.
 
 Prefer a dataclass over `NamedTuple`: the list fields are mutable and a
 `NamedTuple` invites positional unpacking, the exact habit being removed.
@@ -171,18 +199,21 @@ cs.disables]`, and a *whole-metro* cite resolves to every sub-kernel's spec. So
 a kernel that declares no disable and cites a metro with three sub-kernels
 inherits three. `BuiltKernel.disables` being a list is correct.
 
-The mistake is using one field for both. The declared fields (`cites`/
-`disables` on what 3.5 renames to `KernelDecl`) are
-plural *because resolution writes into them*, and that plurality then reads
-backwards as "you may declare several" — which nothing checks, at any stage.
+The mistake is using one field for both. `disables` (on what 3.5 renames to
+`KernelDecl`) is plural *because resolution writes into it*, and that plurality
+then reads backwards as "you may declare several" — which nothing checks, at any
+stage.
 
 Split them:
 
 | | declared | after resolution |
 |---|---|---|
-| field | `KernelDecl.cite`, `KernelDecl.disable` | `KernelDecl.resolved_disables` |
+| field | `KernelDecl.disable` | `KernelDecl.resolved_disables` |
 | cardinality | 0-1, enforced at partition | 0-N, legitimately |
 | written by | the collector, once | `resolve_cites` |
+
+`cites` needs no such split: `resolve_cites` only ever READS `spec.cites`, never
+writes it, so the declared field is already the whole story.
 
 `BuiltKernel.disables` keeps its list and its meaning. `is_functional_disabled`
 keeps iterating it.
@@ -355,8 +386,9 @@ whose inputs are still changing; it is listed here only so the plan is complete.
    line in the commit message rather than riding along as refactor side effects:**
    a second `@ati.disable` becomes an error on every stack (today affine drops
    the first silently), and an `@ati.tensor` on an affine stack becomes an error
-   naming the kind.
-3. Split declared from resolved (3.4): `KernelDecl.cite`/`disable` singular,
+   naming the kind. A third, smaller one: flyc's `assert cite is None` goes,
+   widening flyc to the common multi-cite vocabulary.
+3. Split declared from resolved (3.4): `KernelDecl.disable` singular,
    `resolved_disables` added, `resolve_cites` writing only the latter. This is
    the largest step and the one that touches the shared Triton path, so it
    stands alone.
@@ -383,9 +415,14 @@ would have dropped it from every clone.
 * flyc: `--selective 'flash/flyc/flyc_attn_fwd'`, 584 files, byte-identical;
   288 functionals with unchanged godel numbers.
 * Suite green at each step.
-* **A test asserting a second `@ati.disable` raises on every stack kind**, and a
-  second `@ati.cite` likewise. This is the regression that motivates the change
-  and nothing covers it today.
+* **A test asserting a second `@ati.disable` raises on every stack kind.** This
+  is the regression that motivates the change and nothing covers it today.
+* **A test pinning cite precedence**: with several `@ati.cite` on one stack, the
+  OUTERMOST (topmost in source) wins a contested operand. Order is load-bearing
+  through `reversed(pending)` -> `partition` -> `setdefault`, and nothing
+  currently guards it against a reordering in the new partition.
+* A test that `bwd_kernel_fuse`'s three-cite stack still resolves — it is a
+  shipping backend and the reason `cites` stays plural.
 * A test asserting an `@ati.tensor` on an affine stack raises — the `forbid`
   path, which is new behaviour rather than a restored invariant.
 * A test that a whole-metro cite still inherits N disables (3.4's plural side),
