@@ -447,11 +447,27 @@ def _extract_hsaco(jf) -> bytes:
     """Pull the compiled hsaco ELF out of a traced `JitFunction`.
 
     `jf._last_compiled[1]._ir_text` is the linked MLIR after `jf(*args)` ran
-    under `COMPILE_ONLY=1`. Exactly two `gpu.binary` objects are expected --
-    the `#rocdl.target<chip=...>` one and the `no_wave64` variant the
-    `rocdl-attach-target` pass adds -- and they are byte-identical; asserting
-    that is cheap insurance that nothing downstream silently started emitting
-    two different code objects.
+    under `COMPILE_ONLY=1`. Two `gpu.binary` objects appear -- one per target
+    on the `gpu.module`: the bare `#rocdl.target<chip=...>` FlyDSL's ROCm
+    backend sets when it creates the module, and the `no_wave64` variant
+    `rocdl-attach-target` appends. The first is the one shipped.
+
+    They are two independent LLVM codegen runs, so they are *not* guaranteed
+    byte-identical, and requiring it (as this used to) breaks the build: the
+    AMDGPU backend is not bitwise reproducible. About one gfx1201
+    `flyc_attn_fwd` `BLOCK_DMODEL=48` compile in five came out differing from
+    its sibling -- benignly, e.g. a commutative VOP3's two source operands
+    swapped -- and every such difference vanished under
+    `setarch --addr-no-randomize`, i.e. it tracks address-space layout, not
+    anything about the kernel.
+
+    A difference is still worth knowing about, hence the warning rather than
+    silence: the two targets are only equivalent as long as nothing lands on
+    one and not the other. `rocdl-attach-target` is the only one of the two
+    carrying the backend's configured options (`wave64`, `abi`, `O`, and
+    `fast`/`unsafe-math` off the compile hints), so a hint that starts
+    reaching it would show up here first -- as a warning on every compile
+    rather than the occasional one.
     """
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import gpu as gpud
@@ -470,9 +486,10 @@ def _extract_hsaco(jf) -> bytes:
     if not blobs:
         raise RuntimeError("_extract_hsaco: no gpu.binary op found in the compiled IR")
     if len(set(blobs)) != 1:
-        raise RuntimeError(
-            f"_extract_hsaco: expected every gpu.binary object to be byte-identical, "
-            f"got {len(set(blobs))} distinct blob(s) among {len(blobs)}"
+        print(
+            f"_extract_hsaco: warning: the {len(blobs)} gpu.binary objects are not "
+            f"byte-identical ({len(set(blobs))} distinct); shipping the first.",
+            file=sys.stderr,
         )
     return blobs[0]
 
