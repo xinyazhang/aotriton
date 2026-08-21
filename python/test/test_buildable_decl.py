@@ -92,7 +92,7 @@ def test_flyc_only_fields_survive_the_clone():
     from aotriton.codegen.linker import Linker
     _k, _o, _a, flycs = Linker(_MODULES).link_all_families()
     copy = flycs[0].kernel_decl.clone()
-    for attr in ('desc_path', 'functionals_of', 'hints_cls', 'fn'):
+    for attr in ('desc_path', 'hints_cls', 'fn'):
         assert getattr(copy, attr) is not None, f'{attr} lost'
 
 

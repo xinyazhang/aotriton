@@ -43,8 +43,6 @@ class FlycDecl(BuildableDecl):
 
       desc_path       the description module's own file, for the Fly.compile
                       DESC column (build plumbing)
-      functionals_of  the operator whose functional space this kernel borrows;
-                      a Triton kernel owns its own, so has no equivalent
       hints_cls       the @ati.flyc.hints dataclass (tune)
       fn              the deferred builder the FlyDSL compiler calls (build)
 
@@ -59,7 +57,6 @@ class FlycDecl(BuildableDecl):
     """
 
     desc_path: Path = None             # the DESCRIPTION module's own file
-    functionals_of: str = None         # operator NAME this kernel's functionals come from
     hints_cls: type | None = None      # the @ati.flyc.hints dataclass, or None
     fn: object = None                  # the placeholder def itself (the builder)
 
@@ -131,10 +128,6 @@ def collect_flyc_decl(placeholder, specs):
     b.unrecognized = remaining
     b.reject_remaining('@ati.flyc')
     assert marker is not None, '@ati.start flyc path without an @ati.flyc.kernel marker'
-    assert marker.functionals_of is not None, (
-        f'@ati.flyc.kernel on {placeholder.__name__!r} is missing functionals_of=; '
-        f'Phase 1 has no other route to a functional space (flyc declares none of '
-        f'its own and is not an operator backend yet -- PLAN-PHASE1.md Task 5a)')
     # The DESCRIPTION module's own file (e.g. modules/flash/aot/flyc_attn_fwd.py),
     # NOT marker.module_path (the vendored kernel file under modules/flash/flyc/).
     # This is what codegen/root.py's Fly.compile DESC column feeds to
@@ -144,7 +137,7 @@ def collect_flyc_decl(placeholder, specs):
     stub = _flyc_kernel_stub(marker.module_path, placeholder.__name__)
     # `name` passed explicitly: the flyc DESCRIPTION's identity, not the
     # AST-located @flyc.kernel def's name in the vendored file.
-    return FlycDecl(desc_path=desc_path, functionals_of=marker.functionals_of,
+    return FlycDecl(desc_path=desc_path,
                     hints_cls=hints_cls, fn=placeholder,
                     params=kernel_params(stub), tensors=b.tensors,
                     scalars=b.scalars, overrides=b.overrides,

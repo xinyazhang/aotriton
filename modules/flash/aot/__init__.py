@@ -95,10 +95,4 @@ def op_attn_bwd():
 
 
 operators = [op_attn_fwd, op_attn_bwd]
-# flyc_attn_fwd is now reachable BOTH ways: as op_attn_fwd's index-2 backend and
-# through this list. The list predates it being dispatchable and exists so a flyc
-# kernel can be built without anything launching it; recording is idempotent, so
-# appearing twice records once. Delete this once no flyc kernel needs the
-# build-only route.
-flyc_kernels = [flyc_attn_fwd]
-__all__ = ['operators', 'flyc_kernels']
+__all__ = ['operators']

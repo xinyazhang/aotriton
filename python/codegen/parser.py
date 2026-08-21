@@ -152,7 +152,7 @@ class CompiledFamily:
         self.kernels = {}      # def-name -> KernelShell
         self.metros = {}       # backend enum-name -> MetroShell
         self.affines = {}      # affine NAME -> AffineDecl
-        self.flycs = {}        # flyc NAME -> FlycDecl (Task 5a; reached via aot.flyc_kernels)
+        self.flycs = {}        # flyc NAME -> FlycDecl, reached as an @ati.backend
         self.operators = {}    # op-name -> OperatorShell
         self.op_order = []     # operator NAMEs in declared order
 
@@ -197,12 +197,6 @@ class FamilyCompiler:
     def run(self):
         for op_def in getattr(self.aot, 'operators', []):
             self.visit_operator(op_def)
-        # A flyc description is reachable through neither `operators` NOR any
-        # backend ref (PLAN-PHASE1.md Task 5a/5e deliberately does not register it
-        # as one) -- `aot.flyc_kernels` is the second root modules/<family>/aot
-        # exposes just for this.
-        for flyc_def in getattr(self.aot, 'flyc_kernels', []):
-            self._record_flyc(flyc_def)
         return self.compiled
 
     # --- operator + backend dispatch -----------------------------------------
@@ -247,29 +241,16 @@ class FamilyCompiler:
         return (b.index, 'affine', adecl.name)
 
     def visit_flyc(self, b):
-        """Backend-ref form: record the flyc description and report it like any
-        other backend. Dispatched via `_node_kind`, same as visit_metro/kernel/
-        affine."""
-        return (b.index, 'flyc', self._record_flyc(b.obj))
-
-    def _record_flyc(self, flyc_def):
-        """Record a flyc description (dedup by name, same pattern as
-        visit_affine) and return its name.
-
-        Two entry points reach this: `visit_flyc` above, for a flyc def listed as
-        an operator backend, and the `aot.flyc_kernels` sweep, which predates
-        flyc being dispatchable and exists so a flyc kernel can be BUILT before
-        anything launches it. The second one can go once every flyc kernel is
-        reachable as a backend; recording is idempotent, so a kernel appearing in
-        both lists is recorded once."""
+        """Record a flyc description and report it like any other backend
+        (dedup by name, same pattern as visit_affine)."""
         from aotriton.template_instantiation.specs.flyc import FlycDecl
-        node = getattr(flyc_def, '__ati_node__', None)
+        node = getattr(b.obj, '__ati_node__', None)
         assert isinstance(node, FlycDecl), (
-            f'{self.family}: {flyc_def!r} has no FlycDecl '
+            f'{self.family}: {b.obj!r} has no FlycDecl '
             f'(not a passive @ati.flyc.kernel def)')
         if node.name not in self.compiled.flycs:
             self.compiled.flycs[node.name] = node
-        return node.name
+        return (b.index, 'flyc', node.name)
 
     # --- metro sub-plan descent (Call | Cond tree) ---------------------------
 

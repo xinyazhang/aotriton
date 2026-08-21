@@ -52,7 +52,7 @@ class BuildableDecl(AtiNode):
 
     Holds every field the two backends' records have in common, which turns out
     to be all of `KernelDecl`'s -- the Triton record adds nothing, and `FlycDecl`
-    adds four (`desc_path`, `functionals_of`, `hints_cls`, `fn`). They are
+    adds three (`desc_path`, `hints_cls`, `fn`). They are
     SIBLINGS, not a subtype pair: an earlier version converted a `FlycDecl` into
     a `KernelDecl` before building, which asserted a relationship that does not
     hold, discarded the flyc-only fields, and hid every subsequent divergence
