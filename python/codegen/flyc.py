@@ -57,6 +57,7 @@ class FlycShimGenerator(InterfaceGenerator):
         d = {
             'kernel_family_name'    : kdesc.FAMILY,
             'shim_kernel_name'      : kdesc.NAME,
+            'flyc_gpu_symbol'       : kdesc.gpu_symbol_name,
             'param_class_name'      : kdesc.param_class_name,
             'shared_iface_family'   : shared_iface_family,
             'shared_iface'          : 1 if shared_iface else 0,
@@ -85,6 +86,7 @@ class FlycShimGenerator(InterfaceGenerator):
             'call_options_struct' : kdesc.SHARED_IFACE.CALL_OPTIONS_NAME if shared_iface else 'void',
             'kernel_family_name'  : kdesc.FAMILY,
             'shim_kernel_name'    : kdesc.NAME,
+            'flyc_gpu_symbol'     : kdesc.gpu_symbol_name,
             'param_class_name'    : kdesc.param_class_name,
             'context_class_name'  : kdesc.context_class_name,
             'godel_number_body'   : self.codegen_godel_number_body(),
