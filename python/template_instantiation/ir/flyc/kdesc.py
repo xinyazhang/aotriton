@@ -91,6 +91,30 @@ class KernelDescription(Interface):
         self.hints_cls = hints_cls
 
     @property
+    def gpu_symbol_name(self):
+        """The HIP kernel symbol the hsaco actually exports.
+
+        NOT `self.NAME`. `NAME` is the description's identity ('flyc_attn_fwd');
+        the ELF exports the `@flyc.kernel` def's name with FlyDSL's kernel id
+        appended ('flash_attn_func_aiw_kernel_0'). A Triton kernel's two names
+        coincide by convention, which is why the shim template originally passed
+        `shim_kernel_name` here and why the mismatch only showed up as a runtime
+        `hipModuleGetFunction` failure on the flyc path.
+
+        The `_0` is the kernel id, not a uniquing suffix. FlyDSL's
+        `_emit_kernel` (compiler/kernel_function.py) names an unnamed kernel
+        `f"{func.__name__}_{kernel_id}"`, and `kernel_id` comes from a
+        per-compilation counter -- so it is 0 for every kernel we build, because
+        `aotriton.flyc_compile` drives exactly one kernel per invocation.
+
+        Both halves of that are assumptions about FlyDSL, so `flyc_compile`
+        checks the symbol it actually finds in the ELF against this name and
+        fails the build if they diverge. A convention change should stop the
+        build, not produce kernels that cannot be looked up."""
+        stub = self.kernel_decl.kernel
+        return f'{stub.__name__}_0'
+
+    @property
     def perf_cfields(self):
         return []
 

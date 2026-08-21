@@ -127,9 +127,17 @@ hipError_t
 [[context_class_name]]::launch(hipStream_t stream) const {
     if (!launch_condition)
       return hipSuccess;
-    // Renamed from Triton's `triton_kernel_name` (cosmetic, PLAN-PHASE2.md
+    // NOT the description's name. invoke()'s first argument becomes
+    // OnDiskKernelInfo::function_name, which on_device_kernel.cc hands to
+    // hipModuleGetFunction -- so this must be the symbol the hsaco actually
+    // exports. A Triton kernel's description name and GPU symbol coincide by
+    // convention; a flyc kernel's never do (`flyc_attn_fwd` vs
+    // `flash_attn_func_aiw_kernel_0`), and passing the wrong one fails only at
+    // launch, after lookup and decompression have both succeeded.
+    //
+    // Was `triton_kernel_name` upstream (cosmetic rename, PLAN-PHASE2.md
     // Task 4, delta 3): passed to invoke() purely for logging.
-    constexpr std::string_view kFlycKernelName { "[[shim_kernel_name]]" };
+    constexpr std::string_view kFlycKernelName { "[[flyc_gpu_symbol]]" };
     auto args = prepare_arguments[pp_args_index](*this);
     dim3 grid;
     if (custom_grid_calculator) {

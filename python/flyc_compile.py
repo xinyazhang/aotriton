@@ -529,13 +529,41 @@ def _elf_metadata(report: str) -> dict:
     )
 
 
-def _verify_elf(meta: dict, target: str, report: str):
+def _expected_gpu_symbol(node) -> str:
+    """The HIP symbol the shim will ask `hipModuleGetFunction` for.
+
+    Must match `ir/flyc/kdesc.py`'s `gpu_symbol_name`, which the generated shim
+    embeds. Duplicated deliberately rather than imported: the two are computed in
+    different processes at different times (the generator writes the shim at
+    configure time; this driver compiles the kernel later), so they cannot share
+    a value -- only a rule. `_verify_elf` is what stops the two copies of the
+    rule from drifting apart silently.
+    """
+    return f'{node.kernel.__name__}_0'
+
+
+def _verify_elf(meta: dict, target: str, report: str, node=None):
     if meta['machine'] != 'EM_AMDGPU':
         raise RuntimeError(f"--verify: expected Machine EM_AMDGPU, got {meta['machine']!r}. Full report:\n{report}")
     if meta['flags_arch'] != target:
         raise RuntimeError(
             f"--verify: ELF Flags name {meta['flags_arch']!r}, expected {target!r}. Full report:\n{report}"
         )
+    if node is not None:
+        want = _expected_gpu_symbol(node)
+        if meta['kernel_name'] != want:
+            raise RuntimeError(
+                f"--verify: this hsaco exports {meta['kernel_name']!r}, but the "
+                f"generated shim looks up {want!r}, so every launch would fail "
+                f"in hipModuleGetFunction.\n\n"
+                f"The shim's name comes from ir/flyc/kdesc.py's gpu_symbol_name: "
+                f"the @flyc.kernel def's name plus FlyDSL's kernel id. A mismatch "
+                f"means one of that rule's two assumptions no longer holds -- "
+                f"either the kernel gained an explicit name= (FlyDSL's "
+                f"_emit_kernel then uses it verbatim, with no id suffix), or a "
+                f"single compilation now emits more than one kernel so the id is "
+                f"no longer 0.\n\nFull report:\n{report}"
+            )
 
 
 def do_compile(args):
@@ -592,7 +620,7 @@ def do_compile(args):
     report = _readelf_report(readelf, out_path.with_suffix('.hsaco'))
     meta = _elf_metadata(report)
     if args.verify:
-        _verify_elf(meta, args.target, report)
+        _verify_elf(meta, args.target, report, node)
 
     # aotriton.aks2's loader computes the AKS2 directory entry's block_threads
     # as `j['num_warps'] * j['warp_size']` -- the same key shape python/compile.py
