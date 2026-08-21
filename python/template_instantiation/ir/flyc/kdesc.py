@@ -53,7 +53,7 @@ class KernelDescription(Interface):
     ENUM_PREFIX = 'kFlyc_'
     is_tunable = False
 
-    def __init__(self, built, *, family, module_path,
+    def __init__(self, built, *, family, source_path,
                 functionals_source=None, tensors=None, scalars=None,
                 builder_fn=None, hints_cls=None):
         # `built` is the BuiltKernel build_kernel() lowered this kernel's
@@ -65,7 +65,10 @@ class KernelDescription(Interface):
         self._built = built
         self.NAME = built.name
         self.FAMILY = family
-        self.MODULE_PATH = module_path
+        # `source_path`, not `MODULE_PATH`: ir/triton/kdesc.py already calls the
+        # kernel's own file `source_path`, so the old name was a third spelling
+        # of one concept (FlycDecl.module_path was the second).
+        self.source_path = source_path
         # The Operator this kernel's `functionals_of=` names, resolved by the
         # linker (Task 5a). None only transiently, between __new__ and the
         # linker's assignment -- every kdesc actually handed to the generator has

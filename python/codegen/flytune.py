@@ -71,8 +71,8 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
             f'(linker.py:_build_flycs must thread builder_fn=decl.fn)')
         # The description imports its vendored kernel/tuning modules by bare name
         # (e.g. `import fmha_tuning_gfx1201`), resolved relative to the directory
-        # holding kdesc.MODULE_PATH. A path, not flydsl -- fine for the generator.
-        kernel_dir = str(Path(kdesc.MODULE_PATH).parent)
+        # holding kdesc.source_path. A path, not flydsl -- fine for the generator.
+        kernel_dir = str(Path(kdesc.source_path).parent)
         if kernel_dir not in sys.path:
             sys.path.insert(0, kernel_dir)
         # (build, knobs): `build` is a deferred callable that would construct the

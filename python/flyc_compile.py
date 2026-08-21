@@ -15,7 +15,7 @@ Invoked as `python -m aotriton.flyc_compile`:
         --out_path build/flyc/attn_fwd_hd64_f16
 
 **Kernel-agnostic by construction.** This module drives *any*
-`@ati.flyc.kernel` description through `fn.__ati_node__` (`module_path`,
+`@ati.flyc.kernel` description through `fn.__ati_node__` (`source_path`,
 `hints()`) and the plain `fn(choices, hints) -> built` call — it does not
 import a specific kernel family's tuning module, and nothing here names a
 specific kernel. It enters at the `@flyc.jit` `JitFunction` the description's
@@ -528,7 +528,7 @@ def do_compile(args):
 
     fn = _load_description_module(Path(args.path), args.kernel_name)
     node = fn.__ati_node__
-    kernel_dir = str(Path(node.module_path).parent)
+    kernel_dir = str(Path(node.source_path).parent)
     if kernel_dir not in sys.path:
         sys.path.insert(0, kernel_dir)
 

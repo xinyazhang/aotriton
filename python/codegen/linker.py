@@ -77,65 +77,6 @@ def _kernel_build_order(compiled):
         raise SystemExit(f'ATI linker: @ati.cite dependency cycle: {e.args[1]}')
 
 
-def _clone_spec(spec):
-    """A shallow copy of a KernelSpec with FRESH mutable lists, so the linker's
-    resolve_cites (which appends gap tensors/scalars/overrides/dtype_vars and may set
-    tune/disables) never mutates the module-level passive spec — making linking
-    idempotent (the spec is the source of truth; the linker builds from a copy).
-
-    Built through the real constructor, NOT `KernelSpec.__new__` + hand-assigned
-    attributes. The `__new__` form skipped `__post_init__`, so every field that
-    class derives rather than stores had to be re-derived here by hand, and a
-    field added there later would be silently absent from every clone the linker
-    builds from — while the original spec, which tests read directly, still
-    looked right.
-    """
-    from aotriton.template_instantiation.specs.kernel import KernelSpec
-    return KernelSpec(
-        kernel=spec.kernel,
-        params=spec.params,                 # immutable signature; sharing is fine
-        tensors=list(spec.tensors),
-        scalars=list(spec.scalars),
-        overrides=list(spec.overrides),
-        tune=spec.tune,                     # replaced wholesale by resolve_cites if None
-        disables=list(spec.disables),
-        dtype_vars=list(spec.dtype_vars),
-        cites=list(spec.cites),
-    )
-
-
-def _flyc_kernel_spec(decl):
-    """The builder-facing `KernelSpec` for a `FlycDecl`, with FRESH mutable
-    lists. This is the ONE place a flyc description is adapted to the shape
-    `resolve_cites`/`build_kernel` read, and it exists for two reasons:
-
-    * `resolve_cites` appends gap tensors/scalars/overrides/dtype_vars and may
-      set tune/disables, so it must never touch the module-level passive
-      FlycDecl. Same contract as `_clone_spec` above.
-    * A description carries at most ONE `@ati.cite` and one `@ati.disable`;
-      the builder reads list-valued `cites`/`disables`. The wrap happens here,
-      at the boundary, rather than in FlycDecl -- a declaration that offered
-      `cites` would advertise a cardinality a user cannot actually write.
-
-    Returning a real KernelSpec (rather than a FlycDecl duck-typed into the
-    role) means the builder is handed exactly the type it was written against,
-    and every attribute it reads is declared in one place.
-    """
-    from aotriton.template_instantiation.specs.kernel import KernelSpec
-    return KernelSpec(
-        name=decl.name,           # the DESCRIPTION's identity, not the vendored symbol
-        kernel=decl.kernel,
-        params=decl.params,                 # immutable signature; sharing is fine
-        tensors=list(decl.tensors),
-        scalars=list(decl.scalars),
-        overrides=list(decl.overrides),
-        tune=decl.tune,
-        disables=[decl.disable] if decl.disable is not None else [],
-        dtype_vars=list(decl.dtype_vars),
-        cites=[decl.cite] if decl.cite is not None else [],
-    )
-
-
 def _build_kernels(compiled):
     """Resolve cites + build every kernel shell into a KernelDescription, in cite
     dependency order. Returns {def-name -> KernelDescription}."""
@@ -164,14 +105,14 @@ def _build_kernels(compiled):
         for sub in metro_shell.donor_order():
             if sub == _citer:
                 continue
-            donor_spec = specs.get(sub)        # the cite-resolved clone KernelSpec
+            donor_spec = specs.get(sub)        # the cite-resolved clone KernelDecl
             if donor_spec is not None:
                 donors.append(donor_spec)
         return donors
 
     for name in _kernel_build_order(compiled):
         shell = compiled.kernels[name]
-        spec = _clone_spec(shell.spec)
+        spec = shell.spec.clone()
         resolve_cites(spec, family=compiled.family, lookup=lookup,
                       metro_lookup=lambda f, o, m, _n=name: metro_lookup(f, o, m, _n))
         specs[name] = spec
@@ -179,7 +120,7 @@ def _build_kernels(compiled):
         kdesc = KernelDescription(bk, family=compiled.family,
                                   source_path=shell.source_path,
                                   triton_kernel_name=name)
-        kdesc.kernel_spec = spec       # the cite-resolved clone (for whole-metro cites)
+        kdesc.kernel_decl = spec       # the cite-resolved clone (for whole-metro cites)
         built[name] = kdesc
     return built
 
@@ -229,17 +170,17 @@ def _build_flycs(compiled, operators, built_kernels):
             f'flyc kernel {name!r} declares functionals_of={decl.functionals_of!r} '
             f'but no such operator was built in family {compiled.family!r}; '
             f'operators: {sorted(operators)}')
-        spec = _flyc_kernel_spec(decl)
+        spec = decl.clone()
         resolve_cites(spec, family=compiled.family, lookup=lookup,
                       inherit_tune=False)
         bk = build_kernel(spec)
         kdesc = KernelDescription(bk, family=compiled.family,
-                                  module_path=decl.module_path,
+                                  source_path=decl.source_path,
                                   functionals_source=op,
                                   tensors=spec.tensors, scalars=spec.scalars,
                                   builder_fn=decl.fn, hints_cls=decl.hints_cls)
         kdesc.desc_path = decl.desc_path
-        kdesc.kernel_spec = spec       # the cite-resolved clone
+        kdesc.kernel_decl = spec       # the cite-resolved clone
         out[name] = kdesc
     return out
 
