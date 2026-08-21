@@ -36,6 +36,36 @@ corrected.
 
 ---
 
+## Status (read this first)
+
+**Tasks 1-5 are implemented and shipped.** Sections 2-6 describe work that now
+exists; they are kept for the reasoning, not as instructions. Where they name an
+identifier, it has been updated to what the code actually calls it today.
+
+**Tasks 6-8 (sections 7-9) are the remaining work**, plus the Gates section.
+
+Renames that happened after most of this document was written, and that a reader
+cross-referencing older text will hit:
+
+| was | now |
+|---|---|
+| `class Schemaless` | `class Pon` (`include/aotriton/_internal/pon.h`) |
+| `render_schemaless()` | `render_pon()` (`python/utils/pon.py`) |
+| `parse_kv()` | `parse_pon()` |
+| `KernelSpec` | `KernelDecl` |
+| `MetroPlan` | `MetroSpec` |
+| `get_kernel_spec()` | `get_kernel_decl()` |
+| `kdesc.MODULE_PATH`, `FlycDecl.module_path` | `source_path` on both |
+| `_partition()` | `partition()` / `partition_<kind>()` returning a `SpecBundle` |
+| `linker._clone_spec()` | `KernelDecl.clone()` (reflective, on the record) |
+
+`Pon`'s accessors also changed shape: `get_int(key)` now returns
+`std::optional<int64_t>` and `get_int(key, dflt)` returns `int64_t`. Neither
+aborts, so the sketch in section 3 showing a fatal-on-missing accessor is stale
+in that respect.
+
+---
+
 ## 0. What Phase 1 already put in place
 
 Facts, not plans. Each was measured.
@@ -193,7 +223,7 @@ sentinel per field, and a sentinel that collides with a legal value is a silent 
 grid. **Verdict: avoidable under A by restricting the struct to the host subset, at the
 cost of the struct no longer being "the knobs".**
 
-**2. Schemaless because arches differ — real, structural, and the strongest objection.**
+**2. Schemaless storage because arches differ — real, structural, and the strongest objection.**
 `perf_cfields` is *one C struct type per `KernelDescription`*, shared across every arch in
 `autotune_table[arch][functional]`. Triton gets away with this because its psel schema is
 arch-*invariant* — the values differ per arch, the fields do not. Per-arch knob *sets*
@@ -255,7 +285,7 @@ So the typo exposure is real and simply accepted, bounded by two things: the han
 surface is six functions, and the accessor should **assert on a missing key**, naming it,
 rather than returning a zero that becomes a silently wrong grid.
 
-### The accessor: `class Schemaless`
+### The accessor: `class Pon` (was `class Schemaless`)
 
 | | path |
 |---|---|
@@ -279,9 +309,9 @@ namespace AOTRITON_NS {
 // A borrowed, read-only view over a ';'-separated 'k=v' string. Holds no
 // storage: the backing text is the compiled-in packed_string, which has static
 // storage duration. Never construct from a temporary std::string.
-class Schemaless {
+class Pon {
 public:
-  constexpr explicit Schemaless(std::string_view text = {}) noexcept : text_(text) {}
+  constexpr explicit Pon(std::string_view text = {}) noexcept : text_(text) {}
 
   bool contains(std::string_view key) const noexcept;
   std::optional<std::string_view> find(std::string_view key) const noexcept;
@@ -328,14 +358,14 @@ no allocation, C++20 is already the project standard. Rules:
 - **Duplicate keys: first wins**, documented. A generator that emits a duplicate has a bug;
   the accessor should be deterministic about it rather than order-dependent.
 
-**Construction site.** `lookup_optimal()` sets `perf_ = Schemaless(kernel_on_device->psel())`
+**Construction site.** `lookup_optimal()` sets `perf_ = Pon(kernel_on_device->psel())`
 once, after the image is chosen and before any launch — so `grid_calculator()` never
 parses on the launch path.
 
 **Build wiring — a real gotcha.** `v3src/CMakeLists.txt:450` uses
 `aux_source_directory(. CC_FILES)`, which is **not recursive**. A new `v3src/schemaless/`
 directory is silently ignored, and the failure surfaces as a link error for
-`Schemaless::get_int` much later. Add the directory explicitly alongside `CC_FILES` in
+`Pon::get_int` much later. Add the directory explicitly alongside `CC_FILES` in
 `add_library(aotriton_v2 ...)`.
 
 **Unit tests** (no GPU, so they belong in the ordinary suite): missing key; `None`;
@@ -364,7 +394,7 @@ Design A it would have been a second, hand-maintained subset.
   `copt_section` stays `''`
 - `codegen_kernel_image_perfs` emits an empty list and `codegen_perf_assignment` emits
   nothing — both reused unchanged, they simply have nothing to say
-- NEW runtime: `class Schemaless` (see above), plus a public `psel()` on `TritonKernel`
+- NEW runtime: `class Pon` (see above), plus a public `psel()` on `TritonKernel`
 - `grid_calculator()` reads `perf().get_int("block_m")`; no generated accessors
 - `sidecar` — the dict `perf_section` renders — is **not** produced here. It comes from
   Task 3's `FlycTuneCodeGenerator` calling the description function once per functional
@@ -399,7 +429,7 @@ This is what the earlier, wrong draft of this paragraph got backwards. It is quo
 full at the top of this task; the short version is that it treated the first element of
 the return as an already-built module (`built`) and told `root.py` to keep and thread it,
 which is exactly invoking the builder at generate time. The fix was not a new mechanism —
-Design B, `#P`, and `class Schemaless` below are all unchanged — it was moving one import
+Design B, `#P`, and `class Pon` below are all unchanged — it was moving one import
 from call level into the closure in `modules/flash/aot/flyc_attn_fwd.py`, so that a caller
 which does not invoke the callable has no path to flydsl at all — a structural guarantee
 about *this one import*, not a claim that the generator's environment is or must be
@@ -433,7 +463,7 @@ import that only resolves if `modules/flash/flyc/` (the vendored kernel director
 `sys.path`. `python/flyc_compile.py` already does exactly this for itself, from data it
 already has: `kernel_dir = str(Path(node.module_path).parent)`, then
 `sys.path.insert(0, kernel_dir)`. Task 3's generator does the same thing from the same
-kind of data — `kdesc.MODULE_PATH.parent`, a path the linker resolves at parse time with
+kind of data — `Path(kdesc.source_path).parent`, a path the linker resolves at parse time with
 no import involved (`decorators/flyc.py`'s `FlycKernelSpec`). No CMake variable is needed
 for this at all: unlike the FlyDSL source checkout (an external pin, hence
 `AOTRITON_FLYDSL_KERNEL_ROOT`), the vendored kernel directory is a path inside this repo
@@ -500,7 +530,7 @@ constructor:
 choices = {name: tc.triton_compile_signature for name, tc in f.resolved.items()}
 hints = kdesc.hints()                        # the @ati.flyc.hints dataclass's defaults;
                                               # no CLI override exists at generate time
-kernel_dir = str(kdesc.MODULE_PATH.parent)
+kernel_dir = str(Path(kdesc.source_path).parent)
 if kernel_dir not in sys.path:
     sys.path.insert(0, kernel_dir)           # same derivation flyc_compile.py uses on itself
 build, sidecar = kdesc.builder_fn(choices, hints)   # NEVER call build()
@@ -511,7 +541,7 @@ self._sig = KernelSignature(f, sidecar=sidecar)
 them, because they must resolve to the identical knob set: the whole point of Design B is
 that this generate-time `#P` string agrees with what `flyc_compile.py` resolves
 independently at build time, and Task 2's Gate checks exactly that agreement.
-`kdesc.MODULE_PATH` is already resolved by the linker at parse time
+`kdesc.source_path` is already resolved by the linker at parse time
 (`decorators/flyc.py`'s `FlycKernelSpec`), with no import involved, so finding it costs
 nothing and needs no new CMake variable.
 
@@ -628,7 +658,7 @@ namespace AOTRITON_NS::v3::flash {
 int32_t FlycAttnFwdContext::flyc_varlen_bits()   const;  // packs the varlen encoding
 int32_t FlycAttnFwdContext::flyc_batch_size()    const;  // params->Q->size(0)
 int32_t FlycAttnFwdContext::flyc_num_seqlens()   const;  // packed-sequence count
-float   FlycAttnFwdContext::flyc_idropout_p()    const;
+int32_t FlycAttnFwdContext::flyc_idropout_p()    const;  // NOT float -- see below
 float   FlycAttnFwdContext::flyc_dropout_scale() const;
 
 dim3    FlycAttnFwdContext::grid_calculator()    const;
@@ -637,7 +667,22 @@ dim3    FlycAttnFwdContext::grid_calculator()    const;
 
 Return types are **not** declared twice: each comes from the `@ati.scalar` type on the
 same description line (`'i32'` → `int32_t`), which is why the description does not repeat
-them.
+them. **Do not transcribe these by hand** — read them off
+`kdesc.iter_context_helpers()`, which yields `(name, ctype)` pairs and is what
+generates the header. Verified against the live description, the five are:
+
+```
+('flyc_varlen_bits', 'int32_t')   ('flyc_batch_size',    'int32_t')
+('flyc_num_seqlens', 'int32_t')   ('flyc_idropout_p',    'int32_t')
+('flyc_dropout_scale', 'float')
+```
+
+An earlier draft of this section declared `flyc_idropout_p` as `float`. It is
+`int32_t` — the kernel takes the dropout probability pre-quantised to an integer,
+with the float scale carried separately by `flyc_dropout_scale`. Getting this
+wrong is not a compile error in the description; it is a definition that does not
+match the generated declaration, so it surfaces as an unresolved symbol at link
+time with a mangled name that differs only in return type.
 
 Six functions is the whole hand-written surface. Two of them are one-liners
 (`flyc_batch_size`, `flyc_dropout_scale`); the description's own comment accepts that cost
@@ -656,8 +701,9 @@ test** — this is the single most likely source of a silent wrong answer in Pha
 |---|---|
 | NEW | `modules/flash/csrc/flyc_attn_fwd.cc` |
 
-No CMake change: `v3src/CMakeLists.txt` globs `modules/<family>/csrc/**.cc` with
-`CONFIGURE_DEPENDS`.
+No CMake change: `v3src/CMakeLists.txt:458-459` does
+`file(GLOB_RECURSE MODULE_CC_FILES CONFIGURE_DEPENDS "modules/*/csrc/*.cc")` — verified
+still present and still recursive.
 
 ---
 
@@ -665,16 +711,38 @@ No CMake change: `v3src/CMakeLists.txt` globs `modules/<family>/csrc/**.cc` with
 
 Two small parser changes plus a description.
 
-`_node_kind` (`parser.py:149`) gains a `FlycDecl` branch returning `'flyc'`, so a flyc def
-can appear as a backend ref. The existing `visit_flyc` was written for the
-`aot.flyc_kernels` list and takes a bare def; the backend path passes a `Backend` record
-(`b.index`, `b.obj`, `b.name`) and must return `(b.index, 'flyc', name)`. Keep both entry
-points during the transition: `functionals_of=` still resolves the functional space, and
-`flyc_kernels` can stay until the backend path is proven, then be deleted in one commit.
+> **API drift since this section was written.** The collector unification renamed
+> several things it names. `MetroPlan` is now `MetroSpec`; `KernelSpec` is now
+> `KernelDecl`; `get_kernel_spec()` is `get_kernel_decl()`; `spec.module_path` is
+> `spec.source_path`. Line numbers below are re-checked against the current tree.
 
-The metro plan must accept a flyc step. `_iter_plan_subkernels` resolves each call by name
-against `self.aot`, and `_record_kernel` assumes a Triton `KernelSpec` — that assumption
-needs relaxing so a step can be a flyc def.
+`_node_kind` (`parser.py:152`) dispatches on the `AtiNode` subclass and today
+handles `MetroSpec` → `'metro'`, `KernelDecl` → `'kernel'`, `AffineDecl` →
+`'affine'`. It gains a `FlycDecl` branch returning `'flyc'`, so a flyc def can
+appear as a backend ref.
+
+The existing `visit_flyc` (`parser.py:237`) was written for the
+`aot.flyc_kernels` list and takes a bare def — its own docstring says it is "not
+dispatched through `_node_kind` / backend_refs". The backend path passes a
+`Backend` record (`b.index`, `b.obj`, `b.name`) and must return
+`(b.index, 'flyc', name)`. Keep both entry points during the transition:
+`functionals_of=` still resolves the functional space, and `flyc_kernels` can
+stay until the backend path is proven, then be deleted in one commit.
+
+The metro plan must accept a flyc step. `_iter_plan_subkernels` (`parser.py:251`)
+resolves each call by name against `self.aot`, and `_record_kernel`
+(`parser.py:264`) assumes a Triton kernel — it calls `get_kernel_decl(def_obj)`
+and asserts non-None, then builds a `KernelShell(name, spec, spec.source_path)`.
+A flyc def has a `FlycDecl`, not a `KernelDecl`, so `get_kernel_decl` returns
+None and the assert fires. That branch needs relaxing so a step can be a flyc
+def recorded into `compiled.flycs` instead of `compiled.kernels`.
+
+**One more signature moved.** `linker._build_flycs` is now
+`_build_flycs(compiled, operators, built_kernels)` — the third argument is the
+already-built Triton kdesc dict, used as the `lookup` donor set for flyc's
+`@ati.cite`. A backend-driven flyc path must keep passing it, and must keep
+running AFTER `_build_kernels` and `_build_operators` for the same reason it
+does today.
 
 Then, in `modules/flash/aot/__init__.py`:
 
