@@ -219,3 +219,73 @@ explicitly on every re-sync — the AST order check is the cheap way.
    above.
 3. Re-run Gate 1 and Gate 3 from `PLAN-PHASE1.md`.
 4. Update the commit hash at the top of this file.
+
+## Open FlyDSL issues, verified against upstream
+
+Checked against `upstream/main` at `11c4174d`, **41 commits ahead of the vendored
+`9de9628a`**. All three are still present there; none is fixed by re-syncing.
+
+### 1. Every kernel is compiled twice, and the wrong copy is the one that runs
+
+Two independent code paths attach a `#rocdl.target` to the same `gpu.module`:
+
+| where | target attached |
+|---|---|
+| `jit_function.py:1495` `create_gpu_module("kernels", targets=backend.gpu_module_targets())` | `#rocdl.target<chip = "gfx1201">` — bare, all defaults |
+| `backends/rocm.py:93` `rocdl-attach-target{O=2 abi=600 chip=... wave64=false ...}` | `#rocdl.target<chip = "gfx1201", flags = {no_wave64}>` |
+
+`gpu-module-to-binary` then emits **one code object per attached target**, so
+every `gpu.binary` carries two objects for one kernel. Dumped from a real
+gfx1201 head-dim-48 compile:
+
+```
+object 0   #rocdl.target<chip = "gfx1201">
+object 1   #rocdl.target<chip = "gfx1201", flags = {no_wave64}>
+```
+
+**The second one never runs.** The `gpu.binary` op carries no offloading
+handler, so MLIR defaults to `#gpu.select_object`, and its specification
+(`mlir/Dialect/GPU/IR/CompilationAttrs.td:266`) is explicit:
+
+> The first object in a `gpu.binary` operation is selected if no target is
+> specified.
+
+So the object that is launched is the BARE one, and the object built with the
+backend's actual compile options — `O=2`, `abi=600`, `correct-sqrt`, `daz`,
+and `fast`/`unsafe-math` from `compile_hints` — is discarded.
+
+This is worse than the wasted link time it looks like. It is currently harmless
+only because the ROCDL defaults for gfx1201 already imply wave32 and the fp-math
+hints default off, so the two happen to agree semantically. A description
+setting `fast_fp_math` or `unsafe_fp_math` would have those options applied to
+object 1 alone and silently dropped from the shipped kernel.
+
+**How we found it.** `flyc_compile.py`'s `_extract_hsaco` asserts every
+`gpu.binary` object is byte-identical, which held for 284 of 288 gfx1201
+functionals and failed intermittently on head-dim 48. Investigating produced a
+second finding worth recording on its own: the two objects have identical wave
+size, register footprint (sgpr 104 / vgpr 121), LDS (6784) and instruction count
+(2217), differing only in VOPD packing, `s_delay_alu` hints and one
+`s_code_end` — and **neither target is stable across runs**, agreeing about half
+the time. So the assertion was inadvertently a determinism test for the AMDGPU
+backend, and head-dim 48 is a tile where that determinism does not hold.
+
+**Fix:** attach the target once. Either drop `targets=` at
+`create_gpu_module` and let the pass own it (preferred — the pass is the one
+carrying the real options), or drop the pass and pass the full target at
+creation. Either removes the duplicate object, halves link time for every
+kernel, and makes the compile options reach the kernel that runs.
+
+### 2. `flyc.compile()` ignores `COMPILE_ONLY`
+
+Its tail calls `_get_func_exe()` (`jit_function.py:1697`), which builds an
+ExecutionEngine and needs HIP, so the documented GPU-less compile mode is
+unusable through the public API. `JitFunction.__call__` early-returns correctly;
+`compile()` should too. Working around this is why `flyc_compile.py` invokes the
+`JitFunction` directly rather than calling `compile()`.
+
+### 3. A wrong `ROCM_PATH` surfaces only as `lld invocation failed`
+
+No lld output, no mention of the path. A pre-flight check for
+`<toolkit>/llvm/bin/ld.lld` with a real message would have saved the entire
+investigation recorded in `python/flyc_bootstrap.py`'s `resolve_rocm_path`.
