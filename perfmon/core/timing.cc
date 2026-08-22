@@ -3,6 +3,7 @@
 
 #include "timing.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -249,9 +250,30 @@ MeasurementRecord measure_launch(const pmon_family_vtable& vtable, void* ctx, hi
   wait_until_cool(thermal_threshold_c);
   pmon_thermal thermal = thermal_snapshot();
 
+  // PERFMON_TIMING_METHOD forces one method instead of "hipgraph_ev100,
+  // falling back to batched_ev if capture fails". This is a CALIBRATION
+  // hook, not a production knob: batched_ev is otherwise unreachable,
+  // because capture has never failed on any backend tried, so there would
+  // be no way to gather the cross-method data rev0 D6 implicitly depends
+  // on (its "never compare across timing_method" rule is only actionable
+  // if someone has measured how far apart the methods actually are).
+  //
+  // Unset -> the normal automatic behaviour. The chosen method is recorded
+  // in the returned record exactly as before, so forced runs stay
+  // distinguishable in the data from automatic ones.
+  const char* forced = std::getenv("PERFMON_TIMING_METHOD");
+  const std::string want = forced ? forced : "";
+  if (!want.empty() && want != "hipgraph_ev100" && want != "batched_ev") {
+    throw std::runtime_error("timing: PERFMON_TIMING_METHOD must be "
+                              "'hipgraph_ev100' or 'batched_ev', got '" + want + "'");
+  }
+
   std::vector<double> samples_ms;
   std::string method;
-  if (try_hipgraph_ev100(vtable, ctx, stream, &samples_ms)) {
+  if (want == "batched_ev") {
+    run_batched_ev(vtable, ctx, stream, &samples_ms);
+    method = "batched_ev";
+  } else if (try_hipgraph_ev100(vtable, ctx, stream, &samples_ms)) {
     method = "hipgraph_ev100";
   } else {
     run_batched_ev(vtable, ctx, stream, &samples_ms);
