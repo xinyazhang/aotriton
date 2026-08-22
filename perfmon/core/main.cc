@@ -16,13 +16,13 @@
 // (the task that actually needs a working runner binary), with every
 // judgment call disclosed here and in entry_codec.h/.cc.
 //
-// UNVERIFIED IN THIS ENVIRONMENT: no ROCm/hipcc/HIP, no GPU on this
-// machine (see T05/T06/etc.'s commit messages for how that was confirmed).
-// This file has never been compiled. Its family-neutral half (PON parsing,
-// entry_codec.h/.cc) *is* compiled and unit-tested with g++ -- see that
-// file's own commit for the verified assertions -- but this file itself
-// touches perfmon_abi.h (HIP) and can only be syntax/compile-checked with
-// hipcc.
+// Verified on gfx942 / ROCm 7.14 by T14: `enumerate`, `measure` (attn_fwd
+// backends 0-1, attn_bwd backends 0-2), `platform` and `exit` all drive
+// correctly over stdin, and an out-of-range backend index produces a
+// non-`OK` line without crashing the process.
+//
+// Still unexercised here: the GQA `N_HEADS=(H, G)` wire form that rejoin()
+// below exists to handle -- every T14 shape used a scalar `N_HEADS`.
 //
 // Architecture: statically links exactly one family's vtable via
 // `pmon_family_entry()` (perfmon_abi.h) -- no dlopen (rev0 D4) -- and is

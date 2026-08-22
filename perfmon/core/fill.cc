@@ -4,7 +4,8 @@
 // perfmon-exec0.md T09 / rev0 §5.3.
 //
 // ASSUMPTIONS ABOUT THE HIP API, FLAGGED FOR HUMAN REVIEW ON A ROCM
-// MACHINE (this file has never been compiled -- no ROCm/hipcc here):
+// MACHINE (all of which held for hipcc / ROCm 7.14 on gfx942, where this
+// file now compiles clean and runs under T14):
 //   * <hip/hip_fp16.h> provides __half / __float2half / __half2float, and
 //     <hip/hip_bfloat16.h> provides a `hip_bfloat16` type constructible
 //     from and convertible to float (`hip_bfloat16(float)`,

@@ -3,11 +3,14 @@
 //
 // perfmon-exec0.md T09: deterministic on-device input fill (rev0 §5.3).
 //
-// UNVERIFIED IN THIS ENVIRONMENT: this machine has no ROCm/hipcc/HIP
-// headers and no GPU (see the T05/T06 commit messages for how that was
-// confirmed). fill.h/fill.cc have never been compiled. Written strictly to
-// rev0 §5.3 and this task's spec; see fill.cc's top-of-file comment for the
-// specific HIP/hip_bfloat16 API surface this assumes.
+// Compiled with hipcc for gfx942 (ROCm 7.14) and exercised end to end by
+// T14, which measured attn_fwd and attn_bwd on every backend using buffers
+// filled by this code. The dedicated debug guard pass described in rev0
+// §5.3 (download the filled buffer, assert every element finite and normal)
+// has NOT been run in isolation; T14 only establishes that the fill
+// produces inputs the kernels accept and that repeated runs agree.
+// See fill.cc's top-of-file comment for the HIP/hip_bfloat16 API surface
+// this assumes.
 
 #ifndef PERFMON_CORE_FILL_H
 #define PERFMON_CORE_FILL_H

@@ -33,11 +33,18 @@
 #   bin/runner            the executable T13's own Verify step checks
 #   lib/libperfmon_flash.so
 #
-# UNVERIFIED IN THIS ENVIRONMENT: this machine has no ROCm/hipcc/HIP, no
-# GPU, no `cmake`+hip toolchain, no `gh` CLI, no network access to fetch
-# anything (see perfmon/core/CMakeLists.txt's/T05's commit messages for how
-# the missing-ROCm fact was confirmed). This script has never been run.
-# Verified here only via `bash -n` (syntax check) and manual re-reading
+# RUN AND VERIFIED for `head 7.14.0 gfx942` on an 8x gfx942 node with
+# theRock ROCm 7.14: T13's Verify step passes (see the runner CMakeLists).
+# The <tag> != head path is still UNRUN, as is the `gh release download`
+# images fetch in step 3 -- disclosure #5 below stands unchanged.
+#
+# Disclosure #4 (below) was CONFIRMED in practice: the shim build produces
+# no lib/aotriton.images/ even for `head`, so T14 could only run after a
+# separate full (non-shim) gfx942 build's images were copied in by hand:
+#   .ci/build-test.sh gfx942 <prebuilt-triton-wheel>
+#   cp -r build-0.14-test-gfx942/install_dir/lib/aotriton.images \
+#         perfmon/subjects/aotriton-head+rocm7.14.0/aotriton/lib/
+# Originally verified only via `bash -n` (syntax check) and manual re-reading
 # against .ci/build-shim.sh, .ci/common-build.sh, v3src/CMakeLists.txt's
 # install() rules, and .ci/runc-manylinux-build-tar.sh's tarball-naming
 # convention (all read in full while writing this). See
