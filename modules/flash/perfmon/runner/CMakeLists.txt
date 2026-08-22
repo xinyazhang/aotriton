@@ -154,21 +154,16 @@ endif()
 list(APPEND CMAKE_PREFIX_PATH "${_perfmon_rocm_path}/lib/cmake" "${_perfmon_rocm_path}")
 find_package(hip REQUIRED)
 
-# ROCm's own runtime lib dirs, for the installed RPATH below. `hip::host`
+# ROCm's RUNTIME lib dirs, for the installed RPATH below. `hip::host`
 # supplies these as BUILD-tree link paths only, and BUILD_WITH_INSTALL_RPATH
 # (set below) deliberately discards those -- so without naming them here the
 # installed `bin/runner` cannot find `libamdhip64.so`, which is precisely
 # what T13's own Verify step ("resolves with NO LD_LIBRARY_PATH set")
-# checks. `rocm_sysdeps`/`host-math` are theRock's private renamed copies of
-# liblzma/openblas etc.; .ci/common-vars.sh's own add_rocm_sdk_ldconfig()
-# adds exactly these two to LD_LIBRARY_PATH for the same reason, and putting
-# them on the RPATH is that workaround made permanent for these binaries.
-set(_perfmon_rocm_rpath "${_perfmon_rocm_path}/lib")
-foreach(_sysdep rocm_sysdeps host-math)
-  if(IS_DIRECTORY "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
-    list(APPEND _perfmon_rocm_rpath "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
-  endif()
-endforeach()
+# checks. Crucially these are NOT ${ROCM_PATH}/lib on theRock, since
+# ROCM_PATH is a build-time package that a measurement node need not have
+# installed at all; see PerfmonRocmRuntime.cmake.
+include("${_perfmon_core_src_dir}/PerfmonRocmRuntime.cmake")
+perfmon_rocm_runtime_dirs(_perfmon_rocm_rpath "${_perfmon_rocm_path}")
 
 # Library name is deliberately just "perfmon_flash" (-> libperfmon_flash.so),
 # not something trying to bake "@<subject>" into the filename: this whole

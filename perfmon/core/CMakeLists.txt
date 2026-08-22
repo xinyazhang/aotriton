@@ -49,19 +49,13 @@ list(APPEND CMAKE_PREFIX_PATH "${_perfmon_rocm_path}/lib/cmake" "${_perfmon_rocm
 
 find_package(hip REQUIRED)
 
-# ROCm's own runtime lib dirs, baked into this library's installed RPATH so
-# it resolves libamdhip64.so with NO LD_LIBRARY_PATH -- the same requirement
+# ROCm's RUNTIME lib dirs, baked into this library's installed RPATH so it
+# resolves libamdhip64.so with NO LD_LIBRARY_PATH -- the same requirement
 # T13's Verify step places on `bin/runner`, applied one level down since
-# `bin/runner` loads this library. `rocm_sysdeps`/`host-math` are theRock's
-# private renamed copies of liblzma/openblas etc., the two directories
-# .ci/common-vars.sh's own add_rocm_sdk_ldconfig() adds to LD_LIBRARY_PATH
-# for exactly this reason.
-set(_perfmon_rocm_rpath "${_perfmon_rocm_path}/lib")
-foreach(_sysdep rocm_sysdeps host-math)
-  if(IS_DIRECTORY "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
-    list(APPEND _perfmon_rocm_rpath "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
-  endif()
-endforeach()
+# `bin/runner` loads this library. These are NOT ${ROCM_PATH}/lib on
+# theRock; see PerfmonRocmRuntime.cmake for why.
+include("${CMAKE_CURRENT_SOURCE_DIR}/PerfmonRocmRuntime.cmake")
+perfmon_rocm_runtime_dirs(_perfmon_rocm_rpath "${_perfmon_rocm_path}")
 
 if(PERFMON_ENABLE_AMDSMI)
   set(_perfmon_thermal_src thermal_amdsmi.cc)
