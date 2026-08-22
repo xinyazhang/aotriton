@@ -18,12 +18,12 @@
 # `-DCMAKE_CXX_COMPILER=hipcc`) so that fill.cc's __global__ kernels
 # compile, exactly like the rest of this codebase already expects.
 #
-# UNVERIFIED IN THIS ENVIRONMENT: no ROCm/hipcc/HIP install exists on this
-# machine (see perfmon/core/probe_graph_timing.cc's T05 commit message for
-# how that was confirmed), so this file has never been configured, let
-# alone built. Written strictly to T11's spec; see its own Verify step
-# (`ldd` on the built library shows no `libaotriton*`) for what a human
-# must still check on a real machine.
+# Configured and built with hipcc against theRock ROCm 7.14 (gfx942), and
+# T11's own Verify step passes: `ldd` on the installed libperfmon_core.so
+# shows no `libaotriton*` and nothing unresolved, with no LD_LIBRARY_PATH
+# set. BOTH values of PERFMON_ENABLE_AMDSMI build here -- see
+# thermal_amdsmi.cc's header -- and the ON/OFF difference is exactly the
+# one T11 specifies: thermal source and the amd_smi link, nothing else.
 
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(PerfmonCore CXX)
@@ -49,6 +49,20 @@ list(APPEND CMAKE_PREFIX_PATH "${_perfmon_rocm_path}/lib/cmake" "${_perfmon_rocm
 
 find_package(hip REQUIRED)
 
+# ROCm's own runtime lib dirs, baked into this library's installed RPATH so
+# it resolves libamdhip64.so with NO LD_LIBRARY_PATH -- the same requirement
+# T13's Verify step places on `bin/runner`, applied one level down since
+# `bin/runner` loads this library. `rocm_sysdeps`/`host-math` are theRock's
+# private renamed copies of liblzma/openblas etc., the two directories
+# .ci/common-vars.sh's own add_rocm_sdk_ldconfig() adds to LD_LIBRARY_PATH
+# for exactly this reason.
+set(_perfmon_rocm_rpath "${_perfmon_rocm_path}/lib")
+foreach(_sysdep rocm_sysdeps host-math)
+  if(IS_DIRECTORY "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
+    list(APPEND _perfmon_rocm_rpath "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
+  endif()
+endforeach()
+
 if(PERFMON_ENABLE_AMDSMI)
   set(_perfmon_thermal_src thermal_amdsmi.cc)
 else()
@@ -65,6 +79,10 @@ add_library(perfmon_core SHARED
 
 target_include_directories(perfmon_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(perfmon_core PUBLIC hip::host)
+
+set_target_properties(perfmon_core PROPERTIES
+  BUILD_WITH_INSTALL_RPATH TRUE
+  INSTALL_RPATH "${_perfmon_rocm_rpath}")
 
 if(PERFMON_ENABLE_AMDSMI)
   # Deliberately NOT a soft find_package()/find_library() with a friendly

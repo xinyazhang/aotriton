@@ -7,12 +7,10 @@
 # build_subject.sh, unlike perfmon/core/CMakeLists.txt (T11), which is built
 # once per ROCm and reused unchanged across every subject in that column.
 #
-# UNVERIFIED IN THIS ENVIRONMENT: no ROCm/hipcc/HIP/AOTriton build exists on
-# this machine (see T05's/T11's commit messages for how that was confirmed;
-# this project has never been configured, let alone built). See
-# adapter_v3.cc's own top-of-file comment for the same disclosure on the
-# source side, and perfmon-handoff0.md for the exact commands a human must
-# run on a ROCm+GPU machine to actually verify it.
+# Configured and built for subject `aotriton-head+rocm7.14.0` on gfx942, via
+# perfmon/build_subject.sh. T13's Verify step passes: `ldd bin/runner` shows
+# exactly one libaotriton, resolving under perfmon/subjects/<id>/, with NO
+# LD_LIBRARY_PATH set, and `runner <<< "exit"` exits 0.
 #
 # --- AOTRITON_ROOT (T12 spec, verbatim) -----------------------------------
 # "CMake takes AOTRITON_ROOT and compiles against that root's include/,
@@ -156,6 +154,22 @@ endif()
 list(APPEND CMAKE_PREFIX_PATH "${_perfmon_rocm_path}/lib/cmake" "${_perfmon_rocm_path}")
 find_package(hip REQUIRED)
 
+# ROCm's own runtime lib dirs, for the installed RPATH below. `hip::host`
+# supplies these as BUILD-tree link paths only, and BUILD_WITH_INSTALL_RPATH
+# (set below) deliberately discards those -- so without naming them here the
+# installed `bin/runner` cannot find `libamdhip64.so`, which is precisely
+# what T13's own Verify step ("resolves with NO LD_LIBRARY_PATH set")
+# checks. `rocm_sysdeps`/`host-math` are theRock's private renamed copies of
+# liblzma/openblas etc.; .ci/common-vars.sh's own add_rocm_sdk_ldconfig()
+# adds exactly these two to LD_LIBRARY_PATH for the same reason, and putting
+# them on the RPATH is that workaround made permanent for these binaries.
+set(_perfmon_rocm_rpath "${_perfmon_rocm_path}/lib")
+foreach(_sysdep rocm_sysdeps host-math)
+  if(IS_DIRECTORY "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
+    list(APPEND _perfmon_rocm_rpath "${_perfmon_rocm_path}/lib/${_sysdep}/lib")
+  endif()
+endforeach()
+
 # Library name is deliberately just "perfmon_flash" (-> libperfmon_flash.so),
 # not something trying to bake "@<subject>" into the filename: this whole
 # CMake project is reconfigured and rebuilt fresh per subject (see this
@@ -206,7 +220,7 @@ get_filename_component(_perfmon_core_libdir "${_perfmon_core_lib}" DIRECTORY)
 
 set_target_properties(perfmon_flash PROPERTIES
   BUILD_WITH_INSTALL_RPATH TRUE
-  INSTALL_RPATH "${_perfmon_aotriton_libdir};${_perfmon_core_libdir}")
+  INSTALL_RPATH "${_perfmon_aotriton_libdir};${_perfmon_core_libdir};${_perfmon_rocm_rpath}")
 
 # --- `runner` executable (T13 gap-fill) -----------------------------------
 # Links this project's own just-built `perfmon_flash` (which resolves
@@ -238,7 +252,7 @@ target_link_libraries(runner PRIVATE
 # siblings of this subject's own install prefix.
 set_target_properties(runner PROPERTIES
   BUILD_WITH_INSTALL_RPATH TRUE
-  INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR};${_perfmon_aotriton_libdir};${_perfmon_core_libdir}")
+  INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR};${_perfmon_aotriton_libdir};${_perfmon_core_libdir};${_perfmon_rocm_rpath}")
 
 install(TARGETS perfmon_flash
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
