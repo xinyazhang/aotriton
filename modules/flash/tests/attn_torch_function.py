@@ -56,6 +56,14 @@ else:
         return torch.empty_like(L)
 
 FORCE_FWD_BACKEND = V3_API and (os.getenv('FWD_IMPL', default=None) is not None)
+# True when the forward backend is pinned to flyc. Compared against the
+# generated constant rather than a literal 2 -- that is what
+# <aotriton/flash/backends.h> and its binding exist for, and this index already
+# moved once when flyc was added.
+FORCE_FWD_FLYC = False
+if FORCE_FWD_BACKEND:
+    from pyaotriton.v3.flash import OpAttnFwdBackend
+    FORCE_FWD_FLYC = (FWD_IMPL == OpAttnFwdBackend.kMetro_Flyc)
 # When FORCE_BWD_BACKEND is True, backward_v3 sets extargs.force_backend_index = BWD_IMPL
 FORCE_BWD_BACKEND = V3_API and (os.getenv('BWD_IMPL', default=None) is not None)
 
