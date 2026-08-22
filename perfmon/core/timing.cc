@@ -97,8 +97,8 @@ struct GraphScratch {
 // into the sample.
 //
 // Returns false (leaving `out_ms` untouched) if hipGraph capture itself
-// fails -- the caller falls back to batched_ev in that case, per T10's
-// spec ("If capture fails for a given backend, fall back to batched_ev for
+// fails -- the caller falls back to stream_ev in that case, per T10's
+// spec ("If capture fails for a given backend, fall back to stream_ev for
 // that backend and record which was used. Never drop the measurement.").
 // Any OTHER HIP error (instantiate/launch/event-read, all of which are
 // unexpected once capture itself succeeded) is a hard failure via
@@ -137,7 +137,7 @@ bool try_hipgraph_ev100(const pmon_family_vtable& vtable, void* ctx, hipStream_t
     if (rec_err != hipSuccess) break;
   }
   // End the capture unconditionally, even after a failure above, so the
-  // stream is never left capturing for the batched_ev fallback.
+  // stream is never left capturing for the stream_ev fallback.
   hipError_t end_err = hipStreamEndCapture(stream, &scratch.graph);
   check_launch(launch_rc, "vtable.launch (timed-loop capture)");
   check(rec_err, "capturing the timed loop");
@@ -197,45 +197,77 @@ bool try_hipgraph_ev100(const pmon_family_vtable& vtable, void* ctx, hipStream_t
   return true;
 }
 
-// Fallback method (rev0 §5.1 `batched_ev`): kBatchedEvBatches batches,
-// each running kTimingIters conventionally-issued (non-graph) iterations
-// of [L2-flush memset, family launch] bracketed by one event pair per
-// batch; the batch's per-iteration mean (elapsed_ms / kTimingIters) is the
-// one sample that batch contributes. `out_ms` ends up holding
-// kBatchedEvBatches values, not kTimingIters*kBatchedEvBatches -- matching
-// T10's "per-batch mean as the sample" wording exactly.
-void run_batched_ev(const pmon_family_vtable& vtable, void* ctx, hipStream_t stream,
-                     std::vector<double>* out_ms) {
+// Fallback method (`stream_ev`), for a backend that refuses stream
+// capture: the SAME kTimingIters iterations of
+// [L2-flush memset, record start, family launch, record end], issued
+// directly on the stream instead of captured into a graph. Zero graph
+// dependency, which is the whole point of having it (rev0 §5.1).
+//
+// rev0 §5.1 specifies this fallback as "K=20 batches x N=100 back-to-back
+// calls, two events per batch, per-batch mean as the sample", and it was
+// implemented that way until it was first actually executed. With only two
+// events per batch the 1 GiB L2 flush is unavoidably INSIDE the timed
+// window, so every sample was kernel + flush. Measured on gfx942 against
+// the same shapes:
+//
+//   seqlen  reported  true kernel   error      (flush measured at 0.2164 ms)
+//      128   0.23364      0.02253   +937%
+//      512   0.25475      0.04435   +474%
+//     4096   0.62049      0.39040    +59%
+//
+// i.e. a near-constant +0.21 ms, which is unusable at small shapes and
+// wrong at every shape. Per-iteration events fix it because the flush then
+// sits before the start record, exactly as in hipgraph_ev100 and in
+// python/tune/gpu_utils.py:do_bench.
+//
+// The batch structure bought nothing once that was clear: it existed to
+// amortise event overhead, but 2N per-iteration events cost nothing
+// measurable here (do_bench uses exactly that shape), and per-batch means
+// discard the per-iteration distribution that stats.h reports p05/p95 over.
+// So the fallback is now N=100 samples, the same count and shape
+// hipgraph_ev100 produces -- the two methods differ only in whether the
+// work is dispatched from a graph or from the stream.
+//
+// RENAMED from "batched_ev" deliberately: there are no batches any more,
+// and `timing_method` is a published field that rev0 D6 keys its
+// "never compare across methods" rule on. A name that lies about the
+// method is worse than a name that differs from the design doc.
+void run_stream_ev(const pmon_family_vtable& vtable, void* ctx, hipStream_t stream,
+                    std::vector<double>* out_ms) {
   void* flush_buf = flush_buffer();
 
-  hipEvent_t start_ev, end_ev;
-  check(hipEventCreate(&start_ev), "hipEventCreate");
-  check(hipEventCreate(&end_ev), "hipEventCreate");
-
-  // Warm up once, conventionally, before the first timed batch.
+  std::vector<hipEvent_t> start_ev(kTimingIters, nullptr), end_ev(kTimingIters, nullptr);
   for (int i = 0; i < kTimingIters; ++i) {
+    check(hipEventCreateWithFlags(&start_ev[i], hipEventDefault), "hipEventCreateWithFlags");
+    check(hipEventCreateWithFlags(&end_ev[i], hipEventDefault), "hipEventCreateWithFlags");
+  }
+
+  // Warm up before the timed pass, matching hipgraph_ev100's graph warmup.
+  for (int i = 0; i < kWarmupIters; ++i) {
     check(hipMemsetAsync(flush_buf, 0, kL2FlushBytes, stream), "hipMemsetAsync (L2 flush)");
     check_launch(vtable.launch(ctx, stream), "vtable.launch (warmup)");
   }
   check(hipStreamSynchronize(stream), "hipStreamSynchronize (warmup)");
 
-  out_ms->resize(kBatchedEvBatches);
-  for (int b = 0; b < kBatchedEvBatches; ++b) {
-    check(hipEventRecord(start_ev, stream), "hipEventRecord (batch start)");
-    for (int i = 0; i < kTimingIters; ++i) {
-      check(hipMemsetAsync(flush_buf, 0, kL2FlushBytes, stream), "hipMemsetAsync (L2 flush)");
-      check_launch(vtable.launch(ctx, stream), "vtable.launch (batched)");
-    }
-    check(hipEventRecord(end_ev, stream), "hipEventRecord (batch end)");
-    check(hipStreamSynchronize(stream), "hipStreamSynchronize (batch)");
+  for (int i = 0; i < kTimingIters; ++i) {
+    check(hipMemsetAsync(flush_buf, 0, kL2FlushBytes, stream), "hipMemsetAsync (L2 flush)");
+    check(hipEventRecord(start_ev[i], stream), "hipEventRecord (start)");
+    check_launch(vtable.launch(ctx, stream), "vtable.launch (stream)");
+    check(hipEventRecord(end_ev[i], stream), "hipEventRecord (end)");
+  }
+  check(hipStreamSynchronize(stream), "hipStreamSynchronize (timed)");
 
-    float elapsed_ms = 0.0f;
-    check(hipEventElapsedTime(&elapsed_ms, start_ev, end_ev), "hipEventElapsedTime (batch)");
-    (*out_ms)[b] = static_cast<double>(elapsed_ms) / static_cast<double>(kTimingIters);
+  out_ms->resize(kTimingIters);
+  for (int i = 0; i < kTimingIters; ++i) {
+    float ms = 0.0f;
+    check(hipEventElapsedTime(&ms, start_ev[i], end_ev[i]), "hipEventElapsedTime");
+    (*out_ms)[i] = static_cast<double>(ms);
   }
 
-  check(hipEventDestroy(start_ev), "hipEventDestroy");
-  check(hipEventDestroy(end_ev), "hipEventDestroy");
+  for (int i = 0; i < kTimingIters; ++i) {
+    check(hipEventDestroy(start_ev[i]), "hipEventDestroy");
+    check(hipEventDestroy(end_ev[i]), "hipEventDestroy");
+  }
 }
 
 }  // namespace
@@ -250,8 +282,8 @@ MeasurementRecord measure_launch(const pmon_family_vtable& vtable, void* ctx, hi
   pmon_thermal thermal = thermal_snapshot();
 
   // PERFMON_TIMING_METHOD forces one method instead of "hipgraph_ev100,
-  // falling back to batched_ev if capture fails". This is a CALIBRATION
-  // hook, not a production knob: batched_ev is otherwise unreachable,
+  // falling back to stream_ev if capture fails". This is a CALIBRATION
+  // hook, not a production knob: stream_ev is otherwise unreachable,
   // because capture has never failed on any backend tried, so there would
   // be no way to gather the cross-method data rev0 D6 implicitly depends
   // on (its "never compare across timing_method" rule is only actionable
@@ -262,21 +294,21 @@ MeasurementRecord measure_launch(const pmon_family_vtable& vtable, void* ctx, hi
   // distinguishable in the data from automatic ones.
   const char* forced = std::getenv("PERFMON_TIMING_METHOD");
   const std::string want = forced ? forced : "";
-  if (!want.empty() && want != "hipgraph_ev100" && want != "batched_ev") {
+  if (!want.empty() && want != "hipgraph_ev100" && want != "stream_ev") {
     throw std::runtime_error("timing: PERFMON_TIMING_METHOD must be "
-                              "'hipgraph_ev100' or 'batched_ev', got '" + want + "'");
+                              "'hipgraph_ev100' or 'stream_ev', got '" + want + "'");
   }
 
   std::vector<double> samples_ms;
   std::string method;
-  if (want == "batched_ev") {
-    run_batched_ev(vtable, ctx, stream, &samples_ms);
-    method = "batched_ev";
+  if (want == "stream_ev") {
+    run_stream_ev(vtable, ctx, stream, &samples_ms);
+    method = "stream_ev";
   } else if (try_hipgraph_ev100(vtable, ctx, stream, &samples_ms)) {
     method = "hipgraph_ev100";
   } else {
-    run_batched_ev(vtable, ctx, stream, &samples_ms);
-    method = "batched_ev";
+    run_stream_ev(vtable, ctx, stream, &samples_ms);
+    method = "stream_ev";
   }
 
   MeasurementRecord record;

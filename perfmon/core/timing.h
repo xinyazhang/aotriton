@@ -19,8 +19,9 @@
 // methodology rev0 §5.1 specifies is unchanged.
 //
 // Verified end to end on gfx942 via T14 (attn_fwd and attn_bwd, every
-// backend). The batched_ev fallback below has NOT been exercised on real
-// hardware -- capture has not failed on any configuration tried so far.
+// backend). The stream_ev fallback below is exercised only via
+// PERFMON_TIMING_METHOD -- capture has not failed on any configuration
+// tried, so it has never been reached automatically.
 
 #ifndef PERFMON_CORE_TIMING_H
 #define PERFMON_CORE_TIMING_H
@@ -34,14 +35,12 @@
 
 namespace perfmon {
 
-// N in rev0 §5.1: iterations captured/timed per hipgraph_ev100 sample, and
-// per batch in batched_ev.
+// N in rev0 §5.1: timed iterations, and hence samples, in BOTH methods.
 constexpr int kTimingIters = 100;
 
-// K in rev0 §5.1's batched_ev fallback: number of batches, each yielding
-// one per-batch-mean sample. compute_stats() then runs over these K means,
-// not over the underlying K*N individual iterations.
-constexpr int kBatchedEvBatches = 20;
+// Untimed warmup iterations before the timed pass in the stream_ev
+// fallback, mirroring the graph warmup hipgraph_ev100 does.
+constexpr int kWarmupIters = 10;
 
 // 1 GiB L2-flush buffer, matching triton.testing.do_bench and
 // python/tune/gpu_utils.py:210. Mandatory between EVERY timed iteration,
@@ -57,7 +56,7 @@ constexpr double kDefaultThermalThresholdC = 85.0;
 // One measurement's result, including which timing method actually
 // produced it (T10: "The returned record always carries `timing_method`").
 struct MeasurementRecord {
-  std::string timing_method;  // "hipgraph_ev100" or "batched_ev"
+  std::string timing_method;  // "hipgraph_ev100" or "stream_ev"
   bool l2_flush = true;       // always true -- see kL2FlushBytes above
   Stats stats;                // n/mean/median/stddev/min/p05/p95 (stats.h)
   pmon_thermal thermal;       // thermal.valid == false -> caller must
@@ -80,10 +79,16 @@ struct MeasurementRecord {
 // instantiate, warm up, launch once, read back all per-iteration
 // hipEventElapsedTime values) first. If `hipStreamBeginCapture`/
 // `hipStreamEndCapture` fails for this backend -- rev0 §5.1's documented
-// possibility -- falls back to batched_ev (kBatchedEvBatches batches of
-// kTimingIters conventionally-timed iterations each, per-batch mean as one
-// sample) for THIS CALL ONLY; the measurement is never dropped, only its
-// `timing_method` differs.
+// possibility -- falls back to stream_ev for THIS CALL ONLY; the
+// measurement is never dropped, only its `timing_method` differs.
+//
+// Both methods now time the identical thing: kTimingIters iterations of
+// [1 GiB L2 flush, launch], one independent event pair per iteration, with
+// the flush OUTSIDE the pair. They differ only in whether the work is
+// dispatched from a graph or straight from the stream, which on gfx942 is
+// worth a couple of percent. rev0 D6's "never compare across
+// timing_method" still applies, but the gap it guards against is now small
+// rather than structural.
 //
 // `seed` is the caller-derived rev0 §5.3 seed (hash(functional_pon,
 // shape_pon, subject, iface)) already used to fill `ctx`'s input buffers;
