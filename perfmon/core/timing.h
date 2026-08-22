@@ -19,9 +19,19 @@
 // methodology rev0 §5.1 specifies is unchanged.
 //
 // Verified end to end on gfx942 via T14 (attn_fwd and attn_bwd, every
-// backend). The stream_ev fallback below is exercised only via
-// PERFMON_TIMING_METHOD -- capture has not failed on any configuration
-// tried, so it has never been reached automatically.
+// backend).
+//
+// hipgraph_ev100 is expected to work UNIFORMLY -- it is not a fast path
+// with a routine fallback. stream_ev existing at all is a hedge against
+// rev0 §5.1's original uncertainty about whether in-graph event timing was
+// viable, and that uncertainty is now resolved. So stream_ev never being
+// reached automatically is the design working, not a coverage gap: it is
+// exercised deliberately, via PERFMON_TIMING_METHOD, as the independent
+// cross-check that hipgraph_ev100's numbers are right.
+//
+// A capture failure would therefore be an anomaly, not a routine
+// condition. See measure_launch's note on why the automatic fallback is
+// still wired up despite that.
 
 #ifndef PERFMON_CORE_TIMING_H
 #define PERFMON_CORE_TIMING_H

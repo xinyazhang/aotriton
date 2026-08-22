@@ -282,16 +282,20 @@ MeasurementRecord measure_launch(const pmon_family_vtable& vtable, void* ctx, hi
   pmon_thermal thermal = thermal_snapshot();
 
   // PERFMON_TIMING_METHOD forces one method instead of "hipgraph_ev100,
-  // falling back to stream_ev if capture fails". This is a CALIBRATION
-  // hook, not a production knob: stream_ev is otherwise unreachable,
-  // because capture has never failed on any backend tried, so there would
-  // be no way to gather the cross-method data rev0 D6 implicitly depends
-  // on (its "never compare across timing_method" rule is only actionable
-  // if someone has measured how far apart the methods actually are).
+  // falling back to stream_ev if capture fails".
+  //
+  // This is a CALIBRATION hook, not a production knob, and it is the
+  // INTENDED way stream_ev gets run. hipgraph_ev100 is expected to work
+  // uniformly, so the automatic fallback should never fire; forcing
+  // stream_ev is how the two methods get compared against each other and
+  // against gpu_utils.py:do_bench. rev0 D6's "never compare across
+  // timing_method" rule is only actionable once someone has measured how
+  // far apart the methods actually are -- currently a couple of percent.
   //
   // Unset -> the normal automatic behaviour. The chosen method is recorded
-  // in the returned record exactly as before, so forced runs stay
-  // distinguishable in the data from automatic ones.
+  // in the returned record either way, so a forced run and an (unexpected)
+  // automatic fallback are not distinguishable from the record alone --
+  // see the fallback's own comment below.
   const char* forced = std::getenv("PERFMON_TIMING_METHOD");
   const std::string want = forced ? forced : "";
   if (!want.empty() && want != "hipgraph_ev100" && want != "stream_ev") {
@@ -307,6 +311,19 @@ MeasurementRecord measure_launch(const pmon_family_vtable& vtable, void* ctx, hi
   } else if (try_hipgraph_ev100(vtable, ctx, stream, &samples_ms)) {
     method = "hipgraph_ev100";
   } else {
+    // UNEXPECTED. hipgraph_ev100 works uniformly across every backend
+    // tried, so reaching here means stream capture was refused -- an
+    // anomaly worth investigating, not a routine slower path.
+    //
+    // T10's spec is explicit that the measurement must not be dropped
+    // ("fall back ... and record which was used. Never drop the
+    // measurement."), so it is still taken. But the ONLY trace of the
+    // switch is `timing_method` in the record, which means a silently
+    // method-switched row can sit in published data looking like any
+    // other -- the same shape of silent degradation rev0 §5.2 refuses to
+    // allow for the thermal gate. Whoever writes T27/T28 must therefore
+    // treat a stream_ev row from an automatic fallback as a finding, not
+    // merely as a row that cannot be diffed against hipgraph_ev100.
     run_stream_ev(vtable, ctx, stream, &samples_ms);
     method = "stream_ev";
   }
