@@ -5,18 +5,18 @@
 //
 // T05's hardware question is ANSWERED (gfx942 / ROCm 7.14; see
 // probe_graph_timing.cc's header for the numbers): in-graph
-// hipEventElapsedTime works, but ONLY when the event-record nodes are added
-// explicitly. HIP's stream capture silently DISCARDS hipEventRecord --
-// capturing [memset, record, kernel, record] x 100 yields 200 graph nodes
-// instead of 400, and every elapsed-time read then fails with
+// hipEventElapsedTime works, provided the event records opt in with
+// hipEventRecordWithFlags(..., hipEventRecordExternal). A DEFAULT-flag
+// record during capture is an internal capture dependency marker, not a
+// node -- capturing [memset, record, kernel, record] x 100 that way yields
+// 200 nodes instead of 400 and every elapsed-time read fails with
 // hipErrorInvalidResourceHandle.
 //
-// Capture is faithful for everything else, so timing.cc captures the whole
-// [L2-flush memset, launch] x N loop in one go and then splices the event
-// nodes into the captured chain. The timed graph is flat -- M + N*N_nodes
-// in one straight line, the shape do_bench produces on a stream -- with no
-// nesting. The methodology rev0 §5.1 specifies is unchanged; only the way
-// the event nodes get in is.
+// With the external flag, timing.cc captures the whole
+// [L2-flush memset, record, launch, record] x N loop in a single pass and
+// does nothing else to the graph. It is do_bench's loop, captured: a flat
+// M + N*N_nodes chain with no nesting and no post-hoc editing. The
+// methodology rev0 §5.1 specifies is unchanged.
 //
 // Verified end to end on gfx942 via T14 (attn_fwd and attn_bwd, every
 // backend). The batched_ev fallback below has NOT been exercised on real
