@@ -1,16 +1,24 @@
 // Copyright © 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 //
-// perfmon-exec0.md T10: hipGraph capture timing, per rev0 §5.1.
+// perfmon-exec0.md T10: hipGraph timing, per rev0 §5.1.
 //
-// UNVERIFIED IN THIS ENVIRONMENT (no ROCm/hipcc/HIP, no GPU -- confirmed in
-// T05's commit). Written strictly to spec, and depends directly on T05's
-// still-outstanding hardware result: T05's probe_graph_timing.cc exists to
-// answer whether hipgraph_ev100 (this file's primary method) is even
-// viable on the target ROCm/GPU combination. If T05 shows in-graph
-// hipEventElapsedTime is unreliable, measure_launch's automatic
-// hipgraph_ev100 -> batched_ev fallback (below) is the documented escape
-// hatch, but this has not been exercised on real hardware either.
+// T05's hardware question is ANSWERED (gfx942 / ROCm 7.14; see
+// probe_graph_timing.cc's header for the numbers): in-graph
+// hipEventElapsedTime works, but ONLY when the event-record nodes are added
+// explicitly. HIP's stream capture silently DISCARDS hipEventRecord --
+// capturing [memset, record, kernel, record] x 100 yields 200 graph nodes
+// instead of 400, and every elapsed-time read then fails with
+// hipErrorInvalidResourceHandle.
+//
+// timing.cc therefore captures ONLY the opaque family launch() into a child
+// graph and assembles [memset -> record -> child -> record] x N itself. The
+// methodology rev0 §5.1 specifies is unchanged; only the API used to build
+// the graph is.
+//
+// Verified end to end on gfx942 via T14 (attn_fwd and attn_bwd, every
+// backend). The batched_ev fallback below has NOT been exercised on real
+// hardware -- capture has not failed on any configuration tried so far.
 
 #ifndef PERFMON_CORE_TIMING_H
 #define PERFMON_CORE_TIMING_H

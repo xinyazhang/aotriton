@@ -42,10 +42,58 @@ void check_launch(int rc, const char* what) {
   }
 }
 
-// Primary method (rev0 §5.1 `hipgraph_ev100`): capture kTimingIters
-// iterations of [L2-flush memset, event record, family launch, event
-// record] into one hipGraph, instantiate, warm up, launch once,
-// read back every per-iteration hipEventElapsedTime.
+// Releases the HIP objects one hipgraph_ev100 attempt owns. Every exit
+// path from try_hipgraph_ev100 -- normal return, early `return false`, or
+// a check() throw -- runs this, because the runner is one long-lived
+// process serving many measurements (rev0 D4) and leaking 2N events plus
+// two graphs per failed measure would accumulate.
+struct GraphScratch {
+  std::vector<hipEvent_t> start_ev;
+  std::vector<hipEvent_t> end_ev;
+  hipGraph_t child = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t graph_exec = nullptr;
+
+  // Destructor cleanup is best-effort: these run on the failure path too,
+  // where a HIP error is already being reported, so the [[nodiscard]]
+  // status of each destroy is deliberately discarded rather than allowed
+  // to mask the original error.
+  ~GraphScratch() {
+    if (graph_exec) static_cast<void>(hipGraphExecDestroy(graph_exec));
+    if (graph) static_cast<void>(hipGraphDestroy(graph));
+    if (child) static_cast<void>(hipGraphDestroy(child));
+    for (auto& e : start_ev) if (e) static_cast<void>(hipEventDestroy(e));
+    for (auto& e : end_ev) if (e) static_cast<void>(hipEventDestroy(e));
+  }
+};
+
+// Primary method (rev0 §5.1 `hipgraph_ev100`): kTimingIters iterations of
+// [L2-flush memset, event record, family launch, event record] in one
+// hipGraph -- instantiate, warm up, launch once, read back every
+// per-iteration hipEventElapsedTime.
+//
+// The graph is ASSEMBLED EXPLICITLY (hipGraphAddMemsetNode /
+// hipGraphAddEventRecordNode / hipGraphAddChildGraphNode) rather than
+// captured whole, because T05's hardware probe found that HIP's stream
+// capture SILENTLY DISCARDS hipEventRecord: capturing
+// [record, kernel, record] yields a graph whose hipGraphGetNodes count is
+// 1, not 3, and every subsequent hipEventElapsedTime on those events fails
+// with hipErrorInvalidResourceHandle because they were never recorded.
+// Measured on gfx942 / ROCm 7.14. Built explicitly instead, the same
+// events read back correctly and agree with conventional (non-graph)
+// timing to 0.05%.
+//
+// Stream capture is still used, but only for the ONE opaque
+// `vtable.launch(ctx, stream)` -- the family call is an AOTriton entry
+// point whose kernel launches perfmon cannot enumerate as explicit nodes
+// (rev0 D4 keeps this library AOTriton-neutral). That single-launch
+// capture becomes a child-graph node instantiated kTimingIters times.
+//
+// Events are 2N INDEPENDENT objects (start_ev[i], end_ev[i]), never a
+// shared ev[i+1] straddling adjacent iterations: a shared end/start event
+// is recorded twice per graph, and its surviving timestamp is the LATER
+// record, which silently folds the next iteration's 1 GiB flush memset
+// into the sample.
 //
 // Returns false (leaving `out_ms` untouched) if hipGraph capture itself
 // fails -- the caller falls back to batched_ev in that case, per T10's
@@ -59,49 +107,92 @@ void check_launch(int rc, const char* what) {
 bool try_hipgraph_ev100(const pmon_family_vtable& vtable, void* ctx, hipStream_t stream,
                          std::vector<double>* out_ms) {
   void* flush_buf = flush_buffer();
+  GraphScratch scratch;
 
-  std::vector<hipEvent_t> ev(kTimingIters + 1);
-  for (auto& e : ev) check(hipEventCreate(&e), "hipEventCreate");
-
+  // --- 1. Capture ONE family launch into a child graph -------------------
+  // No hipEventRecord inside this capture: see the note above on capture
+  // dropping event nodes. Only the family's own kernel launches go here.
   hipError_t begin_err = hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal);
-  check(begin_err, "hipStreamBeginCapture");
-
-  for (int i = 0; i < kTimingIters; ++i) {
-    check(hipMemsetAsync(flush_buf, 0, kL2FlushBytes, stream), "hipMemsetAsync (L2 flush)");
-    check(hipEventRecord(ev[i], stream), "hipEventRecord");
-    check_launch(vtable.launch(ctx, stream), "vtable.launch (in-graph)");
-    check(hipEventRecord(ev[i + 1], stream), "hipEventRecord");
+  if (begin_err != hipSuccess) {
+    return false;  // documented fallback trigger
   }
-
-  hipGraph_t graph = nullptr;
-  hipError_t end_err = hipStreamEndCapture(stream, &graph);
+  int launch_rc = vtable.launch(ctx, stream);
+  // End the capture unconditionally, even when the launch failed, so the
+  // stream is never left in capturing state for the batched_ev fallback.
+  hipError_t end_err = hipStreamEndCapture(stream, &scratch.child);
+  check_launch(launch_rc, "vtable.launch (child-graph capture)");
   if (end_err != hipSuccess) {
-    // Capture failed -- this is exactly the documented fallback trigger.
-    // Best-effort cleanup of what we created before returning false.
-    for (auto& e : ev) hipEventDestroy(e);
-    return false;
+    return false;  // documented fallback trigger
   }
 
-  hipGraphExec_t graph_exec = nullptr;
-  check(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "hipGraphInstantiate");
+  size_t child_nodes = 0;
+  check(hipGraphGetNodes(scratch.child, nullptr, &child_nodes), "hipGraphGetNodes (child)");
+  if (child_nodes == 0) {
+    throw std::runtime_error(
+      "timing: vtable.launch enqueued no work on the captured stream -- the "
+      "family adapter must launch on the stream it is given, never the null "
+      "stream (rev0 D4/T12).");
+  }
+
+  // --- 2. Assemble the timed graph explicitly ---------------------------
+  check(hipGraphCreate(&scratch.graph, 0), "hipGraphCreate");
+
+  scratch.start_ev.assign(kTimingIters, nullptr);
+  scratch.end_ev.assign(kTimingIters, nullptr);
+  for (int i = 0; i < kTimingIters; ++i) {
+    check(hipEventCreateWithFlags(&scratch.start_ev[i], hipEventDefault), "hipEventCreateWithFlags");
+    check(hipEventCreateWithFlags(&scratch.end_ev[i], hipEventDefault), "hipEventCreateWithFlags");
+  }
+
+  hipMemsetParams flush_params = {};
+  flush_params.dst = flush_buf;
+  flush_params.value = 0;
+  flush_params.elementSize = 1;
+  flush_params.width = kL2FlushBytes;
+  flush_params.height = 1;
+  flush_params.pitch = 0;
+
+  // A single linear dependency chain: every iteration's flush waits on the
+  // previous iteration's end-record, so the iterations run strictly in
+  // sequence and each timed window contains exactly one launch.
+  hipGraphNode_t prev = nullptr;
+  for (int i = 0; i < kTimingIters; ++i) {
+    hipGraphNode_t flush_node = nullptr;
+    hipGraphNode_t start_node = nullptr;
+    hipGraphNode_t child_node = nullptr;
+    hipGraphNode_t end_node = nullptr;
+    const hipGraphNode_t* deps = prev ? &prev : nullptr;
+    size_t ndeps = prev ? 1 : 0;
+
+    check(hipGraphAddMemsetNode(&flush_node, scratch.graph, deps, ndeps, &flush_params),
+          "hipGraphAddMemsetNode (L2 flush)");
+    check(hipGraphAddEventRecordNode(&start_node, scratch.graph, &flush_node, 1,
+                                     scratch.start_ev[i]),
+          "hipGraphAddEventRecordNode (start)");
+    check(hipGraphAddChildGraphNode(&child_node, scratch.graph, &start_node, 1, scratch.child),
+          "hipGraphAddChildGraphNode (family launch)");
+    check(hipGraphAddEventRecordNode(&end_node, scratch.graph, &child_node, 1, scratch.end_ev[i]),
+          "hipGraphAddEventRecordNode (end)");
+    prev = end_node;
+  }
+
+  check(hipGraphInstantiate(&scratch.graph_exec, scratch.graph, nullptr, nullptr, 0),
+        "hipGraphInstantiate");
 
   // Warm up the instantiated graph before the timed launch (T10 spec).
-  check(hipGraphLaunch(graph_exec, stream), "hipGraphLaunch (warmup)");
+  check(hipGraphLaunch(scratch.graph_exec, stream), "hipGraphLaunch (warmup)");
   check(hipStreamSynchronize(stream), "hipStreamSynchronize (warmup)");
 
-  check(hipGraphLaunch(graph_exec, stream), "hipGraphLaunch (timed)");
+  check(hipGraphLaunch(scratch.graph_exec, stream), "hipGraphLaunch (timed)");
   check(hipStreamSynchronize(stream), "hipStreamSynchronize (timed)");
 
   out_ms->resize(kTimingIters);
   for (int i = 0; i < kTimingIters; ++i) {
     float ms = 0.0f;
-    check(hipEventElapsedTime(&ms, ev[i], ev[i + 1]), "hipEventElapsedTime");
+    check(hipEventElapsedTime(&ms, scratch.start_ev[i], scratch.end_ev[i]),
+          "hipEventElapsedTime");
     (*out_ms)[i] = static_cast<double>(ms);
   }
-
-  check(hipGraphExecDestroy(graph_exec), "hipGraphExecDestroy");
-  check(hipGraphDestroy(graph), "hipGraphDestroy");
-  for (auto& e : ev) check(hipEventDestroy(e), "hipEventDestroy");
 
   return true;
 }
