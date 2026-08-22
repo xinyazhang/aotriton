@@ -7,13 +7,18 @@
 // -- not a from-scratch reimplementation of the PyTorch integration this
 // task's spec points at for the call sequence.
 //
-// UNVERIFIED IN THIS ENVIRONMENT: no ROCm/hipcc/HIP/AOTriton build exists
-// here (see T05's commit message for how that was confirmed). This file has
-// never been compiled, let alone linked against a real libaotriton*_v2.so.
-// See adapter_v3/CMakeLists.txt's own header for the same disclosure on the
-// build side, and perfmon-handoff0.md for the exact commands a human must
-// run on a ROCm+GPU machine to actually verify it (T12's own Verify step is
-// "T14" -- explicitly out of scope for this agent, per this task's briefing).
+// T12's Verify step is "T14", and T14 has now passed on gfx942 / ROCm 7.14
+// against a real libaotritonpmon_v2.so: attn_fwd backends 0-1 and attn_bwd
+// backends 0-2 all measure, with enumerate_backends returning the counts
+// modules/flash/tune/level_op.py specifies (2 and 3 on gfx942).
+//
+// One real bug was found by that first run and fixed: build_fwd() passed a
+// NULL persistent_atomic_counter unconditionally, which faults the GPU at
+// address 0x0 for any causal entry -- see the comment at its assignment.
+//
+// Paths NOT yet exercised on hardware: bias_type != 0, dropout_p > 0, GQA
+// (gqa_ratio > 1), storage_flip, and fp16 (every T14 shape was bf16,
+// non-GQA, unbiased, dropout-free).
 //
 // ---------------------------------------------------------------------------
 // AOTRITON_NS, not `aotriton::`, throughout this file
@@ -268,6 +273,12 @@ struct Context {
   void* dq_acc_ptr = nullptr;
   size_t dq_acc_bytes = 0;
 
+  // Only set for attn_fwd with a non-None causal_type, which autoselects
+  // the DYNAMIC persistent kernel (modules/flash/kernel/
+  // attn_torch_function.py:222-229). Like dq_acc, launch() re-zeroes it on
+  // every call, not just once in prepare().
+  void* atomic_counter_ptr = nullptr;
+
   flash::attn_fwd_params fwd_params;
   flash::attn_bwd_params bwd_params;
   flash::attn_options options;
@@ -380,7 +391,6 @@ void build_fwd(const pmon_entry* e, int backend, Context* ctx, hipStream_t scrat
   p.philox_seed_output = TensorView<0>::get_null_tensor(AOTRITON_NS::kUInt64);
   p.philox_offset_output = TensorView<0>::get_null_tensor(AOTRITON_NS::kUInt64);
   p.encoded_softmax = TensorView<4>::get_null_tensor(dt);
-  p.persistent_atomic_counter = TensorView<0>::get_null_tensor(AOTRITON_NS::kInt32);
 
   if (e->causal) {
     p.causal_type = flash::CausalType::WindowedAttention;
@@ -390,6 +400,30 @@ void build_fwd(const pmon_entry* e, int backend, Context* ctx, hipStream_t scrat
     p.causal_type = flash::CausalType::None;
     p.window_left = 0;
     p.window_right = 0;
+  }
+
+  // persistent_atomic_counter MUST be a real, zeroed int32 whenever
+  // causal_type != None. modules/flash/kernel/attn_torch_function.py:222-229
+  // autoselects PersistentType.DYNAMIC in exactly that case, and the
+  // persistent kernel's first act is
+  // `tile_id = persistent_atomic_counter.atomic_add(1)`
+  // (modules/flash/kernel/fwd_kernel.py:222). Passing the null tensor here
+  // faults the GPU at address 0x0 -- observed on gfx942 as
+  // "Memory Fault Error ... faulting addr: 0x0, kernel: attn_fwd" the first
+  // time this adapter was ever run (T14).
+  //
+  // Conversely it must stay NULL when causal_type == None: modules/flash/
+  // aot/attn_fwd.py:171 declares
+  // `@ati.derives('persistent_atomic_counter', to=0, when=ati.eq('CAUSAL_TYPE', 0))`,
+  // i.e. the AOT signature itself derives this argument to 0 in that case.
+  // Hence the branch rather than unconditionally allocating four bytes.
+  if (p.causal_type != flash::CausalType::None) {
+    ctx->atomic_counter_ptr = alloc_device(ctx, sizeof(int32_t));
+    perfmon::fill_zero(ctx->atomic_counter_ptr, sizeof(int32_t), scratch_stream);
+    p.persistent_atomic_counter =
+      TensorView<0>(reinterpret_cast<intptr_t>(ctx->atomic_counter_ptr), AOTRITON_NS::kInt32);
+  } else {
+    p.persistent_atomic_counter = TensorView<0>::get_null_tensor(AOTRITON_NS::kInt32);
   }
   p.varlen_type = flash::VarlenType::None;
   // cu_seqlens_q/k and seq_strides_q/k (T1) are left at attn_fwd_params'
@@ -619,6 +653,17 @@ extern "C" int pmon_flash_launch(void* ctx_v, hipStream_t stream) {
   auto* ctx = static_cast<Context*>(ctx_v);
   hipError_t err = hipSuccess;
   if (ctx->iface == PMON_IFACE_ATTN_FWD) {
+    if (ctx->atomic_counter_ptr) {
+      // Re-zero the persistent tile counter on every call, for the same
+      // reason (and by the same stream-ordered mechanism) as dq_acc below:
+      // the kernel atomically increments it, so a counter left at its
+      // post-launch value makes every SUBSEQUENT iteration exit
+      // immediately with no tiles to claim -- which would not fault, it
+      // would just silently report an absurdly fast time. Being
+      // stream-ordered, this is captured as one memset node per iteration
+      // inside timing.cc's child-graph capture.
+      perfmon::fill_zero(ctx->atomic_counter_ptr, sizeof(int32_t), stream);
+    }
     err = flash::attn_fwd(ctx->fwd_params, flash::attn_fwd_params::kVersion, Stream(stream),
                            &ctx->options);
   } else if (ctx->iface == PMON_IFACE_ATTN_BWD) {
