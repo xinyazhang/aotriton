@@ -23,6 +23,11 @@ def fast_philox(philox_seed, philox_offset, M : tl.constexpr, N : tl.constexpr, 
                         "The behavior has been changed in https://github.com/triton-lang/triton/pull/6832")
         tl.static_assert(PHILOX_RN_PER_OFFSET == 8)
         # Cast them to 8 int32 blocks
+        # NOTE: dead branch (`if False`). It has the same nested-tl.join lane
+        # ordering the live branch below was just fixed for, and would need the
+        # same treatment plus a check of what the 8-randoms-per-offset consumer
+        # expects. Deliberately not "fixed" blind -- there is nothing to test it
+        # against while it is unreachable.
         r64 = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(M, N * 4)  # 4x uint64 blocks
         r64_hi = ((r64 >> 32) & 0xffffffff).to(tl.uint32)
         r64_lo = (r64 & 0xffffffff).to(tl.uint32)
@@ -34,7 +39,22 @@ def fast_philox(philox_seed, philox_offset, M : tl.constexpr, N : tl.constexpr, 
                         "fast_philox expects tl.randint4x returns uint32. "
                         "The behavior has been changed in https://github.com/triton-lang/triton/pull/6832")
         tl.static_assert(PHILOX_RN_PER_OFFSET == 4)
-        r32 = tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(M, N * 4).to(tl.int32, bitcast=True)
+        # Pairing is (r0,r2),(r1,r3), NOT (r0,r1),(r2,r3).
+        #
+        # tl.join appends a MINOR axis, so nesting it makes the inner join the
+        # faster-varying one. join(join(a,b), join(c,d)) flattens to
+        # [a, c, b, d] -- with the natural (r0,r1),(r2,r3) pairing that lays the
+        # four randoms of one offset across four adjacent columns as
+        # [r0, r2, r1, r3], which is a lane order nobody chose.
+        #
+        # It went unnoticed because it is a permutation: the mask is drawn from
+        # the same four randoms and the same threshold, so its distribution,
+        # its per-offset keep count, and every statistical property are
+        # unchanged. Only WHICH column gets which random moves, and nothing
+        # compared two independent implementations of this mapping until a
+        # FlyDSL forward -- which emits the natural [r0, r1, r2, r3] -- was
+        # asked to reproduce the same mask.
+        r32 = tl.join(tl.join(r0, r2), tl.join(r1, r3)).reshape(M, N * 4).to(tl.int32, bitcast=True)
     return r32
 
 @triton.jit
