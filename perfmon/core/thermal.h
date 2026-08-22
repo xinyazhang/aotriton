@@ -32,6 +32,15 @@ struct pmon_thermal {
   double temp_c = 0.0;
   double sclk_mhz = 0.0;
   bool   throttled = false;
+  // False when the platform does not report throttle state at all, in which
+  // case `throttled` is meaningless and the record must serialize
+  // `"throttled": null`. Not every GPU answers this: gfx942 returns
+  // amd-smi's documented 0xFFFFFFFF "unsupported" sentinel for
+  // amdsmi_gpu_metrics_t::throttle_status. Same reasoning as `valid` below
+  // -- "we did not observe throttling" and "this GPU cannot tell us" are
+  // different facts, and collapsing them is how a throttled run gets
+  // published looking clean (rev0 §5.2).
+  bool   throttle_known = false;
   bool   valid = false;
 };
 

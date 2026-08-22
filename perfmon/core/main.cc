@@ -123,9 +123,13 @@ std::string json_thermal(const perfmon::pmon_thermal& t) {
   // zeros that could be mistaken for a real zero reading.
   if (!t.valid) return "null";
   std::ostringstream oss;
+  // `throttled` is null, not false, when the platform does not report
+  // throttle state -- see pmon_thermal::throttle_known (thermal.h). gfx942
+  // is such a platform, so this is the common case, not a corner one.
   oss << "{\"temp_c\":" << json_double(t.temp_c)
       << ",\"sclk_mhz\":" << json_double(t.sclk_mhz)
-      << ",\"throttled\":" << (t.throttled ? "true" : "false") << "}";
+      << ",\"throttled\":"
+      << (t.throttle_known ? (t.throttled ? "true" : "false") : "null") << "}";
   return oss.str();
 }
 
