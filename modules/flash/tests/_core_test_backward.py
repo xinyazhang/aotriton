@@ -17,6 +17,7 @@ from attn_torch_function import (
     attention,
     AttentionExtraArgs,
     BWD_IMPL,
+    FORCE_FWD_FLYC,
     V3_API,
     PROBE_UNSUPPORTED,
     hipError_t,
@@ -71,6 +72,14 @@ SMALL_VRAM = bool(int(os.getenv('SMALL_VRAM', default='0')))
 SKIP_BWD = bool(int(os.getenv('SKIP_BWD', default='0')))
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+if FORCE_FWD_FLYC:
+    # flyc is f16/bf16 WMMA only -- modules/flash/aot/flyc_attn_fwd.py's
+    # _flyc_fwd_disabled rejects fp32 outright, so no hsaco exists for those
+    # functionals. Forcing the backend bypasses that predicate (it is the
+    # operator's selection it overrides, not the kernel's own support), so
+    # without this every fp32 case asks for a kernel that was never built.
+    DTYPES = [torch.float16, torch.bfloat16]
 
 if BWD_IMPL is None or BWD_IMPL == 0:
     POT_HEADDIMS = [16, 32, 64, 128, 256, 512]
