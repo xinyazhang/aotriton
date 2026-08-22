@@ -4,6 +4,7 @@
 #include "timing.h"
 
 #include <cstdlib>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -68,27 +69,94 @@ struct GraphScratch {
   }
 };
 
+// Returns `graph`'s nodes in execution order, or an empty vector if the
+// graph is not one straight chain.
+//
+// Capturing a single stream that never forks produces exactly that: one
+// root, one leaf, every node with in-degree and out-degree <= 1, and
+// edges == nodes - 1. Verified for attn_fwd (2 nodes per launch) and
+// attn_bwd backend 2 (4 nodes per launch, including its dq_acc memset) on
+// gfx942. Anything else means the family launch forked onto a second
+// stream, which this file's event insertion does not model -- the caller
+// treats that as "cannot time by graph" rather than guessing.
+std::vector<hipGraphNode_t> linear_chain(hipGraph_t graph) {
+  size_t num_nodes = 0;
+  check(hipGraphGetNodes(graph, nullptr, &num_nodes), "hipGraphGetNodes");
+  std::vector<hipGraphNode_t> nodes(num_nodes);
+  if (num_nodes == 0) return {};
+  check(hipGraphGetNodes(graph, nodes.data(), &num_nodes), "hipGraphGetNodes (fill)");
+
+  size_t num_edges = 0;
+  check(hipGraphGetEdges(graph, nullptr, nullptr, &num_edges), "hipGraphGetEdges");
+  if (num_edges != num_nodes - 1) return {};
+  std::vector<hipGraphNode_t> efrom(num_edges), eto(num_edges);
+  if (num_edges > 0) {
+    check(hipGraphGetEdges(graph, efrom.data(), eto.data(), &num_edges),
+          "hipGraphGetEdges (fill)");
+  }
+
+  std::map<hipGraphNode_t, hipGraphNode_t> next;
+  std::map<hipGraphNode_t, int> indeg, outdeg;
+  for (auto n : nodes) { indeg[n] = 0; outdeg[n] = 0; }
+  for (size_t e = 0; e < num_edges; ++e) {
+    if (++outdeg[efrom[e]] > 1 || ++indeg[eto[e]] > 1) return {};
+    next[efrom[e]] = eto[e];
+  }
+
+  hipGraphNode_t root = nullptr;
+  for (auto n : nodes) {
+    if (indeg[n] == 0) {
+      if (root) return {};  // more than one root
+      root = n;
+    }
+  }
+  if (!root) return {};
+
+  std::vector<hipGraphNode_t> order;
+  for (hipGraphNode_t n = root; ; ) {
+    order.push_back(n);
+    auto it = next.find(n);
+    if (it == next.end()) break;
+    n = it->second;
+  }
+  if (order.size() != num_nodes) return {};
+  return order;
+}
+
+// Splices `ev_node` into the chain between `after` and `before`, so the
+// timestamp is taken strictly between them. Matching
+// python/tune/gpu_utils.py:do_bench, where `start_event.record()` is issued
+// in stream order ahead of `fn()` rather than concurrently with it.
+void splice_after(hipGraph_t graph, hipGraphNode_t after, hipGraphNode_t before,
+                   hipEvent_t ev, hipGraphNode_t* out) {
+  check(hipGraphAddEventRecordNode(out, graph, &after, 1, ev),
+        "hipGraphAddEventRecordNode");
+  if (before) {
+    check(hipGraphRemoveDependencies(graph, &after, &before, 1),
+          "hipGraphRemoveDependencies");
+    check(hipGraphAddDependencies(graph, out, &before, 1), "hipGraphAddDependencies");
+  }
+}
+
 // Primary method (rev0 §5.1 `hipgraph_ev100`): kTimingIters iterations of
 // [L2-flush memset, event record, family launch, event record] in one
 // hipGraph -- instantiate, warm up, launch once, read back every
 // per-iteration hipEventElapsedTime.
 //
-// The graph is ASSEMBLED EXPLICITLY (hipGraphAddMemsetNode /
-// hipGraphAddEventRecordNode / hipGraphAddChildGraphNode) rather than
-// captured whole, because T05's hardware probe found that HIP's stream
+// Built in two steps, because T05's hardware probe found that HIP's stream
 // capture SILENTLY DISCARDS hipEventRecord: capturing
 // [record, kernel, record] yields a graph whose hipGraphGetNodes count is
 // 1, not 3, and every subsequent hipEventElapsedTime on those events fails
 // with hipErrorInvalidResourceHandle because they were never recorded.
-// Measured on gfx942 / ROCm 7.14. Built explicitly instead, the same
-// events read back correctly and agree with conventional (non-graph)
+// Measured on gfx942 / ROCm 7.14. Added as explicit nodes instead, the
+// same events read back correctly and agree with conventional (non-graph)
 // timing to 0.05%.
 //
-// Stream capture is still used, but only for the ONE opaque
-// `vtable.launch(ctx, stream)` -- the family call is an AOTriton entry
-// point whose kernel launches perfmon cannot enumerate as explicit nodes
-// (rev0 D4 keeps this library AOTriton-neutral). That single-launch
-// capture becomes a child-graph node instantiated kTimingIters times.
+// Capture is otherwise faithful, so the whole loop is captured in one go
+// and only the event nodes are added afterwards. The result is a flat
+// chain of M + N*kTimingIters nodes, exactly the shape
+// python/tune/gpu_utils.py:do_bench produces on a stream, with nothing
+// nested and no per-node-type knowledge on perfmon's side.
 //
 // Events are 2N INDEPENDENT objects (start_ev[i], end_ev[i]), never a
 // shared ev[i+1] straddling adjacent iterations: a shared end/start event
@@ -110,33 +178,77 @@ bool try_hipgraph_ev100(const pmon_family_vtable& vtable, void* ctx, hipStream_t
   void* flush_buf = flush_buffer();
   GraphScratch scratch;
 
-  // --- 1. Capture ONE family launch into a child graph -------------------
-  // No hipEventRecord inside this capture: see the note above on capture
-  // dropping event nodes. Only the family's own kernel launches go here.
+  // --- 1. Learn how many nodes ONE launch contributes --------------------
+  // Used only to check that the full-loop capture below came out the size
+  // it should. A family whose per-call node count varies would otherwise
+  // put every event node at the wrong place in the chain and produce
+  // plausible, wrong timings instead of an error.
   hipError_t begin_err = hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal);
   if (begin_err != hipSuccess) {
     return false;  // documented fallback trigger
   }
-  int launch_rc = vtable.launch(ctx, stream);
+  int probe_rc = vtable.launch(ctx, stream);
   // End the capture unconditionally, even when the launch failed, so the
-  // stream is never left in capturing state for the batched_ev fallback.
-  hipError_t end_err = hipStreamEndCapture(stream, &scratch.child);
-  check_launch(launch_rc, "vtable.launch (child-graph capture)");
-  if (end_err != hipSuccess) {
+  // stream is never left capturing for the batched_ev fallback.
+  hipError_t probe_end = hipStreamEndCapture(stream, &scratch.child);
+  check_launch(probe_rc, "vtable.launch (node-count probe)");
+  if (probe_end != hipSuccess) {
     return false;  // documented fallback trigger
   }
-
-  size_t child_nodes = 0;
-  check(hipGraphGetNodes(scratch.child, nullptr, &child_nodes), "hipGraphGetNodes (child)");
-  if (child_nodes == 0) {
+  size_t launch_nodes = 0;
+  check(hipGraphGetNodes(scratch.child, nullptr, &launch_nodes), "hipGraphGetNodes (probe)");
+  if (launch_nodes == 0) {
     throw std::runtime_error(
       "timing: vtable.launch enqueued no work on the captured stream -- the "
       "family adapter must launch on the stream it is given, never the null "
       "stream (rev0 D4/T12).");
   }
 
-  // --- 2. Assemble the timed graph explicitly ---------------------------
-  check(hipGraphCreate(&scratch.graph, 0), "hipGraphCreate");
+  // --- 2. Capture the WHOLE timed loop -----------------------------------
+  // Stream capture handles kernels and memsets faithfully; the only thing
+  // it drops is hipEventRecord (T05). So capture all kTimingIters
+  // iterations of [L2-flush memset, family launch] in one go and add the
+  // event nodes afterwards, in step 3.
+  //
+  // This is the whole graph: M + N*kTimingIters nodes in one straight
+  // chain, the same shape python/tune/gpu_utils.py:do_bench produces on a
+  // stream. Nothing is nested. An earlier version captured a single launch
+  // and wrapped it in one hipGraphAddChildGraphNode per iteration; that
+  // cost ~11.5 us per iteration in graph-node dispatch, all of it inside
+  // the timed window -- a +67% artifact on a 17 us kernel. Letting capture
+  // build the chain also means perfmon never has to know how to copy a
+  // kernel node, so no family can outgrow it by using a node type this
+  // file did not anticipate.
+  begin_err = hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal);
+  if (begin_err != hipSuccess) {
+    return false;
+  }
+  int launch_rc = 0;
+  for (int i = 0; i < kTimingIters && launch_rc == 0; ++i) {
+    hipError_t ferr = hipMemsetAsync(flush_buf, 0, kL2FlushBytes, stream);
+    if (ferr != hipSuccess) {
+      launch_rc = -1;
+      break;
+    }
+    launch_rc = vtable.launch(ctx, stream);
+  }
+  hipError_t end_err = hipStreamEndCapture(stream, &scratch.graph);
+  check_launch(launch_rc, "vtable.launch (timed-loop capture)");
+  if (end_err != hipSuccess) {
+    return false;  // documented fallback trigger
+  }
+
+  // --- 3. Splice the event nodes into the captured chain -----------------
+  std::vector<hipGraphNode_t> chain = linear_chain(scratch.graph);
+  const size_t per_iter = 1 + launch_nodes;  // flush + this launch's nodes
+  if (chain.empty() || chain.size() != per_iter * static_cast<size_t>(kTimingIters)) {
+    throw std::runtime_error(
+      "timing: captured timed loop is not the expected straight chain of " +
+      std::to_string(per_iter * kTimingIters) + " nodes (got " +
+      std::to_string(chain.size()) + "). A family launch that forks onto "
+      "another stream, or whose node count varies per call, cannot have its "
+      "per-iteration event nodes placed correctly.");
+  }
 
   scratch.start_ev.assign(kTimingIters, nullptr);
   scratch.end_ev.assign(kTimingIters, nullptr);
@@ -145,36 +257,20 @@ bool try_hipgraph_ev100(const pmon_family_vtable& vtable, void* ctx, hipStream_t
     check(hipEventCreateWithFlags(&scratch.end_ev[i], hipEventDefault), "hipEventCreateWithFlags");
   }
 
-  hipMemsetParams flush_params = {};
-  flush_params.dst = flush_buf;
-  flush_params.value = 0;
-  flush_params.elementSize = 1;
-  flush_params.width = kL2FlushBytes;
-  flush_params.height = 1;
-  flush_params.pitch = 0;
-
-  // A single linear dependency chain: every iteration's flush waits on the
-  // previous iteration's end-record, so the iterations run strictly in
-  // sequence and each timed window contains exactly one launch.
-  hipGraphNode_t prev = nullptr;
   for (int i = 0; i < kTimingIters; ++i) {
-    hipGraphNode_t flush_node = nullptr;
-    hipGraphNode_t start_node = nullptr;
-    hipGraphNode_t child_node = nullptr;
-    hipGraphNode_t end_node = nullptr;
-    const hipGraphNode_t* deps = prev ? &prev : nullptr;
-    size_t ndeps = prev ? 1 : 0;
+    const size_t base = static_cast<size_t>(i) * per_iter;
+    hipGraphNode_t flush_node = chain[base];              // L2 flush, before the window
+    hipGraphNode_t first_launch = chain[base + 1];        // first node of the launch
+    hipGraphNode_t last_launch = chain[base + per_iter - 1];
+    // The node the end-record must precede: next iteration's flush, or
+    // nothing at all on the final iteration (it becomes the new leaf).
+    hipGraphNode_t next_flush =
+        (i + 1 < kTimingIters) ? chain[base + per_iter] : nullptr;
 
-    check(hipGraphAddMemsetNode(&flush_node, scratch.graph, deps, ndeps, &flush_params),
-          "hipGraphAddMemsetNode (L2 flush)");
-    check(hipGraphAddEventRecordNode(&start_node, scratch.graph, &flush_node, 1,
-                                     scratch.start_ev[i]),
-          "hipGraphAddEventRecordNode (start)");
-    check(hipGraphAddChildGraphNode(&child_node, scratch.graph, &start_node, 1, scratch.child),
-          "hipGraphAddChildGraphNode (family launch)");
-    check(hipGraphAddEventRecordNode(&end_node, scratch.graph, &child_node, 1, scratch.end_ev[i]),
-          "hipGraphAddEventRecordNode (end)");
-    prev = end_node;
+    hipGraphNode_t start_node = nullptr;
+    hipGraphNode_t end_node = nullptr;
+    splice_after(scratch.graph, flush_node, first_launch, scratch.start_ev[i], &start_node);
+    splice_after(scratch.graph, last_launch, next_flush, scratch.end_ev[i], &end_node);
   }
 
   check(hipGraphInstantiate(&scratch.graph_exec, scratch.graph, nullptr, nullptr, 0),

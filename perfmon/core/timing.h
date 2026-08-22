@@ -11,10 +11,12 @@
 // instead of 400, and every elapsed-time read then fails with
 // hipErrorInvalidResourceHandle.
 //
-// timing.cc therefore captures ONLY the opaque family launch() into a child
-// graph and assembles [memset -> record -> child -> record] x N itself. The
-// methodology rev0 §5.1 specifies is unchanged; only the API used to build
-// the graph is.
+// Capture is faithful for everything else, so timing.cc captures the whole
+// [L2-flush memset, launch] x N loop in one go and then splices the event
+// nodes into the captured chain. The timed graph is flat -- M + N*N_nodes
+// in one straight line, the shape do_bench produces on a stream -- with no
+// nesting. The methodology rev0 §5.1 specifies is unchanged; only the way
+// the event nodes get in is.
 //
 // Verified end to end on gfx942 via T14 (attn_fwd and attn_bwd, every
 // backend). The batched_ev fallback below has NOT been exercised on real
