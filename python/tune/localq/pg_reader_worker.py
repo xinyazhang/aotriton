@@ -5,7 +5,10 @@
 PostgreSQL Reader Worker with throttling.
 
 Fetches tasks from PostgreSQL task_queue and sends to broker.
-Blocks until tune_kernel completes (via ack) to throttle task fetching.
+Blocks until the DAG the fetched row started completes (via ack) to throttle
+task fetching. (perfmon rev2 R02: this reader starts *a* DAG, named by the
+row's task_queue.class column -- not hardcoded to 'tune_kernel' -- since a
+second DAG ('perf_measure') is added later.)
 """
 
 import sys
@@ -32,7 +35,7 @@ logger = logging.getLogger(__name__)
 class PGReaderWorker:
     """
     Fetches tasks from PostgreSQL and sends to broker.
-    Blocks until tune_kernel completes (via ack).
+    Blocks until the started DAG completes (via ack).
 
     TODO: Consider redesigning into a single reader that tracks multiple in-flight ACKs
     (one dict of task_id→pending instead of one blocking reader per slot). Benefits:
@@ -46,7 +49,7 @@ class PGReaderWorker:
     """
 
     def __init__(self, worker_id: str, arch: str, broker_socket: str, conn_params: dict,
-                 tuning_mode: str = 'kernel'):
+                 tuning_mode: str = 'kernel', klass: str = 'tune_kernel'):
         """
         Initialize PG reader worker.
 
@@ -56,12 +59,17 @@ class PGReaderWorker:
             broker_socket: Path to broker Unix socket
             conn_params: PostgreSQL connection parameters
             tuning_mode: 'kernel' or 'op' — controls module filter in fetch_tasks
+            klass: which DAG to fetch for, e.g. 'tune_kernel' | 'perf_measure'
+                (perfmon rev2 R01/R02). Defaults to 'tune_kernel', the only
+                DAG that exists today. Named `klass`, not `class`, because
+                `class` is a Python keyword.
         """
         self.worker_id = worker_id
         self.arch = arch
         self.broker_socket = broker_socket
         self.conn_params = conn_params
         self.tuning_mode = tuning_mode
+        self.klass = klass
         self.sock = None
         self.db_conn = None
         self.running = False
@@ -79,7 +87,8 @@ class PGReaderWorker:
         # Connect to database (reuse connection)
         self._connect_to_database()
 
-        logger.info(f"PG Reader {self.worker_id} started for arch={self.arch} tuning_mode={self.tuning_mode} (PID={os.getpid()})")
+        logger.info(f"PG Reader {self.worker_id} started for arch={self.arch} class={self.klass} "
+                    f"tuning_mode={self.tuning_mode} (PID={os.getpid()})")
         self.running = True
 
         while self.running:
@@ -106,9 +115,12 @@ class PGReaderWorker:
                     'worker_id': self.worker_id
                 })
 
-                # Send tune_kernel message to broker
-                tune_kernel_msg = {
-                    'class': 'tune_kernel',
+                # Send the DAG-start message to broker. 'class' names which
+                # DAG to start and comes from the task_queue row itself
+                # (perfmon rev2 R02: this reader starts *a* DAG, not always
+                # 'tune_kernel') -- not a literal hardcoded here.
+                start_dag_msg = {
+                    'class': task['class'],
                     'target_queue': 'gpu_queue',
                     'task_id': task_id,
                     'task_config': task_config
@@ -116,10 +128,10 @@ class PGReaderWorker:
 
                 send_message(self.sock, {
                     'type': 'forward',
-                    'message': tune_kernel_msg
+                    'message': start_dag_msg
                 })
 
-                logger.debug(f"Forwarded tune_kernel for task_id={task_id}")
+                logger.debug(f"Forwarded {task['class']} for task_id={task_id}")
 
                 # Wait for ack (BLOCKING - this throttles PG fetching)
                 while self.running:
@@ -231,13 +243,14 @@ class PGReaderWorker:
         """
         try:
             task_queue = TaskQueue(self.db_conn)
-            tasks = task_queue.fetch_tasks(self.arch, batch_size=1, tuning_mode=self.tuning_mode)
+            tasks = task_queue.fetch_tasks(self.arch, batch_size=1, tuning_mode=self.tuning_mode,
+                                           klass=self.klass)
 
             if tasks:
                 task = tasks[0]
                 logger.info(f"PG Reader {self.worker_id} fetched task from database: "
                            f"id={task.id}, arch={task.arch}, module={task.module}, "
-                           f"tuning_level={task.tuning_level}, status=pending→running")
+                           f"class={task.klass}, subclass={task.subclass}, status=pending→running")
                 # Stamp the level from the task_queue column into task_config.
                 # run() forwards only task_config to the handlers, and the
                 # column -- not the JSON -- is the authoritative value: it is
@@ -246,8 +259,11 @@ class PGReaderWorker:
                 # take tuning_level as a top-level field and are not obliged
                 # to duplicate it inside task_config, so copying it here is
                 # what stops an op task from being executed as kernel-level.
+                # The task_config key stays 'tuning_level' -- that is the
+                # workload-concrete term (kernel/op) used at this surface;
+                # only the task_queue column moved to 'subclass' (R01).
                 task_config = dict(task.task_config)
-                task_config['tuning_level'] = task.tuning_level
+                task_config['tuning_level'] = task.subclass
                 extra_im_texts = get_extra_uts(self.db_conn, task.id)
                 if extra_im_texts:
                     task_config['extra_im_texts'] = extra_im_texts
@@ -256,7 +272,8 @@ class PGReaderWorker:
                     'id': task.id,
                     'arch': task.arch,
                     'module': task.module,
-                    'tuning_level': task.tuning_level,
+                    'class': task.klass,
+                    'tuning_level': task.subclass,
                     'task_config': task_config
                 }
             else:
@@ -287,6 +304,10 @@ def main():
                        help='Path to broker Unix socket')
     parser.add_argument('--tuning_mode', type=str, default='kernel', choices=['kernel', 'op'],
                        help='Task filter mode: kernel (default) or op')
+    parser.add_argument('--class', dest='klass', type=str, default='tune_kernel',
+                       choices=['tune_kernel', 'perf_measure'],
+                       help="Which DAG to fetch for: tune_kernel (default) or perf_measure. "
+                            "dest='klass' because 'class' is a Python keyword.")
     args = parser.parse_args()
 
     # Get database connection parameters
@@ -300,6 +321,7 @@ def main():
         broker_socket=args.broker_socket,
         conn_params=conn_params,
         tuning_mode=args.tuning_mode,
+        klass=args.klass,
     )
 
     # Setup signal handlers for graceful shutdown
