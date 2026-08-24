@@ -6,7 +6,7 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 if [ "$#" -ne 3 ]; then
-  echo 'Missing arguments. Usage: run-test.sh <pass#> <test_level> <split/fused/aiter/v3>' >&2
+  echo 'Missing arguments. Usage: run-test.sh <pass#> <test_level> <split/fused/aiter/flyc/v3>' >&2
   exit 1
 fi
 
@@ -76,12 +76,36 @@ fi
     export BWD_IMPL=2
     fnprefix="aiter_pass"
   fi
+  if [[ "$backend" == "flyc" ]]; then
+    export V3_API=1
+    fnprefix="flyc_pass"
+  fi
   if [[ "$backend" == "v3" ]]; then
     export V3_API=1
     fnprefix="oput_pass"
   fi
   set -v
   export PYTHONPATH="${AOTRITON_TEST_LIBDIR:-${bdir}/install_dir/lib}"
+  # flyc pins the FORWARD backend, unlike the three above which pin the backward
+  # one, so it sets FWD_IMPL -- and SKIP_BWD, because flyc has no backward at
+  # all. Without SKIP_BWD every case would fail in .backward() for a reason that
+  # says nothing about the forward kernel under test.
+  #
+  # The index is looked up, not written down: it is an internal number that
+  # already moved once (flyc taking 2 on op_attn_fwd), whereas 'flyc' is the name
+  # @ati.backend declares and the library publishes. Sits here rather than beside
+  # the other backends because it needs PYTHONPATH to import pyaotriton.
+  if [[ "$backend" == "flyc" ]]; then
+    export SKIP_BWD=1
+    FWD_IMPL=$(python -c "import torch, pyaotriton
+from pyaotriton.v3.flash import OpAttnFwdBackend as B
+print({v: k for k, v in B.by_index.items()}['flyc'])") || {
+      echo "run-test.sh: this build publishes no 'flyc' forward backend" >&2
+      exit 1
+    }
+    export FWD_IMPL
+    echo "run-test.sh: flyc forward backend resolved to FWD_IMPL=${FWD_IMPL}"
+  fi
   _sig=$(ls "$PYTHONPATH/aotriton.images/"*"/__signature__" 2>/dev/null | head -n 1)
   {
     [ -n "$_sig" ] && cat "$_sig" \
