@@ -1,0 +1,216 @@
+#!/bin/bash
+# Copyright © 2026 Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Generate the Dockerfile for the perfmon measurement image.
+# Usage: create_perfmon_dockerfile.sh <workdir> <arch> [rocm_version]
+#
+# This is NOT a variant of create_dockerfile.sh. That script targets an image
+# that ALREADY HAS ROCm (ubuntu 24.04 + distro ROCm) and only layers a venv and
+# some wheels on top. Here the base is a plain debian:13 with no ROCm at all,
+# and we install TheRock ROCm ourselves, from the pip wheel index, into a venv.
+# Steps follow ROCm/legacy-rocm-build, branch docs/7.14.0, docs/install:
+#   * debian 13 -> python3.13 (100-prerequisites.rst)
+#   * python3.13 -m venv .venv                                (200-install.rst)
+#   * python -m pip install --index-url <whl-multi-arch> \
+#         "rocm[libraries,devel,device-<arch>]==<ver>"        (200-install.rst)
+#   * rocm-sdk init      -- only valid because we take `devel` (300-post-install.rst)
+#
+# Two constraints shape the rest of this file:
+#
+#   1. The venv is owned by the INVOKING USER's uid:gid, not root. Build
+#      artifacts (perfmon/subjects/<id>/) are produced inside the container and
+#      read on the host; a root-owned venv would emit root-owned artifacts that
+#      the host user cannot rewrite, and bind-mounted source would be written
+#      as root too.
+#   2. Because of (1), every command that touches the venv runs AS THAT USER --
+#      hence the `su` wrapper below. Running pip as root into a user-owned venv
+#      leaves a mix of root- and user-owned files, which breaks the next
+#      non-root `pip install` with confusing EACCES deep inside site-packages.
+#
+# No torch: the perfmon runner is torch-free by construction, and omitting it
+# is what guarantees torch's bundled libaotriton can never be loaded in the
+# measurement process (perfmon-rev0.md D4, §4).
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+. "$TUNE_ROOT/lib/config_load.sh"
+. "$TUNE_ROOT/lib/sqlite3_compat.sh"
+
+WORKDIR="$1"
+ARCH="$2"
+ROCM_VERSION="$3"
+
+if [ -z "$WORKDIR" ] || [ -z "$ARCH" ]; then
+  cat >&2 <<EOF
+Usage: $0 <workdir> <arch> [rocm_version]
+
+  <workdir>       Project working directory (holds config.rc and workers.db)
+  <arch>          GPU architecture, e.g. gfx942. Selects the ROCm wheel's
+                  device extra (rocm[...,device-<arch>]), so it is required --
+                  device-all would pull every architecture's payload.
+  [rocm_version]  Exact ROCm version, e.g. 7.14.0. Defaults to
+                  \`perfmon::default_rocm\` in workers.db.
+EOF
+  exit 1
+fi
+
+load_config "$WORKDIR"
+
+# ROCm version: argument wins, else workers.db. Never defaulted -- it is half
+# of a subject's identity ((AOTriton tag, ROCm) pair), so guessing it would
+# mislabel whatever gets built.
+if [ -z "$ROCM_VERSION" ]; then
+  ROCM_VERSION=$(sqlite3 "$WORKDIR/workers.db" \
+    "SELECT COALESCE(value,'') FROM config WHERE key='perfmon::default_rocm'" 2>/dev/null || true)
+fi
+
+if [ -z "$ROCM_VERSION" ]; then
+  echo "Error: no ROCm version given and perfmon::default_rocm is not set in" >&2
+  echo "       $WORKDIR/workers.db. Set it to an exact version (e.g. 7.14.0)," >&2
+  echo "       never a truncated one (7.14), or pass it as the third argument." >&2
+  exit 1
+fi
+
+# Base image. Falls back to the worker base only because a fresh config.rc
+# already sets it to debian:13; anything else should be set explicitly.
+PERFMON_IMAGE_BASE="${PERFMON_IMAGE_BASE:-${CELERY_WORKER_IMAGE_BASE:-debian:13}}"
+
+# debian:13 ships python3.13 as `python3`; the venv module is a separate
+# package. Keep this table honest rather than assuming a version -- an older
+# base silently building against a different interpreter is exactly the kind of
+# drift that only shows up as an ABI error much later.
+case "$PERFMON_IMAGE_BASE" in
+  debian:13|debian:13-*|debian:trixie*)
+    PY=python3.13
+    PY_APT="python3.13 python3.13-venv"
+    ;;
+  debian:12|debian:12-*|debian:bookworm*)
+    PY=python3.11
+    PY_APT="python3.11 python3.11-venv"
+    ;;
+  *)
+    echo "Error: unsupported perfmon base image '$PERFMON_IMAGE_BASE'." >&2
+    echo "       Add its python version to the case block in $0 -- do not" >&2
+    echo "       guess, the ROCm wheels are built per interpreter version." >&2
+    exit 1
+    ;;
+esac
+
+# Run the venv as the invoking user so artifacts land host-writable.
+BUILD_UID="${PERFMON_BUILD_UID:-$(id -u)}"
+BUILD_GID="${PERFMON_BUILD_GID:-$(id -g)}"
+BUILD_USER="${PERFMON_BUILD_USER:-builder}"
+
+if [ "$BUILD_UID" = "0" ]; then
+  echo "Warning: building as uid 0; artifacts will be root-owned on the host." >&2
+fi
+
+VENV="/opt/perfmon-venv"
+PIP_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
+ROCM_SPEC="rocm[libraries,devel,device-${ARCH}]==${ROCM_VERSION}"
+
+IMAGE_BUILD_DIR="$WORKDIR/perfmon.image.build"
+mkdir -p "$IMAGE_BUILD_DIR"
+
+cat > "$IMAGE_BUILD_DIR/Dockerfile" <<EOF
+# Auto-generated by .tune/lib/create_perfmon_dockerfile.sh
+# WARNING: This file is overwritten on every run. Do not edit by hand.
+#
+#   base   ${PERFMON_IMAGE_BASE}
+#   python ${PY}
+#   ROCm   ${ROCM_VERSION} (TheRock wheels, ${ARCH})
+#   venv   ${VENV}, owned by ${BUILD_UID}:${BUILD_GID}
+FROM ${PERFMON_IMAGE_BASE}
+
+# Base image has no ROCm and no compiler. git/cmake/ninja are for building the
+# perfmon runner and the AOTriton shim; ca-certificates is needed before pip
+# can reach an https index at all.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+      ca-certificates curl git cmake ninja-build build-essential \\
+      ${PY_APT} \\
+ && rm -rf /var/lib/apt/lists/*
+
+# Recreate the invoking user inside the image so the venv and every artifact it
+# produces are owned by the same uid:gid on the host.
+#
+# Every later layer says \`su ${BUILD_USER}\`, so this step must guarantee that
+# NAME exists and owns that uid -- not merely that the uid exists. A base image
+# that already ships an account at this uid (ubuntu has \`ubuntu\` at 1000;
+# debian does not) would otherwise leave every subsequent su failing with
+# "user ${BUILD_USER} does not exist". Rename it instead of skipping.
+RUN set -eux; \\
+    if ! getent group ${BUILD_GID} >/dev/null; then groupadd -g ${BUILD_GID} ${BUILD_USER}; fi; \\
+    existing=\$(getent passwd ${BUILD_UID} | cut -d: -f1 || true); \\
+    if [ -z "\$existing" ]; then \\
+      useradd -m -u ${BUILD_UID} -g ${BUILD_GID} -s /bin/bash ${BUILD_USER}; \\
+    elif [ "\$existing" != "${BUILD_USER}" ]; then \\
+      usermod -l ${BUILD_USER} -s /bin/bash "\$existing"; \\
+    fi; \\
+    getent passwd ${BUILD_USER}; \\
+    install -d -o ${BUILD_UID} -g ${BUILD_GID} ${VENV}
+
+# Everything below runs as the build user. \`su\` (not USER) so the image's
+# default user stays root for any later layer that needs it, and so the venv is
+# never touched by root -- a root-written file inside a user-owned venv makes
+# the next non-root pip install fail with EACCES inside site-packages.
+RUN su -s /bin/bash ${BUILD_USER} -c '\\
+      set -eux; \\
+      ${PY} -m venv ${VENV}; \\
+      . ${VENV}/bin/activate; \\
+      python -m pip install --upgrade pip'
+
+# TheRock ROCm from the pip wheel index. \`devel\` is required: it carries the
+# headers and the compiler that the AOTriton shim build needs, and it is what
+# makes \`rocm-sdk init\` below meaningful (300-post-install.rst says to run
+# init only when devel is installed).
+RUN su -s /bin/bash ${BUILD_USER} -c '\\
+      set -eux; \\
+      . ${VENV}/bin/activate; \\
+      python -m pip install --index-url ${PIP_INDEX} "${ROCM_SPEC}"; \\
+      rocm-sdk init; \\
+      rocm-sdk path --root > ${VENV}/.rocm_root; \\
+      echo "Resolved ROCM_PATH=\$(cat ${VENV}/.rocm_root)"'
+
+# Bake ROCM_PATH and auto-activate the venv for every \`docker run\`, mirroring
+# .ci/theRock.Dockerfile so both images expose ROCm the same way.
+ENV VIRTUAL_ENV=${VENV}
+ENV PATH="${VENV}/bin:\${PATH}"
+ENV BASH_ENV=/etc/profile.d/perfmon.sh
+
+RUN set -eux; \\
+    rocm_root=\$(cat ${VENV}/.rocm_root); \\
+    mkdir -p /etc/profile.d; \\
+    printf '%s\\n' \\
+      '. ${VENV}/bin/activate' \\
+      "export ROCM_PATH=\${rocm_root}" \\
+      'export PATH="\${ROCM_PATH}/bin:\${ROCM_PATH}/llvm/bin:\${PATH}"' \\
+      'export LD_LIBRARY_PATH="\${ROCM_PATH}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"' \\
+      > /etc/profile.d/perfmon.sh
+
+# Sanity check, as the build user, through the same profile a later build will
+# use. Failing here beats failing three layers into an AOTriton shim build.
+#
+# Asserts only \`hipconfig\`, which is a stable part of every ROCm layout. The
+# compiler is LISTED, not asserted: TheRock's wheel layout is not verified here,
+# and hard-failing the whole image on a guessed binary name would turn a naming
+# difference into a build outage. Read the listing when a shim build later
+# cannot find its compiler.
+RUN su -s /bin/bash ${BUILD_USER} -c 'set -eux; \\
+      . /etc/profile.d/perfmon.sh; \\
+      hipconfig --version; \\
+      echo "--- \${ROCM_PATH}/llvm/bin ---"; \\
+      ls "\${ROCM_PATH}/llvm/bin" 2>/dev/null | head -40 || echo "(no llvm/bin)"'
+
+USER ${BUILD_UID}:${BUILD_GID}
+WORKDIR /work
+EOF
+
+echo "Generated perfmon Dockerfile at: $IMAGE_BUILD_DIR/Dockerfile"
+echo "  base:  $PERFMON_IMAGE_BASE ($PY)"
+echo "  arch:  $ARCH"
+echo "  ROCm:  $ROCM_VERSION"
+echo "  venv:  $VENV (owned by ${BUILD_UID}:${BUILD_GID})"
