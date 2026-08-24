@@ -107,7 +107,7 @@ def op_attn_fwd():
 @ati.tune.binning(max_seqlen_q=ati.tune.binning.le,
                   max_seqlen_k=ati.tune.binning.le)
 @ati.backend(2, aiter_fmha_v3_bwd, 'aiter')
-@ati.backend(1, bwd_kernel_fuse, 'bwd_kernel_fuse')
+@ati.backend(1, bwd_kernel_fuse, 'triton_fuse')
 @ati.backend(0, metro_bwd, 'triton_split')
 @ati.operator(call_options_name='attn_options')
 def op_attn_bwd():

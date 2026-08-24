@@ -133,8 +133,20 @@ class MetroShell:
 
 class OperatorShell:
     """A parsed @ati.operator: the passive OperatorDecl + its backend refs as
-    (index, kind, name) where kind is 'metro' | 'kernel' | 'affine'. default_kdesc +
-    struct are DERIVED by the linker (A1/A3); the surface declares neither."""
+    (index, kind, key, name).
+
+    `key` is what the linker looks the built object up by -- the metro/kernel/
+    affine/flyc's own name. `name` is what @ati.backend DECLARED, and is the
+    user-facing vocabulary: it is what the published backend constants and
+    `by_index` are built from.
+
+    The two were one field until it emerged that only visit_metro used the
+    declared name at all; visit_kernel/affine/flyc silently substituted the
+    object's own, so `@ati.backend(1, aiter_fmha_v3_fwd, 'aiter')` produced
+    'aiter_fmha_v3_fwd' and a rename of a non-metro backend did nothing.
+
+    default_kdesc + struct are DERIVED by the linker (A1/A3); the surface
+    declares neither."""
 
     __slots__ = ('name', 'decl', 'backend_refs')
 
@@ -232,13 +244,13 @@ class FamilyCompiler:
         if b.name not in self.compiled.metros:
             self.compiled.metros[b.name] = MetroShell(b.name, plan, sub_names,
                                                       precedence=plan.precedence)
-        return (b.index, 'metro', b.name)
+        return (b.index, 'metro', b.name, b.name)
 
     def visit_kernel(self, b):
-        return (b.index, 'kernel', self.record_kernel(b.obj))
+        return (b.index, 'kernel', self.record_kernel(b.obj), b.name)
 
     def visit_affine(self, b):
-        return (b.index, 'affine', self.record_affine(b.obj))
+        return (b.index, 'affine', self.record_affine(b.obj), b.name)
 
     # --- recording, dispatched by node kind ----------------------------------
     #
@@ -269,7 +281,7 @@ class FamilyCompiler:
         return adecl.name
 
     def visit_flyc(self, b):
-        return (b.index, 'flyc', self.record_flyc(b.obj))
+        return (b.index, 'flyc', self.record_flyc(b.obj), b.name)
 
     # --- metro sub-plan descent (Call | Cond tree) ---------------------------
 
