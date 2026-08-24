@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+
+{% block title %}PerfmonConfig{% endblock %}
+
+{% block content %}
+<h2>Perfmon Configuration</h2>
+
+<p style="color: gray;">
+    Settings for the performance-measurement workload. These live in
+    <code>workers.db</code> under the <code>perfmon::</code> key prefix, not in
+    <code>config.rc</code>.
+</p>
+
+<section>
+    <h3>Default ROCm Version</h3>
+    <p>
+        The ROCm the perfmon image is built against, and the runtime half of
+        every <em>subject</em>. A subject is an (AOTriton tag, ROCm) pair
+        identified as <code>aotriton-&lt;tag&gt;+rocm&lt;version&gt;</code>, so
+        this string is not just a build input &mdash; it labels the published
+        numbers.
+    </p>
+    <p style="font-size: 0.9em; color: gray;">
+        Give the <strong>exact</strong> version the wheel index expects
+        &mdash; <code>7.14.0</code>, or a TheRock pre-release such as
+        <code>7.14.0a20260624</code>. A truncated <code>7.14</code> is
+        rejected: it goes verbatim into
+        <code>pip install "rocm[...]==&lt;version&gt;"</code>, so a loose value
+        either fails the install or mislabels a build.
+    </p>
+
+    <form hx-post="/api/perfmon/default_rocm"
+          hx-swap="none"
+          hx-on::after-request="location.reload()">
+        <table>
+            <tr>
+                <td><label for="perfmon-rocm">Default ROCm:</label></td>
+                <td>
+                    <input type="text" name="rocm" id="perfmon-rocm"
+                           value="{{ perfmon_rocm or '' }}"
+                           placeholder="7.14.0"
+                           style="width: 320px;">
+                </td>
+                <td><button type="submit">Save</button></td>
+            </tr>
+        </table>
+        <p style="font-size: 0.9em; color: gray;">
+            Leave empty and save to clear it. While unset, the
+            <em>Build Perfmon Artifacts</em> section on the Builds tab stays
+            disabled &mdash; the version is never defaulted, because guessing it
+            would mislabel whatever gets built.
+        </p>
+    </form>
+
+    <p>
+        Current value:
+        {% if perfmon_rocm %}<code>{{ perfmon_rocm }}</code>
+        {% else %}<strong style="color: #a15c00;">not set</strong>{% endif %}
+    </p>
+</section>
+
+<section>
+    <h3>Status</h3>
+    <table>
+        <tr><th>Item</th><th>Value</th></tr>
+        <tr>
+            <td>Default ROCm</td>
+            <td>{% if perfmon_rocm %}<code>{{ perfmon_rocm }}</code>{% else %}<em>not set</em>{% endif %}</td>
+        </tr>
+        <tr>
+            <td>Architectures</td>
+            <td><strong>{{ archs|length }}</strong> ({{ archs|join(', ') }})</td>
+        </tr>
+        <tr>
+            <td>Perfmon workload</td>
+            <td>
+                <span style="color: #a15c00;">not wired up</span> &mdash; the
+                <code>perf_measure</code> queue class and its shard exist, but
+                there are no handlers, no dispatcher path, and
+                <code>worker_service.sh</code> does not forward
+                <code>--class</code> yet.
+            </td>
+        </tr>
+    </table>
+</section>
+{% endblock %}

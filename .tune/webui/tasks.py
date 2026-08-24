@@ -930,6 +930,40 @@ def get_perfmon_rocm(workdir) -> str | None:
         return None
 
 
+def set_perfmon_rocm(workdir, rocm: str):
+    """Set `perfmon::default_rocm` in workers.db. Empty string clears it.
+
+    The version is validated to be a full X.Y.Z (with any suffix, e.g.
+    '7.14.0a20260624'), because a truncated '7.14' is not a thing that can be
+    installed: it goes verbatim into the pip spec
+    (`rocm[...]==<version>`) and into the subject id
+    (`aotriton-<tag>+rocm<version>`), so a loose value would either fail the
+    install or silently mislabel a build.
+    """
+    rocm = (rocm or '').strip()
+    if rocm and not re.fullmatch(r'\d+\.\d+\.\d+[A-Za-z0-9.+-]*', rocm):
+        return {'success': False,
+                'error': f"{rocm!r} is not a full ROCm version. Give the exact "
+                         f"string the wheel index expects, e.g. '7.14.0' or "
+                         f"'7.14.0a20260624' -- never a truncated '7.14'."}
+    init_workers_db(workdir)
+    db_path = Path(workdir) / 'workers.db'
+    try:
+        with sqlite3.connect(db_path.as_posix()) as conn:
+            if rocm:
+                conn.execute("""
+                    INSERT INTO config (key, value) VALUES ('perfmon::default_rocm', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
+                """, (rocm, rocm))
+            else:
+                conn.execute("DELETE FROM config WHERE key = 'perfmon::default_rocm'")
+        return {'success': True,
+                'message': f"Default ROCm set to: {rocm}" if rocm
+                           else "Default ROCm cleared"}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
 def build_perfmon_artifacts(workdir, arch: str, tag: str = 'head', dry_run: bool = False):
     """Build perfmon core + runner for one (tag, ROCm, arch) subject."""
     if not arch:

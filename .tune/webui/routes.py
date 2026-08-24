@@ -427,6 +427,23 @@ def api_build_test_libraries():
     return jsonify(result)
 
 
+@bp.route('/perfmon_config')
+def perfmon_config():
+    """Perfmon configuration page."""
+    workdir = current_app.config['WORKDIR']
+    return render_template('perfmon_config.html',
+                           perfmon_rocm=tasks.get_perfmon_rocm(workdir),
+                           archs=tasks.get_architectures(workdir))
+
+
+@bp.route('/api/perfmon/default_rocm', methods=['POST'])
+def api_set_perfmon_rocm():
+    """Set the default ROCm version used to build perfmon subjects."""
+    workdir = current_app.config['WORKDIR']
+    result = tasks.set_perfmon_rocm(workdir, request.form.get('rocm', ''))
+    return jsonify(result)
+
+
 @bp.route('/api/builds/perfmon', methods=['POST'])
 def api_build_perfmon_artifacts():
     """Build perfmon measurement artifacts (core + runner) for one arch."""
