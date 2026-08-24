@@ -203,8 +203,23 @@
             <td>Architectures</td>
             <td><strong>{{ archs|length }}</strong> ({{ archs|join(', ') }})</td>
         </tr>
+        {# There is exactly one build host. This row used to render `hostnames`,
+           which is every registered worker -- so a two-worker fleet claimed two
+           build hosts. Multiple build nodes are deliberately not supported yet;
+           the single node lives in buildnode::hostname. #}
         <tr>
-            <td>Build Hosts</td>
+            <td>Build Host</td>
+            <td>
+                {% if build_node_config.hostname %}
+                <code>{{ build_node_config.hostname }}</code>
+                {% if not build_node_config.enabled %}<span style="color: gray;">— configured but disabled, builds run locally</span>{% endif %}
+                {% else %}
+                <em>local</em> — no remote build node configured
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>Registered Workers</td>
             <td><strong>{{ hostnames|length }}</strong> ({{ hostnames|join(', ') }})</td>
         </tr>
         <tr>
