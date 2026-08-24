@@ -12,6 +12,18 @@ fi
 
 SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 . "${SCRIPT_DIR}/common-vars.sh"
+
+# The dispatch index a backend NAME resolves to, or non-zero if this build has
+# no such backend on that operator. $1 is OpAttnFwdBackend / OpAttnBwdBackend,
+# $2 the @ati.backend name. Reads PYTHONPATH at call time, so it must be called
+# after that is exported.
+backend_index_of() {
+  python -c "
+import torch, pyaotriton
+from pyaotriton.v3.flash import $1 as B
+print({v: k for k, v in B.by_index.items()}['$2'])
+" 2>/dev/null
+}
 add_torch_ldconfig
 add_rocm_sdk_ldconfig
 
@@ -86,25 +98,31 @@ fi
   fi
   set -v
   export PYTHONPATH="${AOTRITON_TEST_LIBDIR:-${bdir}/install_dir/lib}"
-  # flyc pins the FORWARD backend, unlike the three above which pin the backward
-  # one, so it sets FWD_IMPL -- and SKIP_BWD, because flyc has no backward at
-  # all. Without SKIP_BWD every case would fail in .backward() for a reason that
-  # says nothing about the forward kernel under test.
+  # flyc pins BOTH directions, unlike the three above which pin the backward one
+  # only. Indices are looked up rather than written down: they are internal
+  # numbers that already moved once (flyc taking 2 on op_attn_fwd), whereas
+  # 'flyc' is the name @ati.backend declares and the library publishes. Sits here
+  # rather than beside the other backends because it needs PYTHONPATH.
   #
-  # The index is looked up, not written down: it is an internal number that
-  # already moved once (flyc taking 2 on op_attn_fwd), whereas 'flyc' is the name
-  # @ati.backend declares and the library publishes. Sits here rather than beside
-  # the other backends because it needs PYTHONPATH to import pyaotriton.
+  # The backward half is conditional ON THE BUILD, not on a flag here: the flyc
+  # backward kernel is being wired now, and this pass should start exercising it
+  # the moment it lands rather than waiting for someone to remember this file.
+  # Until then SKIP_BWD keeps the pass to the forward half, because otherwise
+  # every case fails in .backward() for a reason that says nothing about the
+  # forward kernel under test.
   if [[ "$backend" == "flyc" ]]; then
-    export SKIP_BWD=1
-    FWD_IMPL=$(python -c "import torch, pyaotriton
-from pyaotriton.v3.flash import OpAttnFwdBackend as B
-print({v: k for k, v in B.by_index.items()}['flyc'])") || {
+    FWD_IMPL=$(backend_index_of OpAttnFwdBackend flyc) || {
       echo "run-test.sh: this build publishes no 'flyc' forward backend" >&2
       exit 1
     }
     export FWD_IMPL
-    echo "run-test.sh: flyc forward backend resolved to FWD_IMPL=${FWD_IMPL}"
+    if BWD_IMPL=$(backend_index_of OpAttnBwdBackend flyc); then
+      export BWD_IMPL
+      echo "run-test.sh: flyc FWD_IMPL=${FWD_IMPL} BWD_IMPL=${BWD_IMPL} (forward and backward)"
+    else
+      export SKIP_BWD=1
+      echo "run-test.sh: flyc FWD_IMPL=${FWD_IMPL}; no flyc backward backend in this build, SKIP_BWD=1"
+    fi
   fi
   _sig=$(ls "$PYTHONPATH/aotriton.images/"*"/__signature__" 2>/dev/null | head -n 1)
   {
