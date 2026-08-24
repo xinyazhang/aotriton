@@ -156,6 +156,43 @@
 </section>
 
 <section>
+    <h3>Build Perfmon Artifacts</h3>
+    <p>
+        Build the perfmon measurement runner: the AOTriton-neutral
+        <code>libperfmon_core</code> (one per ROCm, shared by every subject) plus
+        this subject's family library and <code>bin/runner</code>.
+        Uses <code>perfmon/build_subject.sh &lt;tag&gt; &lt;rocm&gt; &lt;arch&gt;</code>.
+    </p>
+    <p style="font-size: 0.9em; color: gray;">
+        A <em>subject</em> is an (AOTriton tag, ROCm) pair. ROCm comes from
+        <code>perfmon::default_rocm</code> in <code>workers.db</code>:
+        {% if perfmon_rocm %}<code>{{ perfmon_rocm }}</code>{% else %}<strong style="color: #a15c00;">not set</strong>{% endif %}.
+        Only the <code>head</code> tag is buildable today; historical release
+        subjects additionally need that release's kernel image tarball.
+    </p>
+    {% if not perfmon_rocm %}
+    <p style="font-size: 0.9em; color: #a15c00;">
+        Set <code>perfmon::default_rocm</code> to an exact ROCm version string
+        (e.g. <code>7.14.0</code>, never a truncated <code>7.14</code>) before
+        building &mdash; it is part of the subject's identity, so it is not
+        guessed.
+    </p>
+    {% endif %}
+    <div style="margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">
+        <span style="font-size: 0.9em; color: gray; margin-right: 0.2rem;">Build for arch:</span>
+        {% for arch in archs %}
+        <button hx-post="/api/builds/perfmon"
+                hx-vals='{"arch": "{{ arch }}", "tag": "head"}'
+                hx-swap="none"
+                hx-confirm="Build perfmon artifacts for {{ arch }} (tag head)?"
+                hx-indicator="#perfmon-build-spinner-{{ arch }}"
+                {% if not perfmon_rocm %}disabled title="Set perfmon::default_rocm first"{% endif %}>{{ arch }}</button>
+        <span id="perfmon-build-spinner-{{ arch }}" class="htmx-indicator">⏳</span>
+        {% endfor %}
+    </div>
+</section>
+
+<section>
     <h3>Build Information</h3>
     <table>
         <tr>

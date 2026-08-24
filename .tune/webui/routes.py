@@ -104,11 +104,13 @@ def builds():
     default_workdir = tasks.get_default_workdir(workdir) or '(not set)'
     git_status = tasks.get_git_status(workdir)
     use_installed_db = tasks.get_test_build_use_installed_db(workdir)
+    perfmon_rocm = tasks.get_perfmon_rocm(workdir)
     return render_template('builds.html', archs=archs, hostnames=hostnames,
                            build_node_config=build_node_config,
                            default_workdir=default_workdir,
                            git_status=git_status,
-                           use_installed_db=use_installed_db)
+                           use_installed_db=use_installed_db,
+                           perfmon_rocm=perfmon_rocm)
 
 
 @bp.route('/deploy')
@@ -422,6 +424,16 @@ def api_build_test_libraries():
     single_arch = request.form.get('single_arch', '').strip() or None
     use_installed_db = tasks.get_test_build_use_installed_db(workdir)
     result = tasks.build_test_libraries(workdir, single_arch, use_installed_db=use_installed_db, dry_run=should_dryrun())
+    return jsonify(result)
+
+
+@bp.route('/api/builds/perfmon', methods=['POST'])
+def api_build_perfmon_artifacts():
+    """Build perfmon measurement artifacts (core + runner) for one arch."""
+    workdir = current_app.config['WORKDIR']
+    arch = request.form.get('arch', '').strip()
+    tag = request.form.get('tag', '').strip() or 'head'
+    result = tasks.build_perfmon_artifacts(workdir, arch, tag=tag, dry_run=should_dryrun())
     return jsonify(result)
 
 

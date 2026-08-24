@@ -33,9 +33,10 @@
 </section>
 
 <section>
-    <h3>Tuning Mode</h3>
+    <h3>Workload</h3>
     {{ tuning_mode_radios(tuning_mode, with_own_save_form=true,
-           description_extra='This sets the default selection in the Bulk Actions section below.') }}
+           description_extra='This sets the default selection in the Bulk Actions section below.',
+           include_perfmon=true) }}
 </section>
 
 <section>

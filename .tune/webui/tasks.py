@@ -548,6 +548,24 @@ class BuildTestLibrariesCommand(CommandBuilder):
         return self._run(self.RELATIVE, args, workdir, label, dry_run=dry_run)
 
 
+class BuildPerfmonArtifactsCommand(CommandBuilder):
+    """Build the perfmon measurement artifacts for one subject via
+    perfmon/build_subject.sh.
+
+    A subject is a (AOTriton tag, ROCm) pair; the script builds the
+    AOTriton-neutral libperfmon_core plus that subject's family library and
+    runner. Only the 'head' tag is buildable today -- historical release
+    subjects need the release image tarballs, which is later work.
+    """
+    RELATIVE = 'perfmon/build_subject.sh'
+    DESCRIPTION = 'Build perfmon artifacts'
+
+    def exec(self, workdir, arch: str, rocm: str, tag: str = 'head', dry_run: bool = False):
+        return self._run(self.RELATIVE, [tag, rocm, arch], workdir,
+                         f'Build perfmon artifacts ({tag}+rocm{rocm}, {arch})',
+                         dry_run=dry_run)
+
+
 class BuildImagesCommand(BuildCommand):
     RELATIVE = '.tune/bin/imgbld'
     DESCRIPTION = 'Build Docker images'
@@ -618,6 +636,7 @@ _bake_lut = BakeLutCommand()
 
 _build_libraries = BuildLibrariesCommand()
 _build_test_libraries = BuildTestLibrariesCommand()
+_build_perfmon_artifacts = BuildPerfmonArtifactsCommand()
 _build_images = BuildImagesCommand()
 _build_image_on_worker = BuildImageOnWorkerCommand()
 
@@ -890,6 +909,38 @@ def build_libraries(workdir, single_arch: str | None = None, dry_run: bool = Fal
 def build_test_libraries(workdir, single_arch: str | None = None, use_installed_db: bool = True, dry_run: bool = False):
     """Build testing version of AOTriton libraries inside container (all arches or one)."""
     return _build_test_libraries.exec(workdir, single_arch, use_installed_db=use_installed_db, dry_run=dry_run)
+
+
+def get_perfmon_rocm(workdir) -> str | None:
+    """Read the perfmon default ROCm from workers.db (`perfmon::default_rocm`).
+
+    Returns None when unset. There is deliberately no fallback value: a
+    subject is identified by its (tag, ROCm) pair, so guessing a ROCm here
+    would silently mislabel whatever gets built.
+    """
+    init_workers_db(workdir)
+    db_path = Path(workdir) / 'workers.db'
+    try:
+        with sqlite3.connect(db_path.as_posix()) as conn:
+            cursor = conn.execute(
+                "SELECT value FROM config WHERE key = 'perfmon::default_rocm'")
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def build_perfmon_artifacts(workdir, arch: str, tag: str = 'head', dry_run: bool = False):
+    """Build perfmon core + runner for one (tag, ROCm, arch) subject."""
+    if not arch:
+        return {'success': False, 'error': 'No architecture given'}
+    rocm = get_perfmon_rocm(workdir)
+    if not rocm:
+        return {'success': False,
+                'error': "perfmon::default_rocm is not set in workers.db. "
+                         "Set it to the exact ROCm version string (e.g. "
+                         "'7.14.0') before building perfmon artifacts."}
+    return _build_perfmon_artifacts.exec(workdir, arch, rocm, tag=tag, dry_run=dry_run)
 
 
 def fetch_tuning_build(workdir, dry_run: bool = False):
@@ -1487,9 +1538,18 @@ def get_tuning_mode(workdir) -> str:
 
 
 def set_tuning_mode(workdir, mode: str):
-    """Set the WebUI tuning mode in workers.db. mode must be 'kernel' or 'op'."""
-    if mode not in ('kernel', 'op'):
-        return {'success': False, 'error': f"Invalid tuning mode: {mode!r}"}
+    """Set the WebUI workload in workers.db.
+
+    Surfaced as "Workload" since it now spans work that is not tuning; the
+    config key and this function keep their names.
+
+    'kernel' and 'op' are `class='tune_kernel'` subclasses; 'perfmon' selects
+    the `class='perf_measure'` DAG, whose handlers do not exist yet -- the
+    value is accepted and stored so the choice survives, but nothing consumes
+    it downstream so far.
+    """
+    if mode not in ('kernel', 'op', 'perfmon'):
+        return {'success': False, 'error': f"Invalid workload: {mode!r}"}
     init_workers_db(workdir)
     workdir_path = Path(workdir)
     db_path = workdir_path / 'workers.db'
@@ -1499,7 +1559,7 @@ def set_tuning_mode(workdir, mode: str):
                 INSERT INTO config (key, value) VALUES ('webui::tuning_mode', ?)
                 ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
             """, (mode, mode))
-        return {'success': True, 'message': f"Tuning mode set to: {mode}"}
+        return {'success': True, 'message': f"Workload set to: {mode}"}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
