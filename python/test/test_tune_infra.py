@@ -276,15 +276,16 @@ def test_fetch_tasks_requires_tuning_mode_keyword():
 
 
 def test_fetch_tasks_sql_filters_on_tuning_level():
-    # The SQL itself must filter on the denormalized tuning_level column
-    # (not a `module LIKE '%_op'` string-suffix pattern -- the pre-Phase-2
-    # anti-pattern this replaces).
+    # The SQL itself must filter on the denormalized subclass column (the
+    # task_queue column formerly named tuning_level, renamed under perfmon
+    # rev2 R01) -- not a `module LIKE '%_op'` string-suffix pattern -- the
+    # pre-Phase-2 anti-pattern this replaces.
     pytest.importorskip('psycopg')
     import inspect
     from aotriton.tune.pq.queue import TaskQueue
 
     source = inspect.getsource(TaskQueue.fetch_tasks)
-    assert 'tuning_level = %s' in source
+    assert 'subclass = %s' in source
     assert "LIKE '%_op'" not in source
     assert "NOT LIKE '%_op'" not in source
 
@@ -608,10 +609,13 @@ def test_entry_filter_is_the_only_clause_builder():
     assert sql == "task_config->'entry'->'hdim' = %s::jsonb"
     assert params == ['[64, 128]']
 
-    # Optional row filters lead, in a fixed order.
+    # Optional row filters lead, in a fixed order. The `tuning_level=`
+    # keyword argument is unchanged (workload-facing name); only the
+    # underlying task_queue column it targets was renamed to `subclass`
+    # under perfmon rev2 R01.
     sql, params = entry_filter({'hdim': 64}, arch='gfx942',
                                tuning_level='op', module='flash')
-    assert sql.startswith("task_config->>'arch' = %s AND tuning_level = %s "
+    assert sql.startswith("task_config->>'arch' = %s AND subclass = %s "
                           "AND module = %s AND ")
     assert params[:3] == ['gfx942', 'op', 'flash']
 

@@ -43,7 +43,7 @@ def entry_filter(entry, *, arch=None, tuning_level=None, module=None):
         clauses.append("task_config->>'arch' = %s")
         params.append(arch)
     if tuning_level is not None:
-        clauses.append('tuning_level = %s')
+        clauses.append('subclass = %s')
         params.append(tuning_level)
     if module is not None:
         clauses.append('module = %s')
@@ -69,7 +69,7 @@ def entry_filter(entry, *, arch=None, tuning_level=None, module=None):
 class TuningLevelMismatch(RuntimeError):
     """fetch_tasks() claimed a task belonging to the other tuning level.
 
-    Only reachable if the UPDATE's `tuning_level` predicate is broken, since
+    Only reachable if the UPDATE's `subclass` predicate is broken, since
     PostgreSQL would otherwise not return the row. Systemic rather than
     transient: the filter is the sole thing keeping a worker off tasks its
     pyaotriton build cannot execute, so every later claim is suspect too.
@@ -78,11 +78,20 @@ class TuningLevelMismatch(RuntimeError):
 
 @dataclass
 class Task:
-    """Task representation"""
+    """Task representation.
+
+    `klass` names the DAG (perfmon rev2 R01; 'tune_kernel' | 'perf_measure').
+    Spelled `klass`, not `class`, because `class` is a Python keyword --
+    the SQL column is still `class` (see schema.sql / queue SQL below,
+    which alias it `AS klass` when needed). `subclass` replaces the old
+    `tuning_level` field name, mirroring the task_queue column rename;
+    the concept is unchanged ('kernel' | 'op' for tune_kernel rows).
+    """
     id: int
     arch: str
     module: str
-    tuning_level: str
+    klass: str
+    subclass: str
     task_config: dict
     status: str
     priority: int = 5
@@ -109,12 +118,15 @@ class TaskQueue:
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}"
         self.node_hostname = socket.gethostname()
 
-    def fetch_tasks(self, arch: str, batch_size: int = 10, *, tuning_mode: str) -> list[Task]:
+    def fetch_tasks(self, arch: str, batch_size: int = 10, *, tuning_mode: str,
+                    klass: str = 'tune_kernel') -> list[Task]:
         """
         Fetch pending tasks for a specific architecture.
 
         Uses SELECT FOR UPDATE SKIP LOCKED for atomic task claiming.
-        Queries the architecture-specific partition directly for performance.
+        Queries the (arch, class) leaf partition directly for performance
+        (perfmon rev2 R01: task_queue is sharded rank-2 on (arch, class),
+        with leaves living in the `shards` schema).
 
         Args:
             arch: GPU architecture (e.g., 'gfx942', 'gfx90a')
@@ -122,12 +134,29 @@ class TaskQueue:
             tuning_mode: 'kernel' or 'op' (REQUIRED, keyword-only, no default --
                 a kernel worker must never claim an op task and vice versa,
                 see modular-tune.md F16). Filters on the denormalized
-                task_queue.tuning_level column, not a `module` string pattern.
+                task_queue.subclass column, not a `module` string pattern.
+            klass: which DAG to fetch for, e.g. 'tune_kernel' | 'perf_measure'
+                (keyword-only, defaults to 'tune_kernel' -- the only DAG that
+                exists today). Filters on task_queue.class and selects the
+                (arch, class) leaf partition.
 
         Returns:
             List of claimed Task objects
+
+        TODO: targeted message delivery. `arch` + `klass` + `tuning_mode` is
+        the whole routing vocabulary today, so any worker of the right arch,
+        class, and level can claim any pending task. It cannot express a
+        per-task requirement on what the *host* has provisioned -- which is
+        needed once several builds of the library under test coexist on one
+        fleet.
+
+        Intended shape: a `tags` column on task_queue (see schema.sql) and a
+        tag set per worker, with `AND <task tags are satisfied by worker
+        tags>` added to the claim UPDATE below, plus the same post-claim
+        assertion this method already makes for `tuning_mode` -- claiming a
+        task whose tags do not match is a bug, not a warning.
         """
-        partition_table = f"task_queue_{arch}"
+        partition_table = f"shards.task_queue_{arch}_{klass}"
 
         with self.conn.cursor(row_factory=dict_row) as cur:
             # Atomic task claiming using UPDATE ... RETURNING
@@ -140,15 +169,16 @@ class TaskQueue:
                 WHERE id IN (
                     SELECT id FROM {partition_table}
                     WHERE status = 'pending'
-                      AND tuning_level = %s
+                      AND class = %s
+                      AND subclass = %s
                     ORDER BY priority DESC, id ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id, arch, module, tuning_level, task_config, status, priority,
+                RETURNING id, arch, module, class AS klass, subclass, task_config, status, priority,
                           worker_id, node_hostname, created_at, started_at,
                           completed_at, error, retry_count
-            """, (self.worker_id, self.node_hostname, tuning_mode, batch_size))
+            """, (self.worker_id, self.node_hostname, klass, tuning_mode, batch_size))
 
             try:
                 rows = cur.fetchall()
@@ -158,14 +188,14 @@ class TaskQueue:
 
             tasks = [Task(**row) for row in rows]
 
-            # The UPDATE above filters on tuning_level, so a row of the wrong
-            # level means that predicate is broken. Release the whole batch --
-            # connections here are autocommit, so the claim is already durable
-            # and raising without this would strand every row in 'running' --
-            # then fail. The batch is released entirely, not just the offending
-            # rows: this raises out of the worker, so correctly-claimed tasks
-            # would be stranded too.
-            wrong = [t for t in tasks if t.tuning_level != tuning_mode]
+            # The UPDATE above filters on class and subclass, so a row of the
+            # wrong class/level means that predicate is broken. Release the
+            # whole batch -- connections here are autocommit, so the claim is
+            # already durable and raising without this would strand every row
+            # in 'running' -- then fail. The batch is released entirely, not
+            # just the offending rows: this raises out of the worker, so
+            # correctly-claimed tasks would be stranded too.
+            wrong = [t for t in tasks if t.klass != klass or t.subclass != tuning_mode]
             if wrong:
                 cur.execute(f"""
                     UPDATE {partition_table}
@@ -174,9 +204,9 @@ class TaskQueue:
                      WHERE id = ANY(%s)
                 """, ([t.id for t in tasks],))
                 raise TuningLevelMismatch(
-                    f"fetch_tasks({arch!r}, tuning_mode={tuning_mode!r}) claimed "
-                    f"task_ids={[t.id for t in wrong]} with tuning_level="
-                    f"{sorted({t.tuning_level for t in wrong})}; the tuning_level "
+                    f"fetch_tasks({arch!r}, klass={klass!r}, tuning_mode={tuning_mode!r}) "
+                    f"claimed task_ids={[t.id for t in wrong]} with (class, subclass)="
+                    f"{sorted({(t.klass, t.subclass) for t in wrong})}; the class/subclass "
                     f"filter is not doing its job. Released "
                     f"{len(tasks)} claim(s) back to pending.")
 
@@ -195,7 +225,7 @@ class TaskQueue:
             task_id: Task ID
             arch: GPU architecture (for partition routing)
         """
-        partition_table = f"task_queue_{arch}"
+        partition_table = f"shards.task_queue_{arch}"
 
         with self.conn.cursor() as cur:
             cur.execute(f"""
@@ -219,7 +249,7 @@ class TaskQueue:
         """
         with self.conn.cursor() as cur:
             if arch:
-                partition_table = f"task_queue_{arch}"
+                partition_table = f"shards.task_queue_{arch}"
                 cur.execute(f"""
                     UPDATE {partition_table}
                     SET status = 'failed',
@@ -252,7 +282,7 @@ class TaskQueue:
             task_id: Task ID
             arch: GPU architecture (for partition routing)
         """
-        partition_table = f"task_queue_{arch}"
+        partition_table = f"shards.task_queue_{arch}"
 
         with self.conn.cursor() as cur:
             cur.execute(f"""
@@ -281,7 +311,7 @@ class TaskQueue:
         Returns:
             True if task was retried, False if max retries exceeded
         """
-        partition_table = f"task_queue_{arch}"
+        partition_table = f"shards.task_queue_{arch}"
 
         with self.conn.cursor() as cur:
             cur.execute(f"""
@@ -313,7 +343,7 @@ class TaskQueue:
         """
         with self.conn.cursor() as cur:
             if arch:
-                partition_table = f"task_queue_{arch}"
+                partition_table = f"shards.task_queue_{arch}"
                 cur.execute(f"""
                     SELECT
                         COUNT(*) FILTER (WHERE status = 'pending') as pending,
@@ -347,7 +377,7 @@ class TaskQueue:
         """
         with self.conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT id, arch, module, tuning_level, task_config, status, priority,
+                SELECT id, arch, module, class AS klass, subclass, task_config, status, priority,
                        worker_id, node_hostname, created_at, started_at,
                        completed_at, error, retry_count
                 FROM task_queue
@@ -395,7 +425,7 @@ class TaskQueue:
     # Entry / id lookups
     # ------------------------------------------------------------------
 
-    _LOOKUP_COLUMNS = 'id, arch, module, tuning_level, status'
+    _LOOKUP_COLUMNS = 'id, arch, module, class AS klass, subclass, status'
 
     def find_by_entry(self, entry, *, arch=None, tuning_level=None,
                       module=None, columns: str | None = None,
@@ -455,7 +485,7 @@ class TaskQueue:
                 FROM task_queue
                 WHERE status = 'completed'
                   AND completed_at > NOW() - %s::interval
-                  AND tuning_level = %s
+                  AND subclass = %s
                 GROUP BY arch
             """, (recent_window, tuning_level))
             speed = cur.fetchall()
@@ -465,7 +495,7 @@ class TaskQueue:
                 FROM task_queue
                 WHERE status = 'running'
                   AND EXTRACT(EPOCH FROM (NOW() - started_at)) > %s
-                  AND tuning_level = %s
+                  AND subclass = %s
                 GROUP BY arch
             """, (stale_seconds, tuning_level))
             stale = cur.fetchall()
@@ -509,6 +539,6 @@ class TaskQueue:
                        started_at   = NULL,
                        completed_at = NULL,
                        error        = NULL
-                 WHERE tuning_level = %s AND id = ANY(%s)
+                 WHERE subclass = %s AND id = ANY(%s)
             """, (tuning_level, row_ids))
             return cur.rowcount

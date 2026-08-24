@@ -147,7 +147,7 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
         module_name: Name of the tuning module (e.g., 'flash')
         module_instance: Module instance with ENTRY_CLASS defining field structure
         tuning_mode: 'kernel' or 'op' -- filters on the denormalized
-            task_queue.tuning_level column so kernel-level and op-level
+            task_queue.subclass column so kernel-level and op-level
             completed tasks (which may share the same module name and entry
             fields) are never conflated.
         verbose: Print debug info
@@ -182,7 +182,8 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
                 FROM task_queue
                 WHERE status = 'completed'
                   AND module = %s
-                  AND tuning_level = %s
+                  AND class = 'tune_kernel'
+                  AND subclass = %s
             """, (module_name, tuning_mode))
 
             # Extract task_config from each row and convert to hashable tuple
@@ -278,10 +279,14 @@ def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
                     print(f"Skipping completed task: {task_config['entry']}")
                 continue
 
-        # Prepare task for dispatcher
+        # Prepare task for dispatcher. 'class' names the DAG this task
+        # starts (perfmon rev2 R01/R02) -- dispatch_tasks.py only ever
+        # dispatches the tune_kernel DAG; a --class flag to dispatch
+        # perf_measure tasks is future work (rev2 Stage P), out of scope here.
         tasks_to_dispatch.append({
             'arch': task_config['arch'],
             'module': task_config['module'],
+            'class': 'tune_kernel',
             'tuning_level': task_config['tuning_level'],
             'task_config': task_config,
             'priority': 5  # Default priority

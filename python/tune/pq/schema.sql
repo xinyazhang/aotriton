@@ -18,12 +18,54 @@
 -- `optune_results` / `best_optune_results` / `most_accurate_optune_results`
 -- tables are gone outright, not ALTER'd. Re-initialize and re-tune.
 
+-- perfmon rev2 (Stage R, R01): `class` names which DAG a queued row belongs
+-- to -- today only 'tune_kernel'; a second DAG ('perf_measure') is added
+-- later. It is promoted from the message-dict vocabulary
+-- ({'class': 'tune_kernel', ...}, MessageHandler.get_class_name()) to a
+-- column, so the queue row and the message it produces agree by
+-- construction. NOT NULL, no DEFAULT: every dispatcher must name the DAG it
+-- is queueing, so an insert that omits `class` fails loudly instead of
+-- quietly becoming a tuning task.
+--
+-- `subclass` replaces the old `tuning_level` column name. The concept is
+-- unchanged (still 'kernel'/'op' for tune_kernel rows) -- only the column
+-- name moves, because its vocabulary is now defined per class (empty string
+-- for 'perf_measure', see the composite CHECK below): `subclass` names the
+-- *role*, which stays true for every class, where `tuning_level` would not.
+-- The tuning workload keeps saying "tuning level" at its own surfaces --
+-- --tuning_level on the CLI, task_config['tuning_level'], handlers.py,
+-- tdesc.py -- a schema column rename does not oblige a CLI rename.
+--
+-- Sharded rank-2 on (arch, class): nested LIST partitioning, since
+-- PostgreSQL rejects PARTITION BY LIST (arch, class) with "cannot use list
+-- partition strategy with more than one column" (verified on 17.11). Every
+-- partition -- both the per-arch level and its per-class leaves -- is
+-- created by create_arch_partition() below, the single source of truth for
+-- the class list, and lives in the `shards` schema so `\dt` in `public`
+-- lists only this parent.
+--
 -- Parent table (partitioned by architecture)
+--
+-- TODO: targeted message delivery. Routing today is (arch, class, subclass):
+-- a worker claims anything pending for its architecture, DAG class, and
+-- subclass. That cannot express "only a host that has X provisioned may run
+-- this", which is needed as soon as more than one build of the library under
+-- test coexists on a fleet (e.g. measuring several AOTriton releases, where
+-- the right binary must already be on the node).
+--
+-- Intended shape: a `tags` column on task_queue plus a matching set
+-- advertised per worker, with the claim UPDATE gaining a containment
+-- predicate so only a worker whose tags satisfy the task's may take it.
+-- Keep the post-claim assertion pattern below (see fetch_tasks) when adding
+-- it: a task claimed by a non-matching worker is a bug, not a warning.
+CREATE SCHEMA IF NOT EXISTS shards;
+
 CREATE TABLE IF NOT EXISTS task_queue (
     id BIGSERIAL,
     arch TEXT NOT NULL,
     module TEXT NOT NULL,
-    tuning_level TEXT NOT NULL CHECK (tuning_level IN ('kernel', 'op')),
+    class TEXT NOT NULL CHECK (class IN ('tune_kernel', 'perf_measure')),
+    subclass TEXT NOT NULL DEFAULT '',
     task_config JSONB NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',  -- pending/running/completed/failed/cancelled
     priority INT DEFAULT 5,
@@ -34,7 +76,13 @@ CREATE TABLE IF NOT EXISTS task_queue (
     completed_at TIMESTAMP,
     error TEXT,
     retry_count INT DEFAULT 0,
-    PRIMARY KEY (id, arch)
+    PRIMARY KEY (id, arch, class),
+    -- subclass's vocabulary is defined per class -- enforced, not just
+    -- conventional, so a stray value cannot slip in undetected.
+    CHECK (
+        (class = 'tune_kernel'  AND subclass IN ('kernel', 'op')) OR
+        (class = 'perf_measure' AND subclass = '')
+    )
 ) PARTITION BY LIST (arch);
 
 -- Worker heartbeat table (for monitoring and health checks)
@@ -107,7 +155,7 @@ SELECT
     COUNT(*) as total,
     ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'completed') / NULLIF(COUNT(*), 0), 2) as pct_complete
 FROM task_queue
-WHERE tuning_level = 'kernel'
+WHERE class = 'tune_kernel' AND subclass = 'kernel'
 GROUP BY arch
 ORDER BY arch;
 
@@ -122,7 +170,7 @@ SELECT
     COUNT(*) as total,
     ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'completed') / NULLIF(COUNT(*), 0), 2) as pct_complete
 FROM task_queue
-WHERE tuning_level = 'op'
+WHERE class = 'tune_kernel' AND subclass = 'op'
 GROUP BY arch
 ORDER BY arch;
 
@@ -147,14 +195,15 @@ CREATE OR REPLACE VIEW task_timing_stats AS
 SELECT
     arch,
     module,
-    tuning_level,
+    class,
+    subclass,
     COUNT(*) as completed_tasks,
     PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - started_at))) as median_duration_sec,
     PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (completed_at - started_at))) as p95_duration_sec,
     AVG(EXTRACT(EPOCH FROM (completed_at - started_at))) as avg_duration_sec
 FROM task_queue
 WHERE status = 'completed' AND completed_at IS NOT NULL
-GROUP BY arch, module, tuning_level;
+GROUP BY arch, module, class, subclass;
 
 CREATE OR REPLACE VIEW stale_tasks AS
 SELECT
@@ -193,37 +242,68 @@ SELECT
 FROM stats
 WHERE remaining > 0;
 
--- Function to create partition for an architecture
+-- Function to create the (arch, class) partition tree for an architecture.
+--
+-- Rank-2 sharding on (arch, class): PostgreSQL rejects
+-- `PARTITION BY LIST (arch, class)` with "cannot use list partition strategy
+-- with more than one column" (verified on 17.11), so the arch-level
+-- partition is itself declared `PARTITION BY LIST (class)` and this function
+-- creates both levels. The ARRAY literal below is the single source of
+-- truth for the set of DAG classes -- adding a class here is the only place
+-- that needs to change to grow the class list; there is no DEFAULT
+-- partition at either level, so an insert naming an unregistered class (or
+-- arch) fails loudly with "no partition of relation ... found for row"
+-- instead of being silently absorbed.
+--
+-- All partitions -- arch-level and class-level leaves -- live in the
+-- `shards` schema, not `public`, so `\dt` (default search_path) lists only
+-- the `task_queue` parent.
 CREATE OR REPLACE FUNCTION create_arch_partition(arch_name TEXT)
 RETURNS VOID AS $$
 DECLARE
-    partition_name TEXT;
+    arch_partition TEXT;
+    class_name TEXT;
+    class_partition TEXT;
 BEGIN
-    partition_name := 'task_queue_' || arch_name;
+    arch_partition := 'task_queue_' || arch_name;
 
-    -- Create partition if it doesn't exist
+    -- Top level: one LIST partition per arch, itself sub-partitioned by class.
     EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I PARTITION OF task_queue FOR VALUES IN (%L)',
-        partition_name, arch_name
+        'CREATE TABLE IF NOT EXISTS shards.%I PARTITION OF task_queue '
+        'FOR VALUES IN (%L) PARTITION BY LIST (class)',
+        arch_partition, arch_name
     );
 
-    -- Create indexes on the partition. tuning_level is the leading column
-    -- (alongside status) since fetch_tasks() always filters on both --
-    -- a kernel worker must never claim an op task and vice versa (F16).
-    EXECUTE format(
-        'CREATE INDEX IF NOT EXISTS %I ON %I (tuning_level, status, priority DESC, id ASC) WHERE status = %L',
-        partition_name || '_fetch', partition_name, 'pending'
-    );
+    FOREACH class_name IN ARRAY ARRAY['tune_kernel', 'perf_measure']
+    LOOP
+        class_partition := arch_partition || '_' || class_name;
 
-    EXECUTE format(
-        'CREATE INDEX IF NOT EXISTS %I ON %I (worker_id, status)',
-        partition_name || '_worker', partition_name
-    );
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS shards.%I PARTITION OF shards.%I '
+            'FOR VALUES IN (%L)',
+            class_partition, arch_partition, class_name
+        );
 
-    EXECUTE format(
-        'CREATE INDEX IF NOT EXISTS %I ON %I (created_at DESC)',
-        partition_name || '_created', partition_name
-    );
+        -- Indexes on the leaf (arch, class) partition. subclass leads
+        -- (alongside status) since fetch_tasks() always filters on class,
+        -- subclass, and status together -- a kernel worker must never claim
+        -- an op task and vice versa (F16).
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON shards.%I '
+            '(class, subclass, status, priority DESC, id ASC) WHERE status = %L',
+            class_partition || '_fetch', class_partition, 'pending'
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON shards.%I (worker_id, status)',
+            class_partition || '_worker', class_partition
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON shards.%I (created_at DESC)',
+            class_partition || '_created', class_partition
+        );
+    END LOOP;
 END;
 $$ LANGUAGE plpgsql;
 
