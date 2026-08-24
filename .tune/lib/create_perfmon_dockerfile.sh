@@ -172,23 +172,34 @@ RUN su -s /bin/bash ${BUILD_USER} -c '\\
       . ${VENV}/bin/activate; \\
       python -m pip install --index-url ${PIP_INDEX} "${ROCM_SPEC}"; \\
       rocm-sdk init; \\
-      rocm-sdk path --root > ${VENV}/.rocm_root; \\
-      echo "Resolved ROCM_PATH=\$(cat ${VENV}/.rocm_root)"'
+      echo "Resolved ROCM_PATH=\$(rocm-sdk path --root)"'
 
-# Bake ROCM_PATH and auto-activate the venv for every \`docker run\`, mirroring
-# .ci/theRock.Dockerfile so both images expose ROCm the same way.
+# Auto-activate the venv and derive ROCm's location for every \`docker run\`.
 ENV VIRTUAL_ENV=${VENV}
 ENV PATH="${VENV}/bin:\${PATH}"
 ENV BASH_ENV=/etc/profile.d/perfmon.sh
 
+# ROCM_PATH is asked of \`rocm-sdk path --root\` at use time, never read from a
+# file recorded at build time. rocm-sdk is the authority on where its own tree
+# lives; a cached copy is a second source of truth that goes stale the moment
+# the venv is rebuilt, relocated, or the wheels are upgraded in place -- and it
+# goes stale silently, pointing at a directory that still exists.
+#
+# The guard is not a cache: it only skips re-deriving when this profile has
+# already run in an ancestor shell. BASH_ENV fires for every non-interactive
+# bash, and the su payloads above nest, so without it each nesting level would
+# spawn another rocm-sdk and prepend another copy of ROCM_PATH to PATH.
 RUN set -eux; \\
-    rocm_root=\$(cat ${VENV}/.rocm_root); \\
     mkdir -p /etc/profile.d; \\
     printf '%s\\n' \\
-      '. ${VENV}/bin/activate' \\
-      "export ROCM_PATH=\${rocm_root}" \\
-      'export PATH="\${ROCM_PATH}/bin:\${ROCM_PATH}/llvm/bin:\${PATH}"' \\
-      'export LD_LIBRARY_PATH="\${ROCM_PATH}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"' \\
+      '# Auto-generated. Sourced via BASH_ENV for every non-interactive bash.' \\
+      '[ -n "\${VIRTUAL_ENV:-}" ] || . ${VENV}/bin/activate' \\
+      'if [ -z "\${ROCM_PATH:-}" ]; then' \\
+      '    ROCM_PATH="\$(rocm-sdk path --root)"' \\
+      '    export ROCM_PATH' \\
+      '    export PATH="\${ROCM_PATH}/bin:\${ROCM_PATH}/llvm/bin:\${PATH}"' \\
+      '    export LD_LIBRARY_PATH="\${ROCM_PATH}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"' \\
+      'fi' \\
       > /etc/profile.d/perfmon.sh
 
 # Sanity check, as the build user, through the same profile a later build will
