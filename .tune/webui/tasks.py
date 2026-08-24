@@ -245,8 +245,11 @@ def _resolve_pytest_entry(workdir, line: str) -> dict:
         with psycopg.connect(**conn_params, row_factory=dict_row) as conn:
             # No arch or tuning_level filter: a pytest node ID encodes
             # neither, so every matching row is reported and the caller picks.
+            # klass IS pinned, though: a pytest failure can only ever refer to
+            # a tuning task, and entry fields are shared across DAG classes,
+            # so without it a perf_measure row could be offered as a match.
             rows = TaskQueue(conn).find_by_entry(
-                entry, columns='id, arch, module')
+                entry, klass='tune_kernel', columns='id, arch, module')
         if not rows:
             return {'error': f'No task_queue row found for {parsed_desc}'}
         return {'matches': [{'task_id': r['id'], 'arch': r['arch'], 'module': r['module']} for r in rows]}

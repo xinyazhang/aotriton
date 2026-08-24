@@ -22,7 +22,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def entry_filter(entry, *, arch=None, tuning_level=None, module=None):
+def entry_filter(entry, *, arch=None, klass=None, tuning_level=None, module=None):
     """WHERE fragment selecting task_queue rows for one tuning entry.
 
     Returns (sql, params). `entry` is a mapping of entry fields, or any
@@ -42,6 +42,9 @@ def entry_filter(entry, *, arch=None, tuning_level=None, module=None):
     if arch is not None:
         clauses.append("task_config->>'arch' = %s")
         params.append(arch)
+    if klass is not None:
+        clauses.append('class = %s')
+        params.append(klass)
     if tuning_level is not None:
         clauses.append('subclass = %s')
         params.append(tuning_level)
@@ -220,6 +223,15 @@ class TaskQueue:
     def mark_completed(self, task_id: int, arch: str) -> None:
         """
         Mark task as completed.
+
+        Targets the per-arch partition rather than the (arch, class) leaf, and
+        so does every other by-id mutator below. That is deliberate, not an
+        oversight: these are addressed by primary key, PostgreSQL narrows to
+        at most one leaf per arch on its own, and none of the call sites (the
+        localq handlers) carry the task's class -- threading it through every
+        one of them would be real churn to save a scan of a second index.
+        Only fetch_tasks(), which selects rather than mutates and always knows
+        its class, targets the leaf directly.
 
         Args:
             task_id: Task ID
@@ -427,7 +439,7 @@ class TaskQueue:
 
     _LOOKUP_COLUMNS = 'id, arch, module, class AS klass, subclass, status'
 
-    def find_by_entry(self, entry, *, arch=None, tuning_level=None,
+    def find_by_entry(self, entry, *, arch=None, klass=None, tuning_level=None,
                       module=None, columns: str | None = None,
                       limit: int | None = None) -> list[dict]:
         """task_queue rows matching one tuning entry.
@@ -436,8 +448,15 @@ class TaskQueue:
         pytest node ID carries no arch, while a TUNE_V3BIS line does. Supply
         tuning_level whenever it is known -- both levels share arch and every
         task_config field, so omitting it matches an entry's rows at both.
+
+        `klass` narrows to one DAG. Supplying it matters for a caller that
+        omits tuning_level: entry fields are shared across classes, so an
+        unfiltered lookup can match a row belonging to a different workflow
+        entirely. A caller that does pass tuning_level is already narrowed --
+        'kernel'/'op' cannot collide with perf_measure's empty subclass -- but
+        relying on that is relying on a coincidence of vocabularies.
         """
-        where, params = entry_filter(entry, arch=arch,
+        where, params = entry_filter(entry, arch=arch, klass=klass,
                                      tuning_level=tuning_level, module=module)
         sql = f'SELECT {columns or self._LOOKUP_COLUMNS} FROM task_queue'
         if where:
