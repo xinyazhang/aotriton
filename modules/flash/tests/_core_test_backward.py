@@ -17,7 +17,7 @@ from attn_torch_function import (
     attention,
     AttentionExtraArgs,
     BWD_IMPL,
-    FORCE_FWD_FLYC,
+    FORCE_FWD_BACKEND,
     V3_API,
     PROBE_UNSUPPORTED,
     hipError_t,
@@ -73,7 +73,7 @@ SKIP_BWD = bool(int(os.getenv('SKIP_BWD', default='0')))
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
-if FORCE_FWD_FLYC:
+if FORCE_FWD_BACKEND == 'flyc':
     # flyc is f16/bf16 WMMA only -- modules/flash/aot/flyc_attn_fwd.py's
     # _flyc_fwd_disabled rejects fp32 outright, so no hsaco exists for those
     # functionals. Forcing the backend bypasses that predicate (it is the

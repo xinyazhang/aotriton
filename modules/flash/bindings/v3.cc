@@ -39,10 +39,16 @@ namespace pyaotriton::v3 {
         {                                                                     \
           using T = aotriton::v3::flash::Struct;                              \
           py::class_<T> c(m, #Struct);                                        \
+          py::dict by_index;                                                  \
           AOTRITON_BACKENDS_##Struct(AOTRITON_BIND_ONE)                       \
           c.attr("Max") = T::Max;                                             \
+          /* index -> the name @ati.backend declared, so a caller can pin a   \
+             backend by the description's vocabulary instead of an integer. */\
+          c.attr("by_index") = by_index;                                      \
         }
-#define AOTRITON_BIND_ONE(Name) c.attr(#Name) = T::Name;
+#define AOTRITON_BIND_ONE(Name, Str)                                          \
+        c.attr(#Name) = T::Name;                                              \
+        by_index[py::int_(T::Name)] = Str;
         AOTRITON_BIND_BACKENDS(OpAttnFwdBackend)
         AOTRITON_BIND_BACKENDS(OpAttnBwdBackend)
 #undef AOTRITON_BIND_ONE

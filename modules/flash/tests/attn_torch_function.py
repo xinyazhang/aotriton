@@ -55,15 +55,19 @@ else:
     def lazy_delta(L):
         return torch.empty_like(L)
 
-FORCE_FWD_BACKEND = V3_API and (os.getenv('FWD_IMPL', default=None) is not None)
-# True when the forward backend is pinned to flyc. Compared against the
-# generated constant rather than a literal 2 -- that is what
-# <aotriton/flash/backends.h> and its binding exist for, and this index already
-# moved once when flyc was added.
-FORCE_FWD_FLYC = False
-if FORCE_FWD_BACKEND:
+# The NAME of the pinned forward backend ('triton' / 'flyc' / ...), or None when
+# FWD_IMPL is unset. A name rather than a flag: callers ask
+# `FORCE_FWD_BACKEND == 'flyc'`, which reads as what it means and needs no new
+# variable per backend. Still falsy when nothing is pinned, so the existing
+# `if FORCE_FWD_BACKEND:` guards are unchanged.
+#
+# The mapping comes from OpAttnFwdBackend.by_index, generated beside the
+# constants from the same @ati.backend list, so the index, the enum and the name
+# cannot disagree -- and this index already moved once, when flyc was added.
+FORCE_FWD_BACKEND = None
+if V3_API and os.getenv('FWD_IMPL', default=None) is not None:
     from pyaotriton.v3.flash import OpAttnFwdBackend
-    FORCE_FWD_FLYC = (FWD_IMPL == OpAttnFwdBackend.kMetro_Flyc)
+    FORCE_FWD_BACKEND = OpAttnFwdBackend.by_index[FWD_IMPL]
 # When FORCE_BWD_BACKEND is True, backward_v3 sets extargs.force_backend_index = BWD_IMPL
 FORCE_BWD_BACKEND = V3_API and (os.getenv('BWD_IMPL', default=None) is not None)
 
