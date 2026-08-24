@@ -3,26 +3,30 @@
 # SPDX-License-Identifier: MIT
 
 # Prepare working directory on dev node
-# Usage: prepwkdir <workdir>
+# Usage: prepwkdir <workdir> [--perfmon]
 
 if [ -z "$BASH_VERSION" ]; then
   echo "This script requires Bash. Please run it with 'bash script_name.sh' or ensure /bin/sh points to /bin/bash." >&2
   exit 1
 fi
 
-if [ "$#" -ne 1 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
   cat >&2 <<EOF
-Usage: $0 <workdir>
+Usage: $0 <workdir> [--perfmon]
 
 Prepare working directory on dev node.
 
 Arguments:
-  <workdir>  Project working directory (created by initproj)
+  <workdir>   Project working directory (created by initproj)
+  --perfmon   Also generate the perfmon image Dockerfiles, one per registered
+              architecture, into <workdir>/perfmon.image.build/. Requires
+              perfmon::default_rocm to be set (WebUI: PerfmonConfig tab).
 
 This script will:
   1. Clone or update AOTriton source to <workdir>/aotriton.src
   2. Copy image.scripts from .tune to <workdir>
   3. Create <workdir>/image.build/Dockerfile
+  4. With --perfmon: create <workdir>/perfmon.image.build/Dockerfile.<arch>
 EOF
   exit 1
 fi
@@ -33,6 +37,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AOTRITON_ROOT="$(realpath "${TUNE_ROOT}/..")"
 WORKDIR=$(realpath "$1")
+
+PERFMON=0
+if [ "$2" = "--perfmon" ]; then
+  PERFMON=1
+elif [ -n "$2" ]; then
+  echo "Error: unrecognized argument: $2" >&2
+  exit 1
+fi
 
 # Validate
 if [ ! -d "$WORKDIR" ] || [ ! -f "$WORKDIR/workers.db" ]; then
@@ -94,5 +106,30 @@ rsync -a "$TUNE_ROOT/image.scripts/" "$WORKDIR/image.scripts/"
 # Step 3: Create Dockerfile
 echo "Creating Dockerfile..."
 bash "$TUNE_ROOT/lib/create_dockerfile.sh" "$WORKDIR"
+
+# Step 4: Perfmon Dockerfiles, one per registered architecture.
+#
+# Per-arch because the perfmon image bakes an arch-specific ROCm payload
+# (rocm[...,device-<arch>]); build_image.sh --perfmon then picks the one
+# matching the target host's registered arch.
+if [ "$PERFMON" -eq 1 ]; then
+  . "$TUNE_ROOT/lib/db_query.sh"
+  PERFMON_ROCM=$(sqlite3 "$WORKDIR/workers.db" \
+    "SELECT COALESCE(value,'') FROM config WHERE key='perfmon::default_rocm'" 2>/dev/null || true)
+  if [ -z "$PERFMON_ROCM" ]; then
+    echo "Error: --perfmon given but perfmon::default_rocm is not set in" >&2
+    echo "       $WORKDIR/workers.db. Set it on the WebUI's PerfmonConfig tab." >&2
+    exit 1
+  fi
+  ARCHS=$(get_architectures "$WORKDIR")
+  if [ -z "$ARCHS" ]; then
+    echo "Error: --perfmon given but no architectures are registered in" >&2
+    echo "       $WORKDIR/workers.db, so there is nothing to generate." >&2
+    exit 1
+  fi
+  for a in $ARCHS; do
+    bash "$TUNE_ROOT/lib/create_perfmon_dockerfile.sh" "$WORKDIR" "$a" "$PERFMON_ROCM"
+  done
+fi
 
 echo "Working directory preparation completed"
