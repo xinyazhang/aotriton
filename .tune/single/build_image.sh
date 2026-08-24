@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 # Build Docker image on one host
-# Usage: build_image.sh <workdir> <hostname> [--perfmon] [--follow]
+# Usage: build_image.sh <workdir> <hostname> [--workload <name>] [--follow]
 
 set -e
 
@@ -17,25 +17,36 @@ WORKDIR="$1"
 HOSTNAME="$2"
 shift 2 || true
 FOLLOW=""
-PERFMON=0
+WORKLOAD="kernel"
 
 # Flags are order-independent; both are optional.
-for arg in "$@"; do
-  case "$arg" in
-    --follow)  FOLLOW="true" ;;
-    --perfmon) PERFMON=1 ;;
-    *) echo "Error: unrecognized argument: $arg" >&2; exit 1 ;;
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --follow)   FOLLOW="true"; shift ;;
+    --workload)
+      if [ -z "$2" ]; then
+        echo "Error: --workload needs a value (kernel|op|perfmon)" >&2
+        exit 1
+      fi
+      WORKLOAD="$2"; shift 2 ;;
+    *) echo "Error: unrecognized argument: $1" >&2; exit 1 ;;
   esac
 done
 
+case "$WORKLOAD" in
+  kernel|op|perfmon) ;;
+  *) echo "Error: unknown workload '$WORKLOAD' (expected kernel|op|perfmon)" >&2; exit 1 ;;
+esac
+
 if [ -z "$WORKDIR" ] || [ -z "$HOSTNAME" ]; then
-  echo "Usage: $0 <workdir> <hostname> [--perfmon] [--follow]" >&2
+  echo "Usage: $0 <workdir> <hostname> [--workload <name>] [--follow]" >&2
   echo "" >&2
   echo "  Submit a Docker image build job via tsp on <hostname>." >&2
-  echo "  --perfmon Build the perfmon measurement image from" >&2
-  echo "            perfmon.image.build/Dockerfile.<arch> instead of the tuning" >&2
-  echo "            worker image. Generate it with: prepwkdir <workdir> --perfmon" >&2
-  echo "  --follow  Tail the build output in real-time (blocks until done)." >&2
+  echo "  --workload <name>  kernel (default) | op | perfmon." >&2
+  echo "                     kernel and op share the tuning worker image;" >&2
+  echo "                     perfmon builds its own, per-arch, image. Generate" >&2
+  echo "                     it with: prepwkdir <workdir> --workload perfmon" >&2
+  echo "  --follow           Tail the build output in real-time (blocks)." >&2
   echo "  Without --follow, the job runs in background; check with tsp on the host." >&2
   exit 1
 fi
@@ -68,26 +79,29 @@ WORKER_WORKDIR="${workdir_override:-$DEFAULT_WORKDIR}"
 # bare debian and installs TheRock into a venv itself. Building the former on a
 # debian base fails at `python3: not found`, which is what this flag exists to
 # avoid.
-if [ "$PERFMON" -eq 1 ]; then
+if [ "$WORKLOAD" = "perfmon" ]; then
   if [ -z "$arch" ]; then
-    echo "Error: --perfmon needs the target host's architecture, but $HOSTNAME" >&2
-    echo "       is not registered as a worker in $WORKDIR/workers.db." >&2
+    echo "Error: --workload perfmon needs the target host's architecture, but" >&2
+    echo "       $HOSTNAME is not registered as a worker in $WORKDIR/workers.db." >&2
     exit 1
   fi
-  DOCKERFILE_REL="perfmon.image.build/Dockerfile.$arch"
+  DOCKERFILE_REL="image.build/Dockerfile.$WORKLOAD.$arch"
   if [ ! -f "$WORKDIR/$DOCKERFILE_REL" ]; then
     echo "Error: $WORKDIR/$DOCKERFILE_REL does not exist." >&2
-    echo "       Generate it first:  prepwkdir $WORKDIR --perfmon" >&2
+    echo "       Generate it first:  prepwkdir $WORKDIR --workload $WORKLOAD" >&2
     echo "       then sync the workdir to $HOSTNAME before building." >&2
     exit 1
   fi
-  # Tag per-arch. The perfmon image bakes an arch-specific ROCm payload, so a
-  # fleet with more than one arch would otherwise have its second build
-  # silently overwrite the first under a single CELERY_WORKER_IMAGE tag --
-  # leaving an image whose name says nothing about which GPU it can serve.
-  IMAGE_TAG="${CELERY_WORKER_IMAGE}-${arch}"
-  echo "Perfmon build: $DOCKERFILE_REL -> $IMAGE_TAG"
+  # Tag by workload AND arch. Workload because two images that serve different
+  # DAGs must not share a name; arch because the perfmon image bakes an
+  # arch-specific ROCm payload, so on a multi-arch fleet a shared tag would let
+  # the second build silently overwrite the first, leaving an image whose name
+  # says nothing about which GPU it can serve.
+  IMAGE_TAG="${CELERY_WORKER_IMAGE}-${WORKLOAD}_${arch}"
+  echo "Workload $WORKLOAD: $DOCKERFILE_REL -> $IMAGE_TAG"
 else
+  # kernel and op share the tuning worker image: same DAG, same container. The
+  # workload axis is finer than the image axis, so it does not appear here.
   DOCKERFILE_REL="image.build/Dockerfile"
   IMAGE_TAG="$CELERY_WORKER_IMAGE"
 fi

@@ -3,30 +3,35 @@
 # SPDX-License-Identifier: MIT
 
 # Prepare working directory on dev node
-# Usage: prepwkdir <workdir> [--perfmon]
+# Usage: prepwkdir <workdir> [--workload <name>]
 
 if [ -z "$BASH_VERSION" ]; then
   echo "This script requires Bash. Please run it with 'bash script_name.sh' or ensure /bin/sh points to /bin/bash." >&2
   exit 1
 fi
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+if [ "$#" -lt 1 ] || [ "$#" -gt 3 ]; then
   cat >&2 <<EOF
-Usage: $0 <workdir> [--perfmon]
+Usage: $0 <workdir> [--workload <name>]
 
 Prepare working directory on dev node.
 
 Arguments:
-  <workdir>   Project working directory (created by initproj)
-  --perfmon   Also generate the perfmon image Dockerfiles, one per registered
-              architecture, into <workdir>/perfmon.image.build/. Requires
-              perfmon::default_rocm to be set (WebUI: PerfmonConfig tab).
+  <workdir>           Project working directory (created by initproj)
+  --workload <name>   Which workload's image to prepare, one of:
+                        kernel   kernel tuning (default)
+                        op       operator tuning
+                        perfmon  performance measurement
+                      kernel and op share one image: same DAG, same container.
+                      perfmon needs its own, and needs perfmon::default_rocm
+                      set (WebUI: PerfmonConfig tab).
 
 This script will:
   1. Clone or update AOTriton source to <workdir>/aotriton.src
   2. Copy image.scripts from .tune to <workdir>
   3. Create <workdir>/image.build/Dockerfile
-  4. With --perfmon: create <workdir>/perfmon.image.build/Dockerfile.<arch>
+  4. For --workload perfmon, additionally create one
+     <workdir>/image.build/Dockerfile.perfmon.<arch> per registered arch
 EOF
   exit 1
 fi
@@ -38,13 +43,22 @@ TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AOTRITON_ROOT="$(realpath "${TUNE_ROOT}/..")"
 WORKDIR=$(realpath "$1")
 
-PERFMON=0
-if [ "$2" = "--perfmon" ]; then
-  PERFMON=1
+WORKLOAD="kernel"
+if [ "$2" = "--workload" ]; then
+  if [ -z "$3" ]; then
+    echo "Error: --workload needs a value (kernel|op|perfmon)" >&2
+    exit 1
+  fi
+  WORKLOAD="$3"
 elif [ -n "$2" ]; then
   echo "Error: unrecognized argument: $2" >&2
   exit 1
 fi
+
+case "$WORKLOAD" in
+  kernel|op|perfmon) ;;
+  *) echo "Error: unknown workload '$WORKLOAD' (expected kernel|op|perfmon)" >&2; exit 1 ;;
+esac
 
 # Validate
 if [ ! -d "$WORKDIR" ] || [ ! -f "$WORKDIR/workers.db" ]; then
@@ -107,23 +121,26 @@ rsync -a "$TUNE_ROOT/image.scripts/" "$WORKDIR/image.scripts/"
 echo "Creating Dockerfile..."
 bash "$TUNE_ROOT/lib/create_dockerfile.sh" "$WORKDIR"
 
-# Step 4: Perfmon Dockerfiles, one per registered architecture.
+# Step 4: workload-specific Dockerfiles.
 #
-# Per-arch because the perfmon image bakes an arch-specific ROCm payload
-# (rocm[...,device-<arch>]); build_image.sh --perfmon then picks the one
-# matching the target host's registered arch.
-if [ "$PERFMON" -eq 1 ]; then
+# kernel and op need nothing extra: they share the tuning image made above,
+# because they share a DAG and a container -- the workload axis is finer than
+# the image axis. perfmon is the one that differs, and per-arch at that,
+# because its image bakes an arch-specific ROCm payload
+# (rocm[...,device-<arch>]); build_image.sh --workload perfmon then picks the
+# one matching the target host's registered arch.
+if [ "$WORKLOAD" = "perfmon" ]; then
   . "$TUNE_ROOT/lib/db_query.sh"
   PERFMON_ROCM=$(sqlite3 "$WORKDIR/workers.db" \
     "SELECT COALESCE(value,'') FROM config WHERE key='perfmon::default_rocm'" 2>/dev/null || true)
   if [ -z "$PERFMON_ROCM" ]; then
-    echo "Error: --perfmon given but perfmon::default_rocm is not set in" >&2
-    echo "       $WORKDIR/workers.db. Set it on the WebUI's PerfmonConfig tab." >&2
+    echo "Error: --workload perfmon given but perfmon::default_rocm is not set" >&2
+    echo "       in $WORKDIR/workers.db. Set it on the WebUI's PerfmonConfig tab." >&2
     exit 1
   fi
   ARCHS=$(get_architectures "$WORKDIR")
   if [ -z "$ARCHS" ]; then
-    echo "Error: --perfmon given but no architectures are registered in" >&2
+    echo "Error: --workload perfmon given but no architectures are registered in" >&2
     echo "       $WORKDIR/workers.db, so there is nothing to generate." >&2
     exit 1
   fi

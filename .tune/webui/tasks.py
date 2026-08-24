@@ -1089,7 +1089,11 @@ def init_workers_db(workdir):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
-            INSERT OR IGNORE INTO roles (name) VALUES ('Tuner'), ('Builder'), ('Tester');
+            -- 'Perfmon' is the role a worker gets when it serves the perfmon
+            -- workload. INSERT OR IGNORE, and this script is re-run on every
+            -- init_workers_db() call, so it also lands on databases created
+            -- before the role existed.
+            INSERT OR IGNORE INTO roles (name) VALUES ('Tuner'), ('Builder'), ('Tester'), ('Perfmon');
 
             CREATE TABLE IF NOT EXISTS worker_roles (
                 hostname TEXT NOT NULL,

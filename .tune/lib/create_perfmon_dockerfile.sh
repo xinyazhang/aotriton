@@ -136,11 +136,18 @@ WORKMOUNT="${PERFMON_WORKMOUNT:-/work}"
 PIP_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
 ROCM_SPEC="rocm[libraries,devel,device-${ARCH}]==${ROCM_VERSION}"
 
-# Named per-arch: the image bakes an arch-specific ROCm payload
-# (rocm[...,device-<arch>]), so a bare `Dockerfile` here would let a second
-# arch silently overwrite the first and leave the wrong wheels in the image.
-IMAGE_BUILD_DIR="$WORKDIR/perfmon.image.build"
-DOCKERFILE="$IMAGE_BUILD_DIR/Dockerfile.${ARCH}"
+# Named <workload>.<arch>, beside the tuning worker's Dockerfile in the same
+# image.build/ directory -- one directory to generate, sync and reason about.
+#
+# The workload segment is what separates images that serve different DAGs; the
+# arch segment is needed because this image bakes an arch-specific ROCm payload
+# (rocm[...,device-<arch>]), so a shared name would let a second arch silently
+# overwrite the first and leave the wrong wheels in the image. The tuning
+# worker's own `Dockerfile` carries neither segment because it is one image for
+# every arch and it predates this scheme.
+WORKLOAD="perfmon"
+IMAGE_BUILD_DIR="$WORKDIR/image.build"
+DOCKERFILE="$IMAGE_BUILD_DIR/Dockerfile.${WORKLOAD}.${ARCH}"
 mkdir -p "$IMAGE_BUILD_DIR"
 
 cat > "$DOCKERFILE" <<EOF
