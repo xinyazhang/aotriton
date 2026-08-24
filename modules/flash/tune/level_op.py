@@ -113,12 +113,12 @@ def _build_op_dict():
             im, view, devm = direct_inputs
             import torch
             from aotriton.tune.gpu_utils import zero_devm
-            # kSlimAffine_AiterFmhaV3Bwd accumulates into dq_acc; clear before
+            # The aiter backend accumulates into dq_acc; clear before
             # each call. Named, not 2: the literal was correct only as long as
             # nobody inserted a backend ahead of it, which is exactly what
             # happened to attn_fwd when flyc took index 2.
             from pyaotriton.v3.flash import OpAttnBwdBackend
-            if extargs.backend_index == OpAttnBwdBackend.kSlimAffine_AiterFmhaV3Bwd:
+            if extargs.backend_index == OpAttnBwdBackend.kAiter:
                 zero_devm(devm.dq_acc)
             err = self._direct_call(direct_inputs, extargs)
             return (devm.dk, devm.dv, devm.dq, devm.db), err

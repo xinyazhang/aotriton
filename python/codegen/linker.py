@@ -221,15 +221,15 @@ def _build_metros(compiled, built_kernels, flycs):
 def _backend_objs(op_shell, built_kernels, metros, affines, flycs):
     """Resolve an operator shell's index-sorted backend refs to built IR objects."""
     objs = []
-    for index, kind, name in op_shell.backend_refs:
+    for index, kind, key, _name in op_shell.backend_refs:
         if kind == 'metro':
-            objs.append(metros[name])
+            objs.append(metros[key])
         elif kind == 'kernel':
-            objs.append(built_kernels[name])
+            objs.append(built_kernels[key])
         elif kind == 'flyc':
-            objs.append(flycs[name])
+            objs.append(flycs[key])
         else:
-            objs.append(affines[name])
+            objs.append(affines[key])
     return objs
 
 
@@ -276,10 +276,11 @@ def _build_operators(compiled, built_kernels, metros, affines, flycs):
     for name in compiled.op_order:
         shell = compiled.operators[name]
         decl = shell.decl
-        indices = [i for i, _k, _n in shell.backend_refs]
+        indices = [i for i, _k, _key, _n in shell.backend_refs]
         assert indices == list(range(len(indices))), (
             f'operator {name!r} backend indices must be dense 0..n-1, got {indices}')
         backends = _backend_objs(shell, built_kernels, metros, affines, flycs)
+        backend_names = [n for _i, _k, _key, n in shell.backend_refs]
         default_kdesc = _derive_default_kdesc(backends)
         struct_cfields = _derive_struct_cfields(backends, default_kdesc)
         out[name] = Operator(
@@ -287,7 +288,8 @@ def _build_operators(compiled, built_kernels, metros, affines, flycs):
             struct_cfields=struct_cfields, backends=backends,
             optune_keys=dict(decl.binning),
             call_options_name=decl.opspec.call_options_name,
-            partially_tuned_functionals=dict(decl.fallback))
+            partially_tuned_functionals=dict(decl.fallback),
+            backend_names=backend_names)
     return out
 
 

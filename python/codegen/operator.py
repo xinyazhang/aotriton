@@ -208,6 +208,23 @@ class OperatorGenerator(InterfaceGenerator):
 # operator itself is all they need.
 
 
+def _public_backend_constant(declared_name):
+    """`'triton_fuse'` -> `'kTritonFuse'`.
+
+    The PUBLIC constant, named from what @ati.backend declared and nothing else.
+    Deliberately not `backend.enum_name`, which prefixes kMetro_ / kShim_ /
+    kSlimAffine_ / kFlyc_ according to how the backend is assembled. That is a
+    property of the generator, and a caller choosing a backend has no reason to
+    know it -- or to have their code break when a backend is re-shaped from a
+    bare kernel into a metro without its identity changing.
+
+    The internal BackendEnum in iface.<op>.h keeps the prefixed spelling: it
+    names generated launchers and is where the assembly shape is genuinely the
+    subject.
+    """
+    return 'k' + ''.join(part.capitalize() for part in declared_name.split('_'))
+
+
 def backend_constants_struct_name(op):
     """`OpAttnFwdBackend` for operator `op_attn_fwd` -- the same derivation
     `param_class_name`/`context_class_name` use, so the names an operator
@@ -228,8 +245,8 @@ def codegen_backend_constants(op):
     a name any more than about a value."""
     name = backend_constants_struct_name(op)
     lines = [f'struct AOTRITON_API {name} {{']
-    for i, backend in enumerate(op.list_backends()):
-        lines.append(f'  static constexpr int32_t {backend.enum_name} = {i};')
+    for i, declared in enumerate(op.backend_names):
+        lines.append(f'  static constexpr int32_t {_public_backend_constant(declared)} = {i};')
     lines.append(f'  static constexpr int32_t Max = {op.nbackends};')
     lines.append('};')
     return '\n'.join(lines)
@@ -255,6 +272,6 @@ def codegen_backend_constant_xmacro(op):
     copy of this list, and the third one drifted.
     """
     name = backend_constants_struct_name(op)
-    rows = ' \\\n'.join(f'  X({backend.enum_name}, "{backend.NAME}")'
-                        for backend in op.list_backends())
+    rows = ' \\\n'.join(f'  X({_public_backend_constant(d)}, "{d}")'
+                        for d in op.backend_names)
     return f'#define AOTRITON_BACKENDS_{name}(X) \\\n{rows}'
