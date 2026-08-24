@@ -69,13 +69,23 @@ POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 if [ "$RECREATE_FLAG" = "--recreate" ]; then
     echo "WARNING: Recreating schema - dropping all tables first..."
 
-    # Drop all tables in public schema
+    # Drop BOTH schemas the queue owns. `public` holds the parent tables;
+    # `shards` holds every (arch, class) partition leaf (see schema.sql).
+    # Dropping only `public` was correct before the queue was sharded and is
+    # not any more: a partition leaf that outlives its parent would be matched
+    # by name by create_arch_partition()'s CREATE TABLE IF NOT EXISTS, making
+    # the attach a silent no-op -- the failure would surface much later, as
+    # "no partition of relation ... found for row" on insert.
+    #
+    # `shards` is dropped first so it can never outlive `public`, and both are
+    # in one statement so the drop is all-or-nothing.
     docker run --rm \
         --network=host \
         -e PGPASSWORD="$POSTGRES_PASSWORD" \
         "$PSQL_IMAGE" \
         postgresql://"$POSTGRES_USER"@"$POSTGRES_HOST":"$POSTGRES_PORT" \
-        -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO $POSTGRES_USER; GRANT ALL ON SCHEMA public TO public;"
+        -v ON_ERROR_STOP=1 \
+        -c "DROP SCHEMA IF EXISTS shards CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO $POSTGRES_USER; GRANT ALL ON SCHEMA public TO public;"
 
     if [ $? -ne 0 ]; then
         echo "Error: Failed to drop existing schema" >&2
@@ -97,12 +107,16 @@ docker pull "$PSQL_IMAGE"
 
 # Execute schema SQL via containerized psql
 # Mount schema file into container and execute it
+# ON_ERROR_STOP=1 is what makes the exit-status check below mean anything:
+# without it psql runs every remaining statement after a failure and STILL
+# exits 0, so a half-applied schema was reported as "initialized successfully".
 docker run --rm \
     --network=host \
     -v "$SCHEMA_SQL:/schema.sql:ro" \
     -e PGPASSWORD="$POSTGRES_PASSWORD" \
     "$PSQL_IMAGE" \
     postgresql://"$POSTGRES_USER"@"$POSTGRES_HOST":"$POSTGRES_PORT" \
+    -v ON_ERROR_STOP=1 \
     -f /schema.sql
 
 if [ $? -ne 0 ]; then
@@ -126,6 +140,7 @@ else
             -e PGPASSWORD="$POSTGRES_PASSWORD" \
             "$PSQL_IMAGE" \
             postgresql://"$POSTGRES_USER"@"$POSTGRES_HOST":"$POSTGRES_PORT" \
+            -v ON_ERROR_STOP=1 \
             -c "SELECT create_arch_partition('$ARCH');"
 
         if [ $? -eq 0 ]; then

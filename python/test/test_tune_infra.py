@@ -223,8 +223,8 @@ def test_schema_sql_ddl_parses_and_iface_name_columns_carry_tuning_level():
 
     for name, sql in (('schema.sql', schema_sql), ('materialized_views.sql', mat_views_sql)):
         # Lexical sanity: parens balance (ignoring $$ plpgsql bodies' own
-        # dollar-quoting is not needed here -- schema.sql's only $$ body,
-        # create_arch_partition, is itself paren-balanced).
+        # dollar-quoting is not needed here -- schema.sql's $$ bodies, the
+        # pre-rev2 guard and create_arch_partition, are each paren-balanced).
         assert sql.count('(') == sql.count(')'), f'{name}: unbalanced parentheses'
 
     # CREATE TABLE blocks: split on 'CREATE TABLE' and check each block up to

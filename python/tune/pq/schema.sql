@@ -18,6 +18,13 @@
 -- `optune_results` / `best_optune_results` / `most_accurate_optune_results`
 -- tables are gone outright, not ALTER'd. Re-initialize and re-tune.
 
+-- NOTE: this file must stay pure SQL -- no psql backslash meta-commands.
+-- It has two consumers: `.tune/bin/initdb` (psql -f) and
+-- `pq/admin.py:QueueAdmin.init_schema()` (psycopg `cur.execute()`), and the
+-- latter would reject a meta-command as a syntax error. Fail-fast belongs to
+-- the caller: psycopg already runs this as one implicit transaction, and
+-- initdb passes `-v ON_ERROR_STOP=1`.
+
 -- perfmon rev2 (Stage R, R01): `class` names which DAG a queued row belongs
 -- to -- today only 'tune_kernel'; a second DAG ('perf_measure') is added
 -- later. It is promoted from the message-dict vocabulary
@@ -58,6 +65,35 @@
 -- predicate so only a worker whose tags satisfy the task's may take it.
 -- Keep the post-claim assertion pattern below (see fetch_tasks) when adding
 -- it: a task claimed by a non-matching worker is a bug, not a warning.
+
+-- Guard: refuse to apply onto a pre-rev2 database.
+--
+-- Every CREATE below is `IF NOT EXISTS`, which is right for re-applying onto a
+-- database this same file already built, but silently WRONG against a stale
+-- one: `task_queue` is skipped, keeps its old shape, and then every view,
+-- index and function that references `class`/`subclass` fails in turn. The
+-- operator sees a cascade of "column ... does not exist" and no statement of
+-- the actual cause. Detect it once, here, and say so.
+--
+-- Deliberately checked by COLUMN, not by table existence: re-applying this
+-- file onto its own output must stay a no-op.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'task_queue')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'task_queue'
+                  AND column_name  = 'class')
+    THEN
+        RAISE EXCEPTION
+            'task_queue exists but has no `class` column: this database '
+            'predates perfmon rev2 and there is no migration path'
+        USING HINT =
+            'Export anything you still need, then re-apply with a full drop: '
+            '.tune/bin/initdb <workdir> --recreate';
+    END IF;
+END $$;
+
 CREATE SCHEMA IF NOT EXISTS shards;
 
 CREATE TABLE IF NOT EXISTS task_queue (
