@@ -3,6 +3,24 @@
 
 """
 Message handlers for local queue DAG workflow.
+
+TODO: These handlers are NOT part of the execution framework, and should not
+live inside `localq/`. `pq` + `localq` + `exaid` is a general distributed
+execution framework -- a queue, a DAG runner, and crash-isolated CLI runners
+-- and it should be DAG-neutral. Everything in this file, by contrast,
+describes exactly one DAG: the `tune_kernel` workflow
+(preprocess -> probe -> N x tune_impl -> postprocess), with AOTriton-specific
+knowledge baked in (`ImplSelector`, `save_tuning_result`, tuning levels).
+
+`generic_worker.py` is already neutral; it only knows "find the handler
+registered for this message class". The coupling is entirely in this module
+plus the registration lists in `gpu_worker_socket.py` / `cpu_worker.py`.
+
+The intended shape is one handler package per DAG class, owned by the
+workload rather than the framework, with `localq/` keeping only the base
+class and the class-agnostic handlers (graceful cancel, mark failed). A
+second DAG (performance measurement) is what makes this concrete: adding it
+should cost a handler module and a registration, not edits to a shared file.
 """
 
 import json

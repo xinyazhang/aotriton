@@ -3,6 +3,12 @@
 
 """
 Generic worker that pulls from queue, handles messages, and forwards results.
+
+This module is deliberately DAG-neutral: it knows only "find the handler
+registered for this message class, run it, forward what it returns". Keep it
+that way -- see the TODO in `handlers.py` about moving the DAG-specific
+handlers out of `localq/` so the framework here can serve more than one
+workflow.
 """
 
 import logging
