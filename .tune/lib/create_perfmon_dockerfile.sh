@@ -109,7 +109,25 @@ if [ "$BUILD_UID" = "0" ]; then
   echo "Warning: building as uid 0; artifacts will be root-owned on the host." >&2
 fi
 
-VENV="/opt/perfmon-venv"
+# The venv location comes from config.rc, derived from CELERY_WORKER_PYTHON
+# the same way create_dockerfile.sh derives it (`/venv/bin/python` -> `/venv`).
+# config.rc is the single place the image's python lives, so hardcoding a path
+# here would silently diverge from it: the workers would look for their
+# interpreter at CELERY_WORKER_PYTHON while the image had built one elsewhere.
+if [ -z "$CELERY_WORKER_PYTHON" ]; then
+  echo "Error: CELERY_WORKER_PYTHON not set in $WORKDIR/config.rc" >&2
+  echo "       It names the venv's interpreter (e.g. /venv/bin/python) and is" >&2
+  echo "       what fixes the venv location for this image." >&2
+  exit 1
+fi
+VENV="$(dirname "$(dirname "$CELERY_WORKER_PYTHON")")"
+
+if [ "$VENV" = "/" ] || [ "$VENV" = "." ]; then
+  echo "Error: CELERY_WORKER_PYTHON='$CELERY_WORKER_PYTHON' does not look like" >&2
+  echo "       <venv>/bin/python -- refusing to treat '$VENV' as the venv root." >&2
+  exit 1
+fi
+
 PIP_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
 ROCM_SPEC="rocm[libraries,devel,device-${ARCH}]==${ROCM_VERSION}"
 
