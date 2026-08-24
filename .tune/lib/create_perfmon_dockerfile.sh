@@ -203,10 +203,21 @@ ENV BASH_ENV=/etc/profile.d/perfmon.sh
 # the venv is rebuilt, relocated, or the wheels are upgraded in place -- and it
 # goes stale silently, pointing at a directory that still exists.
 #
-# The guard is not a cache: it only skips re-deriving when this profile has
-# already run in an ancestor shell. BASH_ENV fires for every non-interactive
-# bash, and the su payloads above nest, so without it each nesting level would
-# spawn another rocm-sdk and prepend another copy of ROCM_PATH to PATH.
+# The \`-z ROCM_PATH\` guard is not a cache. It means "this environment is
+# already configured", and it is load-bearing for two distinct cases:
+#
+#   1. Nesting. BASH_ENV fires for every non-interactive bash and the su
+#      payloads above nest, so without the guard each level would spawn
+#      another rocm-sdk and prepend another copy of ROCM_PATH to PATH.
+#   2. Override. A caller can point the image at a different ROCm tree --
+#      \`docker run -e ROCM_PATH=...\` -- and this profile will respect it
+#      instead of overwriting it with the venv's own. That is deliberate;
+#      do not "simplify" the guard away.
+#
+# Note the override is all-or-nothing: setting ROCM_PATH skips the PATH and
+# LD_LIBRARY_PATH exports too, so a caller who overrides it owns those as well.
+# That is the same contract as case (1), where the ancestor shell already set
+# all three.
 RUN set -eux; \\
     mkdir -p /etc/profile.d; \\
     printf '%s\\n' \\
