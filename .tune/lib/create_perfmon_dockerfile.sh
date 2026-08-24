@@ -128,6 +128,11 @@ if [ "$VENV" = "/" ] || [ "$VENV" = "." ]; then
   exit 1
 fi
 
+# Where the checkout gets bind-mounted at run time. Like ${VENV} it sits
+# directly under /, so it must be created and chown'd by root at build time
+# (see the root layer in the Dockerfile below).
+WORKMOUNT="${PERFMON_WORKMOUNT:-/work}"
+
 PIP_INDEX="https://repo.amd.com/rocm/whl-multi-arch/"
 ROCM_SPEC="rocm[libraries,devel,device-${ARCH}]==${ROCM_VERSION}"
 
@@ -160,6 +165,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 # that already ships an account at this uid (ubuntu has \`ubuntu\` at 1000;
 # debian does not) would otherwise leave every subsequent su failing with
 # "user ${BUILD_USER} does not exist". Rename it instead of skipping.
+#
+# This layer runs as ROOT, deliberately, and it is the only place that may.
+# Both ${VENV} and ${WORKMOUNT} sit directly under /, which is root-owned, so
+# the build user cannot create either one -- they have to be made here and
+# handed over. Doing it in one root layer is also why no later \`su\` layer ever
+# needs to mkdir: it only ever writes inside directories it already owns.
 RUN set -eux; \\
     if ! getent group ${BUILD_GID} >/dev/null; then groupadd -g ${BUILD_GID} ${BUILD_USER}; fi; \\
     existing=\$(getent passwd ${BUILD_UID} | cut -d: -f1 || true); \\
@@ -169,7 +180,7 @@ RUN set -eux; \\
       usermod -l ${BUILD_USER} -s /bin/bash "\$existing"; \\
     fi; \\
     getent passwd ${BUILD_USER}; \\
-    install -d -o ${BUILD_UID} -g ${BUILD_GID} ${VENV}
+    install -d -o ${BUILD_UID} -g ${BUILD_GID} ${VENV} ${WORKMOUNT}
 
 # Everything below runs as the build user. \`su\` (not USER) so the image's
 # default user stays root for any later layer that needs it, and so the venv is
@@ -245,12 +256,19 @@ RUN su -s /bin/bash ${BUILD_USER} -c 'set -eux; \\
       echo "--- \${ROCM_PATH}/llvm/bin ---"; \\
       ls "\${ROCM_PATH}/llvm/bin" 2>/dev/null | head -40 || echo "(no llvm/bin)"'
 
+# ${WORKMOUNT} was created and chown'd in the root layer above, NOT left to
+# WORKDIR. A WORKDIR that has to create its directory does so with ownership
+# that varies by builder and version, and here it would be created after
+# USER -- landing root-owned in exactly the case where the build user needs to
+# write to it. Creating it explicitly makes the ownership a property of the
+# image rather than of whoever built it.
 USER ${BUILD_UID}:${BUILD_GID}
-WORKDIR /work
+WORKDIR ${WORKMOUNT}
 EOF
 
 echo "Generated perfmon Dockerfile at: $IMAGE_BUILD_DIR/Dockerfile"
 echo "  base:  $PERFMON_IMAGE_BASE ($PY)"
 echo "  arch:  $ARCH"
 echo "  ROCm:  $ROCM_VERSION"
-echo "  venv:  $VENV (owned by ${BUILD_UID}:${BUILD_GID})"
+echo "  venv:  $VENV (root-created, owned by ${BUILD_UID}:${BUILD_GID})"
+echo "  work:  $WORKMOUNT (root-created, owned by ${BUILD_UID}:${BUILD_GID})"
