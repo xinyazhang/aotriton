@@ -236,7 +236,13 @@ def codegen_backend_constants(op):
 
 
 def codegen_backend_constant_xmacro(op):
-    """A per-struct X-macro listing that operator's constant NAMES.
+    """A per-struct X-macro listing that operator's constants and their names.
+
+    Two arguments per row: the C++ constant (`kMetro_Flyc`) and the backend's
+    declared name (`"flyc"`), the one `@ati.backend` was written with. Both,
+    because a caller pinning a backend wants to say which one in the vocabulary
+    the description uses, not in enum spelling -- and neither should be
+    transcribed by hand into a test.
 
     Per struct rather than one list of (struct, name) pairs: a binding expanding
     a mixed list would have to pick the right target per row, and the targets are
@@ -249,5 +255,6 @@ def codegen_backend_constant_xmacro(op):
     copy of this list, and the third one drifted.
     """
     name = backend_constants_struct_name(op)
-    rows = ' \\\n'.join(f'  X({backend.enum_name})' for backend in op.list_backends())
+    rows = ' \\\n'.join(f'  X({backend.enum_name}, "{backend.NAME}")'
+                        for backend in op.list_backends())
     return f'#define AOTRITON_BACKENDS_{name}(X) \\\n{rows}'
