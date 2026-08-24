@@ -398,7 +398,7 @@ class PostprocessHandler(MessageHandler):
     Aggregates all hsaco results and cleans up.
 
     Input: postprocess message (after dependencies resolved)
-    Output: tune_kernel_ack message (triggers PG reader to continue)
+    Output: dag_ack message (triggers PG reader to continue)
 
     DESIGN NOTE: This class has dual-context usage:
     1. Broker context: Instantiated with db_conn=None, only resolve_dependency() is called
@@ -474,7 +474,7 @@ class PostprocessHandler(MessageHandler):
 
         logger.info(f"Postprocess returning ack message for task_id={task_id}")
         return {
-            'class': 'tune_kernel_ack',
+            'class': 'dag_ack',
             'task_id': task_id,
         }
 
@@ -589,7 +589,7 @@ class MarkTaskFailedHandler(MessageHandler):
 
         # Return nak (negative ack) message to unblock PG reader
         return {
-            'class': 'tune_kernel_ack',
+            'class': 'dag_ack',
             'task_id': task_id,
             'negative': True
         }

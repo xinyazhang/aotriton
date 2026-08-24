@@ -291,7 +291,7 @@ class LocalBroker:
         self._resolve_dependencies(message)
 
         # Check if this is an ack message
-        if message['class'] == 'tune_kernel_ack':
+        if message['class'] == 'dag_ack':
             self._handle_ack(message)
             return
 
@@ -414,14 +414,14 @@ class LocalBroker:
 
     def _handle_ack(self, ack_msg: dict):
         """
-        Handle tune_kernel_ack - notify PG reader workers.
+        Handle dag_ack - notify PG reader workers.
 
         Args:
             ack_msg: Ack message with task_id
         """
         task_id = ack_msg['task_id']
 
-        logger.info(f"Broker received tune_kernel_ack for task_id={task_id}")
+        logger.info(f"Broker received dag_ack for task_id={task_id}")
 
         if task_id not in self.pending_acks:
             logger.warning(f"Received ack for task_id={task_id} but no pending acks")
