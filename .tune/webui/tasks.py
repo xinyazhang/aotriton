@@ -549,23 +549,23 @@ class BuildTestLibrariesCommand(CommandBuilder):
 
 
 class BuildPerfmonArtifactsCommand(CommandBuilder):
-    """Build the perfmon measurement artifacts for one subject via
-    perfmon/build_subject.sh.
+    """Build perfmon subjects for one arch, on the build node.
 
-    A subject is a (AOTriton tag, ROCm) pair; the script builds the
-    AOTriton-neutral libperfmon_core plus that subject's family library and
-    runner. Only the 'head' tag is buildable today -- historical release
-    subjects need the release image tarballs, which is later work.
+    Dispatches to .tune/single/build_perfmon.sh rather than running
+    perfmon/build_subject.sh directly: subjects need hipcc and a ROCm install,
+    which live in the perfmon image on the build node, not on the machine
+    hosting this WebUI.
+
+    All of an arch's tags go in one invocation so the shared, ROCm-scoped
+    libperfmon_core is validated once for the batch instead of per tag.
     """
-    RELATIVE = 'perfmon/build_subject.sh'
+    RELATIVE = '.tune/single/build_perfmon.sh'
     DESCRIPTION = 'Build perfmon artifacts'
 
-    def exec(self, workdir, arch: str, rocm: str, tag: str, dry_run: bool = False):
-        # workdir is passed twice on purpose: once as the script's 4th argument
-        # (where the subject installs, <workdir>/installed/perfmon/<arch>/<tag>)
-        # and once to _run, which uses it for the command log.
-        return self._run(self.RELATIVE, [tag, rocm, arch, workdir], workdir,
-                         f'Build perfmon artifacts ({tag}+rocm{rocm}, {arch})',
+    def exec(self, workdir, arch: str, tags: list[str], dry_run: bool = False):
+        args = [workdir, arch, *tags, '--follow']
+        return self._run(self.RELATIVE, args, workdir,
+                         f'Build perfmon subjects for {arch}: {", ".join(tags)}',
                          dry_run=dry_run)
 
 
@@ -1065,29 +1065,35 @@ def remove_perfmon_tag(workdir, tag: str):
 
 
 def build_perfmon_artifacts(workdir, subjects: list[tuple[str, str]], dry_run: bool = False):
-    """Build perfmon core + runner for each (arch, tag) subject.
+    """Build perfmon subjects for each selected (arch, tag) pair.
 
-    Returns one aggregate result; each subject is a separate build_subject.sh
-    invocation, so a failure on one does not prevent the rest from being
-    attempted -- the matrix is a batch, not a transaction.
+    Pairs are grouped by arch and dispatched one invocation per arch, since
+    build_perfmon.sh takes a tag list. Each arch is a separate remote job, so
+    one arch failing does not prevent the others -- the matrix is a batch, not
+    a transaction.
     """
     if not subjects:
         return {'success': False, 'error': 'No (arch, tag) pairs selected'}
-    rocm = get_perfmon_rocm(workdir)
-    if not rocm:
+    if not get_perfmon_rocm(workdir):
         return {'success': False,
                 'error': "perfmon::default_rocm is not set in workers.db. "
                          "Set it to the exact ROCm version string (e.g. "
                          "'7.14.0') on the PerfmonConfig tab first."}
-    results, failed = [], []
+
+    by_arch: dict[str, list[str]] = {}
     for arch, tag in subjects:
-        r = _build_perfmon_artifacts.exec(workdir, arch, rocm, tag=tag, dry_run=dry_run)
-        results.append({'arch': arch, 'tag': tag, 'result': r})
+        if tag not in by_arch.setdefault(arch, []):
+            by_arch[arch].append(tag)
+
+    results, failed = [], []
+    for arch, tags in by_arch.items():
+        r = _build_perfmon_artifacts.exec(workdir, arch, tags, dry_run=dry_run)
+        results.append({'arch': arch, 'tags': tags, 'result': r})
         if not r.get('success', False):
-            failed.append(f'{tag}/{arch}')
+            failed.append(arch)
     return {'success': not failed,
-            'message': f"Queued {len(subjects)} perfmon build(s) on ROCm {rocm}"
-                       + (f"; failed: {', '.join(failed)}" if failed else ''),
+            'message': f"Dispatched {len(by_arch)} perfmon build job(s) to the build node"
+                       + (f"; failed to dispatch: {', '.join(failed)}" if failed else ''),
             'results': results}
 
 

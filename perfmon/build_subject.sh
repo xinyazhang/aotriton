@@ -2,11 +2,21 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# perfmon-exec0.md T13: builds one "subject" -- one AOTriton tag, shim-built
-# for one ROCm/arch combination, plus this branch's own perfmon harness
-# (libperfmon_flash@<subject> + bin/runner) linked against it.
+# perfmon-exec0.md T13: builds "subjects" -- AOTriton tags, shim-built for one
+# ROCm/arch combination, plus this branch's own perfmon harness
+# (libperfmon_flash@<subject> + bin/runner) linked against each.
 #
-# Usage: build_subject.sh <tag> <rocm> <arch>
+# Runs INSIDE the perfmon image, on the build node: it needs the ROCm toolchain
+# that image carries. .tune/single/build_perfmon.sh is what puts it there; this
+# script is not meant to be invoked on the webui server, which has no ROCm.
+#
+# Usage: build_subject.sh <rocm> <arch> <workdir> <tag> [<tag>...]
+#   Several tags in one invocation, because the ROCm-scoped work -- validating
+#   PERFMON_CORE_ROOT, and the shared libperfmon_core it points at -- is done
+#   once for the batch rather than repeated per tag. Each tag still builds in
+#   its own subshell, so one failure does not abort the rest; the exit status
+#   is nonzero if any failed.
+#
 #   <tag>   git tag to build, e.g. 0.13b. HEAD is NOT supported: it has no
 #           published kernel images, so it would need a full AOTriton build
 #           rather than the shim build this script performs. The working-tree
@@ -142,22 +152,23 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
-  echo "Usage: build_subject.sh <tag> <rocm> <arch> [workdir]" >&2
-  echo '  <tag>:  git tag to build, e.g. 0.13b' >&2
-  echo '  <rocm>: nominal ROCm version label (e.g. 7.14.0) -- see this' >&2
-  echo '          script'"'"'s own header comment for why this is NOT how' >&2
-  echo '          the ROCm toolchain itself is located (set ROCM_PATH)' >&2
-  echo '  <arch>: GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
-  echo '  [workdir]: project workdir; the subject installs under' >&2
-  echo '          <workdir>/installed/perfmon/<arch>/<tag>/. Defaults to' >&2
-  echo '          $PERFMON_WORKDIR.' >&2
+if [ "$#" -lt 4 ]; then
+  echo "Usage: build_subject.sh <rocm> <arch> <workdir> <tag> [<tag>...]" >&2
+  echo '  <rocm>:  nominal ROCm version label (e.g. 7.14.0) -- see this' >&2
+  echo '           script'"'"'s own header comment for why this is NOT how' >&2
+  echo '           the ROCm toolchain itself is located (set ROCM_PATH)' >&2
+  echo '  <arch>:  GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
+  echo '  <workdir>: project workdir; each subject installs under' >&2
+  echo '           <workdir>/installed/perfmon/<arch>/<tag>/' >&2
+  echo '  <tag>...: one or more git tags, e.g. 0.13b 0.12.1b' >&2
   exit 1
 fi
 
-TAG="$1"
-ROCM="$2"
-ARCH="$3"
+ROCM="$1"
+ARCH="$2"
+PERFMON_WORKDIR="$3"
+shift 3
+TAGS=("$@")
 
 # HEAD is not a supported subject. A released tag is shim-built and paired
 # with that release's prebuilt kernel images; HEAD has no published images, so
@@ -167,20 +178,20 @@ ARCH="$3"
 #
 # PERFMON_ALLOW_HEAD=1 keeps the working-tree path reachable for the GPU
 # session that has been exercising it by hand; no UI path sets it.
-case "${TAG}" in
-  head|HEAD)
-    if [ "${PERFMON_ALLOW_HEAD:-0}" != "1" ]; then
-      echo "Error: '${TAG}' is not a supported subject." >&2
-      echo "       Building from HEAD needs a full AOTriton build (no released" >&2
-      echo "       kernel images exist for it), which this script does not do." >&2
-      echo "       Pass a released git tag instead, e.g. 0.13b." >&2
-      echo "       (Set PERFMON_ALLOW_HEAD=1 to force the working-tree path.)" >&2
-      exit 1
-    fi
-    TAG="head"   # internal spelling of the working-tree path below
-    echo "[build_subject] PERFMON_ALLOW_HEAD=1: using the working tree" >&2
-    ;;
-esac
+for _t in "${TAGS[@]}"; do
+  case "$_t" in
+    head|HEAD)
+      if [ "${PERFMON_ALLOW_HEAD:-0}" != "1" ]; then
+        echo "Error: '${_t}' is not a supported subject." >&2
+        echo "       Building from HEAD needs a full AOTriton build (no released" >&2
+        echo "       kernel images exist for it), which this script does not do." >&2
+        echo "       Pass released git tags instead, e.g. 0.13b." >&2
+        echo "       (Set PERFMON_ALLOW_HEAD=1 to force the working-tree path.)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -190,145 +201,164 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # per-arch (installed/<arch>, installed/test/<arch>, installed/database), so
 # putting subjects anywhere else would leave them unsyncable -- and a build
 # artifact living inside the git checkout is wrong regardless.
-PERFMON_WORKDIR="${4:-${PERFMON_WORKDIR:-}}"
-if [ -z "${PERFMON_WORKDIR}" ]; then
-  echo "Error: no workdir given. Pass it as the 4th argument or set" >&2
-  echo "       PERFMON_WORKDIR; the subject installs under" >&2
-  echo "       <workdir>/installed/perfmon/<arch>/<tag>/." >&2
-  exit 1
-fi
 if [ ! -d "${PERFMON_WORKDIR}" ]; then
   echo "Error: workdir '${PERFMON_WORKDIR}' does not exist." >&2
   exit 1
 fi
 
-# The ROCm is NOT a path segment: one workdir pins one ROCm
-# (perfmon::default_rocm), so <arch>/<tag> is already unique within it. It is
-# recorded inside the subject instead, so a directory built against a ROCm that
-# has since been changed is still identifiable rather than silently assumed
-# current.
-SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
-SUBJECT_DIR="${PERFMON_WORKDIR}/installed/perfmon/${ARCH}/${TAG}"
-AOTRITON_ROOT="${SUBJECT_DIR}/aotriton"
+build_one_subject() {
+  local TAG="$1"
 
-echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
-echo "[build_subject] subject_dir=${SUBJECT_DIR}" >&2
-mkdir -p "${SUBJECT_DIR}"
-printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
+  # The ROCm is NOT a path segment: one workdir pins one ROCm
+  # (perfmon::default_rocm), so <arch>/<tag> is already unique within it. It is
+  # recorded inside the subject instead, so a directory built against a ROCm that
+  # has since been changed is still identifiable rather than silently assumed
+  # current.
+  SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
+  SUBJECT_DIR="${PERFMON_WORKDIR}/installed/perfmon/${ARCH}/${TAG}"
+  AOTRITON_ROOT="${SUBJECT_DIR}/aotriton"
 
-# --- Step 1: source tree (T13 spec item 1) --------------------------------
-if [ "${TAG}" == "head" ]; then
-  SRC_DIR="${REPO_ROOT}"
-  echo "[build_subject] tag=head -> using working tree ${SRC_DIR}" >&2
-else
-  WORKTREE_DIR="${SUBJECT_DIR}/src"
-  if [ -f "${WORKTREE_DIR}/.git" ] || [ -d "${WORKTREE_DIR}/.git" ]; then
-    echo "[build_subject] reusing existing worktree ${WORKTREE_DIR}" >&2
+  echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
+  echo "[build_subject] subject_dir=${SUBJECT_DIR}" >&2
+  mkdir -p "${SUBJECT_DIR}"
+  printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
+
+  # --- Step 1: source tree (T13 spec item 1) --------------------------------
+  if [ "${TAG}" == "head" ]; then
+    SRC_DIR="${REPO_ROOT}"
+    echo "[build_subject] tag=head -> using working tree ${SRC_DIR}" >&2
   else
-    echo "[build_subject] git worktree add ${WORKTREE_DIR} ${TAG}" >&2
-    git -C "${REPO_ROOT}" worktree add --detach "${WORKTREE_DIR}" "${TAG}"
+    WORKTREE_DIR="${SUBJECT_DIR}/src"
+    if [ -f "${WORKTREE_DIR}/.git" ] || [ -d "${WORKTREE_DIR}/.git" ]; then
+      echo "[build_subject] reusing existing worktree ${WORKTREE_DIR}" >&2
+    else
+      echo "[build_subject] git worktree add ${WORKTREE_DIR} ${TAG}" >&2
+      git -C "${REPO_ROOT}" worktree add --detach "${WORKTREE_DIR}" "${TAG}"
+    fi
+    SRC_DIR="${WORKTREE_DIR}"
   fi
-  SRC_DIR="${WORKTREE_DIR}"
-fi
 
-# --- Step 2: shim-only AOTriton build (T13 spec item 2) -------------------
-# Sourced from THIS tag's own .ci/, not this repo's -- see disclosure #2.
-export AOTRITON_NAME_SUFFIX_OVERRIDE=pmon
-export AOTRITON_BUILD_PATH="${SUBJECT_DIR}/build-aotriton"
-export AOTRITON_INSTALL_PATH="${AOTRITON_ROOT}"
+  # --- Step 2: shim-only AOTriton build (T13 spec item 2) -------------------
+  # Sourced from THIS tag's own .ci/, not this repo's -- see disclosure #2.
+  export AOTRITON_NAME_SUFFIX_OVERRIDE=pmon
+  export AOTRITON_BUILD_PATH="${SUBJECT_DIR}/build-aotriton"
+  export AOTRITON_INSTALL_PATH="${AOTRITON_ROOT}"
 
-echo "[build_subject] sourcing ${SRC_DIR}/.ci/common-build.sh" >&2
-# shellcheck source=/dev/null
-. "${SRC_DIR}/.ci/common-build.sh"
+  echo "[build_subject] sourcing ${SRC_DIR}/.ci/common-build.sh" >&2
+  # shellcheck source=/dev/null
+  . "${SRC_DIR}/.ci/common-build.sh"
 
-# Exactly build-shim.sh's own flags (disclosure #1) plus -DAOTRITON_NO_PYTHON=ON.
-common_build "${ARCH}" "shim" \
-  -DAOTRITON_NOIMAGE_MODE=ON \
-  -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
-  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
-  -DAOTRITON_NO_PYTHON=ON
+  # Exactly build-shim.sh's own flags (disclosure #1) plus -DAOTRITON_NO_PYTHON=ON.
+  common_build "${ARCH}" "shim" \
+    -DAOTRITON_NOIMAGE_MODE=ON \
+    -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
+    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
+    -DAOTRITON_NO_PYTHON=ON
 
-if [ ! -d "${AOTRITON_ROOT}/include/aotriton" ]; then
-  echo "[build_subject] ERROR: shim build finished but ${AOTRITON_ROOT}/include/aotriton is missing." >&2
-  exit 1
-fi
-
-# --- Step 3: kernel images (T13 spec item 3) ------------------------------
-if [ "${TAG}" == "head" ]; then
-  if [ -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
-    echo "[build_subject] ${AOTRITON_ROOT}/lib/aotriton.images already present" >&2
-  else
-    echo "[build_subject] WARNING: no lib/aotriton.images under ${AOTRITON_ROOT}." \
-         "T13's own spec text says \"For head, the local build already has" \
-         "them\", but a NOIMAGE_MODE=ON shim build (step 2, always run" \
-         "regardless of tag) never populates that directory --" \
-         "v3src/CMakeLists.txt gates its own images install() on" \
-         "'NOT AOTRITON_NOIMAGE_MODE'. This is a disclosed spec" \
-         "inconsistency (see this script's own header comment, item 4)," \
-         "not a bug in this script. Continuing: T13's own Verify step does" \
-         "not exercise enumerate/measure, so it does not need images." >&2
+  if [ ! -d "${AOTRITON_ROOT}/include/aotriton" ]; then
+    echo "[build_subject] ERROR: shim build finished but ${AOTRITON_ROOT}/include/aotriton is missing." >&2
+    exit 1
   fi
-else
-  echo "[build_subject] fetching kernel images for released tag ${TAG}" >&2
-  GIT_SHA="$(git -C "${SRC_DIR}" rev-parse --short=12 "${TAG}")"
-  # Matches .ci/runc-manylinux-build-tar.sh's own tarball naming
-  # (tarbase=aotriton-${GIT_SHORT}${asan_suffix}-images, one file per arch
-  # under aotriton/lib/aotriton.images/) -- '*' absorbs an optional
-  # '+asan' suffix this script does not otherwise select.
-  IMAGES_PATTERN="aotriton-${GIT_SHA}*-images-${ARCH}.tar.gz"
-  IMAGES_DL_DIR="${SUBJECT_DIR}/.images-download"
-  rm -rf "${IMAGES_DL_DIR}"
-  mkdir -p "${IMAGES_DL_DIR}"
 
-  if [ -n "${PERFMON_IMAGES_TARBALL:-}" ]; then
-    echo "[build_subject] using PERFMON_IMAGES_TARBALL override: ${PERFMON_IMAGES_TARBALL}" >&2
-    cp "${PERFMON_IMAGES_TARBALL}" "${IMAGES_DL_DIR}/"
-  elif command -v gh >/dev/null 2>&1; then
-    # See this script's header comment, disclosure #5: this publishing step
-    # is NOT confirmed to exist anywhere in this repo's own CI config; this
-    # is a documented best-effort guess, not a verified integration.
-    echo "[build_subject] gh release download ${TAG} -p '${IMAGES_PATTERN}'" >&2
-    if ! gh release download "${TAG}" -p "${IMAGES_PATTERN}" -D "${IMAGES_DL_DIR}" --clobber; then
-      echo "[build_subject] ERROR: 'gh release download' did not find an asset" \
-           "matching '${IMAGES_PATTERN}' on release '${TAG}'. This repo has no" \
-           "confirmed step that publishes that tarball to GitHub Releases" \
-           "(see this script's header comment, disclosure #5) -- if you have" \
-           "the tarball some other way, re-run with" \
-           "PERFMON_IMAGES_TARBALL=/path/to/it.tar.gz set." >&2
-      exit 1
+  # --- Step 3: kernel images (T13 spec item 3) ------------------------------
+  if [ "${TAG}" == "head" ]; then
+    if [ -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
+      echo "[build_subject] ${AOTRITON_ROOT}/lib/aotriton.images already present" >&2
+    else
+      echo "[build_subject] WARNING: no lib/aotriton.images under ${AOTRITON_ROOT}." \
+           "T13's own spec text says \"For head, the local build already has" \
+           "them\", but a NOIMAGE_MODE=ON shim build (step 2, always run" \
+           "regardless of tag) never populates that directory --" \
+           "v3src/CMakeLists.txt gates its own images install() on" \
+           "'NOT AOTRITON_NOIMAGE_MODE'. This is a disclosed spec" \
+           "inconsistency (see this script's own header comment, item 4)," \
+           "not a bug in this script. Continuing: T13's own Verify step does" \
+           "not exercise enumerate/measure, so it does not need images." >&2
     fi
   else
-    echo "[build_subject] ERROR: 'gh' CLI not found and PERFMON_IMAGES_TARBALL" \
-         "is not set -- cannot fetch images for released tag '${TAG}'." \
-         "Set PERFMON_IMAGES_TARBALL=/path/to/aotriton-<sha>-images-${ARCH}.tar.gz" \
-         "or install the GitHub CLI." >&2
-    exit 1
+    echo "[build_subject] fetching kernel images for released tag ${TAG}" >&2
+    GIT_SHA="$(git -C "${SRC_DIR}" rev-parse --short=12 "${TAG}")"
+    # Matches .ci/runc-manylinux-build-tar.sh's own tarball naming
+    # (tarbase=aotriton-${GIT_SHORT}${asan_suffix}-images, one file per arch
+    # under aotriton/lib/aotriton.images/) -- '*' absorbs an optional
+    # '+asan' suffix this script does not otherwise select.
+    IMAGES_PATTERN="aotriton-${GIT_SHA}*-images-${ARCH}.tar.gz"
+    IMAGES_DL_DIR="${SUBJECT_DIR}/.images-download"
+    rm -rf "${IMAGES_DL_DIR}"
+    mkdir -p "${IMAGES_DL_DIR}"
+
+    if [ -n "${PERFMON_IMAGES_TARBALL:-}" ]; then
+      echo "[build_subject] using PERFMON_IMAGES_TARBALL override: ${PERFMON_IMAGES_TARBALL}" >&2
+      cp "${PERFMON_IMAGES_TARBALL}" "${IMAGES_DL_DIR}/"
+    elif command -v gh >/dev/null 2>&1; then
+      # See this script's header comment, disclosure #5: this publishing step
+      # is NOT confirmed to exist anywhere in this repo's own CI config; this
+      # is a documented best-effort guess, not a verified integration.
+      echo "[build_subject] gh release download ${TAG} -p '${IMAGES_PATTERN}'" >&2
+      if ! gh release download "${TAG}" -p "${IMAGES_PATTERN}" -D "${IMAGES_DL_DIR}" --clobber; then
+        echo "[build_subject] ERROR: 'gh release download' did not find an asset" \
+             "matching '${IMAGES_PATTERN}' on release '${TAG}'. This repo has no" \
+             "confirmed step that publishes that tarball to GitHub Releases" \
+             "(see this script's header comment, disclosure #5) -- if you have" \
+             "the tarball some other way, re-run with" \
+             "PERFMON_IMAGES_TARBALL=/path/to/it.tar.gz set." >&2
+        exit 1
+      fi
+    else
+      echo "[build_subject] ERROR: 'gh' CLI not found and PERFMON_IMAGES_TARBALL" \
+           "is not set -- cannot fetch images for released tag '${TAG}'." \
+           "Set PERFMON_IMAGES_TARBALL=/path/to/aotriton-<sha>-images-${ARCH}.tar.gz" \
+           "or install the GitHub CLI." >&2
+      exit 1
+    fi
+
+    TARBALL="$(find "${IMAGES_DL_DIR}" -maxdepth 1 -name '*.tar.gz' | head -n 1)"
+    if [ -z "${TARBALL}" ]; then
+      echo "[build_subject] ERROR: no .tar.gz found in ${IMAGES_DL_DIR} after fetch." >&2
+      exit 1
+    fi
+    # Tarball root is "aotriton/" (runc-manylinux-build-tar.sh tars from
+    # inside AOTRITON_INSTALL_PREFIX, whose child is "aotriton/"), so
+    # extracting at SUBJECT_DIR lands it at
+    # ${SUBJECT_DIR}/aotriton/lib/aotriton.images/<arch>/ -- exactly beside
+    # the shim-built libaotriton*_v2.so already sitting in
+    # ${AOTRITON_ROOT}/lib/ (T13 spec item 3: "beside the built .so").
+    tar xzf "${TARBALL}" -C "${SUBJECT_DIR}"
+    rm -rf "${IMAGES_DL_DIR}"
+
+    if [ ! -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
+      echo "[build_subject] ERROR: extracted ${TARBALL} but" \
+           "${AOTRITON_ROOT}/lib/aotriton.images still does not exist --" \
+           "unexpected tarball layout." >&2
+      exit 1
+    fi
   fi
 
-  TARBALL="$(find "${IMAGES_DL_DIR}" -maxdepth 1 -name '*.tar.gz' | head -n 1)"
-  if [ -z "${TARBALL}" ]; then
-    echo "[build_subject] ERROR: no .tar.gz found in ${IMAGES_DL_DIR} after fetch." >&2
-    exit 1
-  fi
-  # Tarball root is "aotriton/" (runc-manylinux-build-tar.sh tars from
-  # inside AOTRITON_INSTALL_PREFIX, whose child is "aotriton/"), so
-  # extracting at SUBJECT_DIR lands it at
-  # ${SUBJECT_DIR}/aotriton/lib/aotriton.images/<arch>/ -- exactly beside
-  # the shim-built libaotriton*_v2.so already sitting in
-  # ${AOTRITON_ROOT}/lib/ (T13 spec item 3: "beside the built .so").
-  tar xzf "${TARBALL}" -C "${SUBJECT_DIR}"
-  rm -rf "${IMAGES_DL_DIR}"
+  # --- Step 4: libperfmon_flash@<subject> + bin/runner (T13 spec item 4) ---
 
-  if [ ! -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
-    echo "[build_subject] ERROR: extracted ${TARBALL} but" \
-         "${AOTRITON_ROOT}/lib/aotriton.images still does not exist --" \
-         "unexpected tarball layout." >&2
-    exit 1
-  fi
-fi
+  FLASH_BUILD_DIR="${SUBJECT_DIR}/build-flash"
+  echo "[build_subject] configuring modules/flash/perfmon/runner against" \
+       "AOTRITON_ROOT=${AOTRITON_ROOT} PERFMON_CORE_ROOT=${PERFMON_CORE_ROOT}" >&2
+  cmake -S "${REPO_ROOT}/modules/flash/perfmon/runner" -B "${FLASH_BUILD_DIR}" \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER="${CXX:-hipcc}" \
+    -DCMAKE_INSTALL_PREFIX="${SUBJECT_DIR}" \
+    -DAOTRITON_ROOT="${AOTRITON_ROOT}" \
+    -DPERFMON_CORE_ROOT="${PERFMON_CORE_ROOT}"
+  cmake --build "${FLASH_BUILD_DIR}"
+  cmake --install "${FLASH_BUILD_DIR}"
 
-# --- Step 4: libperfmon_flash@<subject> + bin/runner (T13 spec item 4) ---
+  echo "[build_subject] done: ${SUBJECT_DIR}/bin/runner" >&2
+  echo "[build_subject] verify with:" >&2
+  echo "  ldd ${SUBJECT_DIR}/bin/runner | grep aotriton" >&2
+  echo "  ${SUBJECT_DIR}/bin/runner <<< exit; echo \$?" >&2
+}
+
+# ROCm-scoped, not per-tag: check it ONCE, before any subject is built. Failing
+# after the first tag's AOTriton build would waste the expensive part of the run
+# to report a precondition that was already false at the start.
 PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-/opt/perfmon/rocm-${ROCM}}"
 if [ ! -f "${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" ]; then
   echo "[build_subject] ERROR: PERFMON_CORE_ROOT (${PERFMON_CORE_ROOT}) has no" \
@@ -338,20 +368,21 @@ if [ ! -f "${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" ]; then
   exit 1
 fi
 
-FLASH_BUILD_DIR="${SUBJECT_DIR}/build-flash"
-echo "[build_subject] configuring modules/flash/perfmon/runner against" \
-     "AOTRITON_ROOT=${AOTRITON_ROOT} PERFMON_CORE_ROOT=${PERFMON_CORE_ROOT}" >&2
-cmake -S "${REPO_ROOT}/modules/flash/perfmon/runner" -B "${FLASH_BUILD_DIR}" \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER="${CXX:-hipcc}" \
-  -DCMAKE_INSTALL_PREFIX="${SUBJECT_DIR}" \
-  -DAOTRITON_ROOT="${AOTRITON_ROOT}" \
-  -DPERFMON_CORE_ROOT="${PERFMON_CORE_ROOT}"
-cmake --build "${FLASH_BUILD_DIR}"
-cmake --install "${FLASH_BUILD_DIR}"
+FAILED=()
+for TAG in "${TAGS[@]}"; do
+  echo "[build_subject] === ${TAG} (${ARCH}, rocm ${ROCM}) ===" >&2
+  # Subshell so one tag's failure does not abort the batch under `set -e`, and
+  # so the per-subject variables cannot leak into the next iteration.
+  if ( build_one_subject "${TAG}" ); then
+    echo "[build_subject] ok: ${TAG}" >&2
+  else
+    echo "[build_subject] FAILED: ${TAG}" >&2
+    FAILED+=("${TAG}")
+  fi
+done
 
-echo "[build_subject] done: ${SUBJECT_DIR}/bin/runner" >&2
-echo "[build_subject] verify with:" >&2
-echo "  ldd ${SUBJECT_DIR}/bin/runner | grep aotriton" >&2
-echo "  ${SUBJECT_DIR}/bin/runner <<< exit; echo \$?" >&2
+if [ "${#FAILED[@]}" -ne 0 ]; then
+  echo "[build_subject] ${#FAILED[@]} of ${#TAGS[@]} subject(s) failed: ${FAILED[*]}" >&2
+  exit 1
+fi
+echo "[build_subject] all ${#TAGS[@]} subject(s) built for ${ARCH}" >&2
