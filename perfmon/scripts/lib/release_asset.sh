@@ -11,8 +11,9 @@
 # each build-<tag>.sh names its own asset. Verified against the actual
 # release pages:
 #
-#   0.9.2b, 0.10b   NO images asset exists at all. Only
-#                   aotriton-<tag>-manylinux_2_28_x86_64-rocm<ver>-shared.tar.gz.
+#   0.9.2b, 0.10b   No SEPARATE images package. There is one jumbo tarball,
+#                   aotriton-<tag>-manylinux_2_28_x86_64-rocm<ver>-shared.tar.gz,
+#                   and the GPU images are inside it along with the runtime.
 #   0.11b, 0.11.2b  aotriton-<tag>-images-amd-<group>.tar.gz, with gfx11xx as
 #                   ONE group.
 #   0.12.1b, 0.13b  same shape, but gfx11xx was split into gfx110x and gfx115x,

@@ -246,8 +246,10 @@ ninja -C "${BUILD_DIR}" install
 # The shim built above is deliberately NOIMAGE: the kernels under test must be
 # the ones this release actually shipped, not ones rebuilt now. They come from
 # the release itself.
-# 0.10b ships NO images asset -- only -shared runtime tarballs, same as
-# 0.9.2b. rocm7.0 is the newest variant this release offers.
+# 0.10b ships no SEPARATE images package, same as 0.9.2b: the GPU images are
+# inside the one jumbo tarball, alongside the runtime. rocm7.0 is the newest
+# variant this release offers; the choice does not affect the images, which are
+# GPU code objects rather than ROCm-linked binaries.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/release_asset.sh"
 ASSET="aotriton-0.10b-manylinux_2_28_x86_64-rocm7.0-shared.tar.gz"
 IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"

@@ -125,8 +125,8 @@
 #
 # 5. Kernel images are fetched by perfmon/scripts/build-<tag>.sh, not here,
 #    because their asset naming drifts as hard as the build system does:
-#    0.9.2b and 0.10b publish no images asset at all (kernels come from the
-#    -shared runtime tarball), 0.11b/0.11.2b publish gfx11xx as one group, and
+#    0.9.2b and 0.10b publish no SEPARATE images package -- the images are
+#    inside their one jumbo tarball -- 0.11b/0.11.2b publish gfx11xx as one group, and
 #    0.12.1b/0.13b split that into gfx110x/gfx115x and add gfx1250. Each tag's
 #    script names its own asset, verified against that release's actual asset
 #    list; the download and extraction mechanics they share live in
@@ -350,8 +350,8 @@ build_one_subject() {
   # Kernel images are fetched by the per-tag script above, not here.
   #
   # They have to be: the asset naming drifts as hard as the build system does.
-  # 0.9.2b and 0.10b publish NO images asset at all (their kernels come out of
-  # the -shared runtime tarball); 0.11b/0.11.2b publish gfx11xx as one group;
+  # 0.9.2b and 0.10b publish no SEPARATE images package -- the images are
+  # inside their one jumbo tarball; 0.11b/0.11.2b publish gfx11xx as one group;
   # 0.12.1b/0.13b split that into gfx110x and gfx115x and add gfx1250. There
   # is no git sha in any of those names -- the version of this step that lived
   # here matched on one, and so could never have found anything.
