@@ -18,6 +18,10 @@
 # sync_workdir.sh --workload perfmon knows how to ship. build_subject.sh is
 # handed that path as a plain install prefix; it has no notion of a workdir.
 #
+# Release sources are shallow-cloned from upstream into scratch/perfmon/src/,
+# which sync_workdir excludes -- so a source tree per tag never rides along to
+# the GPU workers.
+#
 # All tags for one arch go in a single invocation: build_subject.sh validates
 # the shared, ROCm-scoped libperfmon_core once for the batch instead of once
 # per tag.
@@ -88,6 +92,22 @@ if [ -z "$ROCM" ]; then
   exit 1
 fi
 
+# Where release tags are cloned from, inside the build container. An explicit
+# perfmon::origin wins; otherwise derive an HTTPS URL from this checkout's
+# upstream remote using .ci/common-git-https-origin.sh's rewrite, since the
+# container cannot ask this machine's git anything.
+PERFMON_ORIGIN=$(sqlite3 "$ABSWORKDIR/workers.db" \
+  "SELECT COALESCE(value,'') FROM config WHERE key='perfmon::origin'" 2>/dev/null || true)
+if [ -z "$PERFMON_ORIGIN" ]; then
+  _remote=$(git -C "$TUNE_ROOT/.." remote get-url upstream 2>/dev/null \
+            || git -C "$TUNE_ROOT/.." remote get-url origin 2>/dev/null || true)
+  case "$_remote" in
+    https://*) PERFMON_ORIGIN="$_remote" ;;
+    *:*)       PERFMON_ORIGIN="https://github.com/${_remote#*:}" ;;
+    *)         PERFMON_ORIGIN="https://github.com/ROCm/aotriton.git" ;;
+  esac
+fi
+
 REMOTE_WORKDIR="$(get_buildnode_workdir "$ABSWORKDIR")"
 PERFMON_IMAGE="${CELERY_WORKER_IMAGE}-perfmon_${ARCH}"
 
@@ -96,6 +116,7 @@ echo "Image:        $PERFMON_IMAGE"
 echo "Image ROCm:   $ROCM (subjects label themselves from the probed toolchain)"
 echo "Arch:         $ARCH"
 echo "Tags:         ${TAGS[*]}"
+echo "Tag origin:   $PERFMON_ORIGIN"
 
 # --user keeps artifacts owned by the invoking uid:gid, matching how the
 # perfmon image builds its venv -- otherwise installed/perfmon/ comes back
@@ -129,12 +150,13 @@ if [ -n "$FOLLOW" ]; then
   # Use tsp -t to tail/follow output in real-time
   # shellcheck disable=SC2029
   ssh "$BUILD_NODE_HOST" bash -s \
-      "$REMOTE_WORKDIR" "$PERFMON_IMAGE" "$ARCH" "${TAGS[@]}" <<'EOF'
+      "$REMOTE_WORKDIR" "$PERFMON_IMAGE" "$ARCH" "$PERFMON_ORIGIN" "${TAGS[@]}" <<'EOF'
 set -x
 REMOTE_WORKDIR="$1"
 PERFMON_IMAGE="$2"
 ARCH="$3"
-shift 3
+PERFMON_ORIGIN="$4"
+shift 4
 TAGS=("$@")
 
 jobid=$(tsp docker run --rm \
@@ -143,6 +165,8 @@ jobid=$(tsp docker run --rm \
   --mount "type=bind,source=${REMOTE_WORKDIR},target=/wkdir" \
   "$PERFMON_IMAGE" \
   bash /wkdir/aotriton.src/perfmon/build_subject.sh \
+       --origin "$PERFMON_ORIGIN" \
+       --src_prefix /wkdir/scratch/perfmon/src/ \
        "$ARCH" /wkdir/installed/perfmon/ "${TAGS[@]}")
 echo "Job ID: $jobid"
 if [ "$(tsp -s "$jobid")" = "queued" ]; then
@@ -156,5 +180,6 @@ else
   ssh -n "$BUILD_NODE_HOST" \
     "tsp docker run --rm --network=host --user \$(id -u):\$(id -g)"\
 " --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir $PERFMON_IMAGE"\
-" bash /wkdir/aotriton.src/perfmon/build_subject.sh $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
+" bash /wkdir/aotriton.src/perfmon/build_subject.sh --origin $PERFMON_ORIGIN"\
+" --src_prefix /wkdir/scratch/perfmon/src/ $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
 fi

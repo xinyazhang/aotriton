@@ -150,13 +150,35 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
+# Defaults for the two knobs below. ORIGIN follows .ci/releasesuite-git-head.sh's
+# --origin convention; SRC_PREFIX defaults somewhere throwaway so the script is
+# usable standalone, with the caller pointing it at the workdir's scratch/.
+ORIGIN="https://github.com/ROCm/aotriton.git"
+SRC_PREFIX="${TMPDIR:-/tmp}/perfmon-src/"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --origin)     ORIGIN="$2"; shift 2 ;;
+    --src_prefix) SRC_PREFIX="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) echo "Error: unrecognized option: $1" >&2; exit 1 ;;
+    *) break ;;
+  esac
+done
+
 if [ "$#" -lt 3 ]; then
-  echo "Usage: build_subject.sh <arch> <install_prefix> <tag> [<tag>...]" >&2
+  echo "Usage: build_subject.sh [--origin <url>] [--src_prefix <dir>] \\" >&2
+  echo "                        <arch> <install_prefix> <tag> [<tag>...]" >&2
   echo '  <arch>:           GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
   echo '  <install_prefix>: where subjects go; each lands in' >&2
   echo '                    <install_prefix><arch>/<tag>/. Carry the trailing' >&2
   echo '                    slash yourself, autotools-style.' >&2
   echo '  <tag>...:         one or more git tags, e.g. 0.13b 0.12.1b' >&2
+  echo '  --origin:         git URL to clone release tags from' >&2
+  echo "                    (default: ${ORIGIN})" >&2
+  echo '  --src_prefix:     where shallow clones go; each tag lands in' >&2
+  echo '                    <src_prefix><tag>/. Trailing slash included.' >&2
+  echo "                    (default: ${SRC_PREFIX})" >&2
   exit 1
 fi
 
@@ -256,31 +278,34 @@ build_one_subject() {
   mkdir -p "${SUBJECT_DIR}"
   printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
 
-  # --- Step 1: source tree (T13 spec item 1) --------------------------------
+  # --- Step 1: source tree ------------------------------------------------
+  # A shallow clone of the tag from upstream, NOT a worktree of the local
+  # checkout. The local aotriton.src is a depth-limited, single-branch clone
+  # synced from the dev node, so it carries no release tags -- and teaching the
+  # dev node to fetch them just to ship them was solving the wrong problem:
+  # upstream is where release tags authoritatively live, and the build node can
+  # reach it directly.
+  #
+  # Sources land under ${SRC_PREFIX}, which the caller points at the workdir's
+  # scratch/ -- excluded from sync_workdir, so a full source tree per tag never
+  # gets rsynced to GPU workers alongside the runner.
   if [ "${TAG}" == "head" ]; then
     SRC_DIR="${REPO_ROOT}"
     echo "[build_subject] tag=head -> using working tree ${SRC_DIR}" >&2
   else
-    WORKTREE_DIR="${SUBJECT_DIR}/src"
-    # Check the ref before `git worktree add`, whose own failure ("fatal:
-    # invalid reference") says nothing about why it is missing or who is
-    # supposed to supply it. aotriton.src is cloned shallow and single-branch,
-    # so it carries no release tags until prepwkdir --workload perfmon fetches
-    # them on the dev node -- this container cannot fetch them itself, since
-    # origin points at a path that exists only there.
-    if ! git -C "${REPO_ROOT}" rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
-      echo "[build_subject] ERROR: tag '${TAG}' is not present in ${REPO_ROOT}." \
-           "Run 'prepwkdir <workdir> --workload perfmon' on the dev node to" \
-           "fetch the configured tags, then re-deploy." >&2
-      exit 1
-    fi
-    if [ -f "${WORKTREE_DIR}/.git" ] || [ -d "${WORKTREE_DIR}/.git" ]; then
-      echo "[build_subject] reusing existing worktree ${WORKTREE_DIR}" >&2
+    SRC_DIR="${SRC_PREFIX}${TAG}"
+    if [ -e "${SRC_DIR}/.git" ]; then
+      echo "[build_subject] reusing existing clone ${SRC_DIR}" >&2
     else
-      echo "[build_subject] git worktree add ${WORKTREE_DIR} ${TAG}" >&2
-      git -C "${REPO_ROOT}" worktree add --detach "${WORKTREE_DIR}" "${TAG}"
+      echo "[build_subject] git clone --depth 1 --branch ${TAG} ${ORIGIN}" >&2
+      mkdir -p "$(dirname "${SRC_DIR}")"
+      # Clone into a temporary sibling and move it into place, so an
+      # interrupted clone cannot leave a half-populated directory that the
+      # `-e .git` check above would later mistake for a good one.
+      rm -rf "${SRC_DIR}.partial"
+      git clone --depth 1 --branch "${TAG}" "${ORIGIN}" "${SRC_DIR}.partial"
+      mv "${SRC_DIR}.partial" "${SRC_DIR}"
     fi
-    SRC_DIR="${WORKTREE_DIR}"
   fi
 
   # --- Step 2: shim-only AOTriton build (T13 spec item 2) -------------------
