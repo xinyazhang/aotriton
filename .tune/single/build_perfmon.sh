@@ -97,36 +97,36 @@ echo "Tags:         ${TAGS[*]}"
 
 # --user keeps artifacts owned by the invoking uid:gid, matching how the
 # perfmon image builds its venv -- otherwise installed/perfmon/ comes back
-# root-owned and the next build cannot overwrite it.
-# FOLLOW travels as a positional argument, not via SendEnv: SendEnv needs a
-# matching AcceptEnv on the remote sshd, which is not something this tooling
-# can assume. And no `ssh -n` here -- the payload IS stdin.
-ssh "$BUILD_NODE_HOST" bash -s \
-    "$REMOTE_WORKDIR" "$PERFMON_IMAGE" "$ROCM" "$ARCH" "${FOLLOW:-false}" "${TAGS[@]}" <<'EOF'
-REMOTE_WORKDIR="$1"
-PERFMON_IMAGE="$2"
-ROCM="$3"
-ARCH="$4"
-FOLLOW="$5"
-shift 5
-TAGS=("$@")
+# root-owned and the next build cannot overwrite it. It is written \$(id -u)
+# so the substitution runs on the REMOTE, not here.
+#
+# Follow and no-follow are two different ssh invocations, exactly as
+# build_image.sh and remotebld do it: the heredoc form queues and then tails
+# unconditionally, the one-liner form just queues. An earlier version passed a
+# FOLLOW flag into a single payload and branched on it inside; the branch never
+# fired, and the job was queued with its output going nowhere. Matching the
+# proven shape removes the failure mode rather than debugging it.
+DOCKER_RUN="docker run --rm --network=host --user \$(id -u):\$(id -g)"
+DOCKER_RUN="$DOCKER_RUN --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir"
+DOCKER_RUN="$DOCKER_RUN $PERFMON_IMAGE"
+DOCKER_RUN="$DOCKER_RUN bash /wkdir/aotriton.src/perfmon/build_subject.sh"
+DOCKER_RUN="$DOCKER_RUN $ROCM $ARCH /wkdir ${TAGS[*]}"
 
-set -x
-jobid=$(tsp docker run --rm \
-  --network=host \
-  --user "$(id -u):$(id -g)" \
-  --mount "type=bind,source=$REMOTE_WORKDIR,target=/wkdir" \
-  "$PERFMON_IMAGE" \
-  bash /wkdir/aotriton.src/perfmon/build_subject.sh \
-       "$ROCM" "$ARCH" /wkdir "${TAGS[@]}")
-set +x
-echo "tsp job ID: $jobid"
+if [ -n "$FOLLOW" ]; then
+  # Use tsp -t to tail/follow output in real-time
+  # shellcheck disable=SC2029
+  ssh "$BUILD_NODE_HOST" bash -s "$DOCKER_RUN" <<'EOF'
+DOCKER_RUN="$1"
 
-if [ "$FOLLOW" = "true" ]; then
-  if [ "$(tsp -s "$jobid")" = "queued" ]; then
-    echo "Waiting for tsp job $jobid to start..."
-    while [ "$(tsp -s "$jobid")" = "queued" ]; do sleep 5; done
-  fi
-  tsp -t "$jobid"
+jobid=$(tsp $DOCKER_RUN)
+echo "Job ID: $jobid"
+if [ "$(tsp -s "$jobid")" = "queued" ]; then
+  echo "Waiting for tsp job $jobid to start..."
+  while [ "$(tsp -s "$jobid")" = "queued" ]; do sleep 5; done
 fi
+tsp -t $jobid
 EOF
+else
+  # shellcheck disable=SC2029
+  ssh -n "$BUILD_NODE_HOST" "tsp $DOCKER_RUN"
+fi
