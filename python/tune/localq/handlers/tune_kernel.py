@@ -84,7 +84,7 @@ class PreprocessHandler(MessageHandler):
 
         # Execute preprocessing
         module = task_config["module"]
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
 
         if 'tmpdir' in task_config:
             tmpdir = Path(task_config['tmpdir'])
@@ -159,7 +159,7 @@ class ProbeHandler(MessageHandler):
         # op task at the wrong level.
         level = task_config['tuning_level']
 
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
         tmpdir = Path(task_config['tmpdir'])
         arch = task_config.get('arch')
 
@@ -282,7 +282,7 @@ class TuneImplHandler(MessageHandler):
         # come through that path and guessing 'kernel' would silently run an
         # op task at the wrong level.
         level = task_config['tuning_level']
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
         tmpdir = Path(task_config['tmpdir'])
 
         impl_selector = ImplSelector(tuning_level=level, iface_name=iface_name, impl_index=impl_index)
