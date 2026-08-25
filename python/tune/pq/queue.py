@@ -444,7 +444,6 @@ class TaskQueue:
     # Progress reporting
     # ------------------------------------------------------------------
 
-    _PROGRESS_VIEW = {'kernel': 'kernel_queue_progress', 'op': 'op_queue_progress'}
 
     # ------------------------------------------------------------------
     # Entry / id lookups
@@ -492,24 +491,28 @@ class TaskQueue:
                 f'WHERE id = ANY(%s) ORDER BY arch, id', (task_ids,))
             return cur.fetchall()
 
-    def get_progress(self, tuning_level: str, *,
+    def get_progress(self, klass: str, subklass: str, *,
                      recent_window: str = '5 minutes',
                      stale_seconds: int = 7200) -> dict:
-        """Per-arch queue progress for one tuning level.
+        """Per-arch queue progress for one (class, subclass).
 
         Returns {'progress': [...], 'speed': [...], 'stale': [...]}: the
-        level's queue-progress view, recent completion counts, and long-running
-        task counts. Callers merge and format these; the SQL and the
-        tuning_level predicates live here so a queue-schema change does not
-        have to be mirrored into the web UI (see pq/README.md).
+        slice's queue-progress rows, recent completion counts, and
+        long-running task counts. Callers merge and format these; the SQL and
+        the predicates live here so a queue-schema change does not have to be
+        mirrored into the web UI (see pq/README.md).
+
+        There used to be one view per tuning level and a dict mapping the
+        level to a view name. R07 collapsed those into a single
+        queue_progress grouped by (arch, class, subclass), so selecting a
+        slice is now a WHERE clause -- and a new class needs no view, no dict
+        entry and no schema change.
         """
-        try:
-            view = self._PROGRESS_VIEW[tuning_level]
-        except KeyError:
-            raise ValueError(f"unknown tuning_level {tuning_level!r}; "
-                             f"expected one of {sorted(self._PROGRESS_VIEW)}")
         with self.conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(f'SELECT * FROM {view} ORDER BY arch')
+            cur.execute(
+                'SELECT * FROM queue_progress '
+                'WHERE class = %s AND subclass = %s ORDER BY arch',
+                (klass, subklass))
             progress = cur.fetchall()
 
             cur.execute("""
@@ -517,9 +520,9 @@ class TaskQueue:
                 FROM task_queue
                 WHERE status = 'completed'
                   AND completed_at > NOW() - %s::interval
-                  AND subclass = %s
+                  AND class = %s AND subclass = %s
                 GROUP BY arch
-            """, (recent_window, tuning_level))
+            """, (recent_window, klass, subklass))
             speed = cur.fetchall()
 
             cur.execute("""
@@ -527,9 +530,9 @@ class TaskQueue:
                 FROM task_queue
                 WHERE status = 'running'
                   AND EXTRACT(EPOCH FROM (NOW() - started_at)) > %s
-                  AND subclass = %s
+                  AND class = %s AND subclass = %s
                 GROUP BY arch
-            """, (stale_seconds, tuning_level))
+            """, (stale_seconds, klass, subklass))
             stale = cur.fetchall()
         return {'progress': progress, 'speed': speed, 'stale': stale}
 

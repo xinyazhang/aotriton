@@ -178,23 +178,26 @@ CREATE TABLE IF NOT EXISTS task_reports (
 ) PARTITION BY LIST (arch);
 
 -- Utility views for monitoring
-CREATE OR REPLACE VIEW queue_progress AS
-SELECT
-    arch,
-    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-    COUNT(*) FILTER (WHERE status = 'running') as running,
-    COUNT(*) FILTER (WHERE status = 'completed') as completed,
-    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-    COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
-    COUNT(*) as total,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'completed') / NULLIF(COUNT(*), 0), 2) as pct_complete
-FROM task_queue
-GROUP BY arch
-ORDER BY arch;
+-- One progress view, grouped by the full routing key (perfmon rev2 R07).
+--
+-- This replaces queue_progress, kernel_queue_progress and op_queue_progress,
+-- which were character-identical except for one WHERE line. Adding
+-- perf_measure to that pattern would have made a fourth copy; grouping by
+-- (arch, class, subclass) instead means a new class or subclass shows up
+-- here with no schema change at all.
+--
+-- Dropped explicitly rather than left to CREATE OR REPLACE: that cannot add
+-- columns to an existing view, so re-applying this file over an older schema
+-- would fail with "cannot change name of view column".
+DROP VIEW IF EXISTS kernel_queue_progress;
+DROP VIEW IF EXISTS op_queue_progress;
+DROP VIEW IF EXISTS queue_progress;
 
-CREATE OR REPLACE VIEW kernel_queue_progress AS
+CREATE VIEW queue_progress AS
 SELECT
     arch,
+    class,
+    subclass,
     COUNT(*) FILTER (WHERE status = 'pending') as pending,
     COUNT(*) FILTER (WHERE status = 'running') as running,
     COUNT(*) FILTER (WHERE status = 'completed') as completed,
@@ -203,24 +206,8 @@ SELECT
     COUNT(*) as total,
     ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'completed') / NULLIF(COUNT(*), 0), 2) as pct_complete
 FROM task_queue
-WHERE class = 'tune_kernel' AND subclass = 'kernel'
-GROUP BY arch
-ORDER BY arch;
-
-CREATE OR REPLACE VIEW op_queue_progress AS
-SELECT
-    arch,
-    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-    COUNT(*) FILTER (WHERE status = 'running') as running,
-    COUNT(*) FILTER (WHERE status = 'completed') as completed,
-    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-    COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
-    COUNT(*) as total,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'completed') / NULLIF(COUNT(*), 0), 2) as pct_complete
-FROM task_queue
-WHERE class = 'tune_kernel' AND subclass = 'op'
-GROUP BY arch
-ORDER BY arch;
+GROUP BY arch, class, subclass
+ORDER BY arch, class, subclass;
 
 CREATE OR REPLACE VIEW worker_health AS
 SELECT

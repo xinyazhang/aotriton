@@ -211,8 +211,11 @@ def get_tuning_progress(workdir):
         conn_params = get_db_connection_params(Path(workdir))
         with psycopg.connect(**conn_params, row_factory=dict_row) as conn:
             tq = TaskQueue(conn)
-            kernel = tq.get_progress('kernel')
-            op = tq.get_progress('op')
+            # ('tune_kernel', 'kernel') / ('tune_kernel', 'op'): the class
+            # and subclass this page reports on. Both slices of one view now,
+            # rather than one view each (rev2 R07).
+            kernel = tq.get_progress('tune_kernel', 'kernel')
+            op = tq.get_progress('tune_kernel', 'op')
             return {
                 'kernel': _merge_progress_rows(kernel['progress'], kernel['speed'], kernel['stale']),
                 'op': _merge_progress_rows(op['progress'], op['speed'], op['stale']),
