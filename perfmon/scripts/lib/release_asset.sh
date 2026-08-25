@@ -12,15 +12,21 @@
 # release pages:
 #
 #   0.9.2b, 0.10b   NO images asset exists at all. Only
-#                   aotriton-<tag>-manylinux_2_28_x86_64-rocm<ver>-shared.tar.gz,
-#                   which for these two releases is a full runtime that has to
-#                   carry lib/aotriton.images/ -- there is nowhere else for the
-#                   kernels of those releases to come from.
+#                   aotriton-<tag>-manylinux_2_28_x86_64-rocm<ver>-shared.tar.gz.
 #   0.11b, 0.11.2b  aotriton-<tag>-images-amd-<group>.tar.gz, with gfx11xx as
 #                   ONE group.
 #   0.12.1b, 0.13b  same shape, but gfx11xx was split into gfx110x and gfx115x,
 #                   and gfx1250 appeared. +asan variants also exist and must
 #                   never be selected.
+#
+# EVERY released tarball has the same internal structure: aotriton/lib/*. The
+# split at 0.11b did not change that -- it moved the aotriton/lib/aotriton.images
+# hierarchy into its own package while aotriton/lib/libaotriton*.so stayed in the
+# runtime one. So 0.9.2b/0.10b's -shared tarball carries both, and the newer
+# images tarballs carry only the images, at the same path either way. That is
+# why one extraction (strip the aotriton/lib/ prefix) serves both shapes, and
+# why asking for the -shared tarball is the right move for the two releases
+# that predate the split rather than a workaround.
 #
 # Note there is no git sha in any of these names -- an earlier version of this
 # code matched on one, which would never have found anything.
