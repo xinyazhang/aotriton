@@ -292,12 +292,24 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
 5. Re-run Gate 1 and Gate 3 from `PLAN-PHASE1.md`.
 6. Update the commit hash at the top of this file.
 
-**A re-sync needs a CLEAN build to test.** Editing a file in this directory does
-not invalidate any `.hsaco`: `v3src/CMakeLists.txt`'s `add_custom_command` for
-each kernel image lists only `DEPENDS aotriton_venv_flydsl` (and
-`aotriton_venv_triton` for Triton), never the source. An incremental build after
-a re-sync therefore regenerates the C++ shim against the new ABI and keeps the
-old code objects, which is a silent wrong-kernarg launch rather than an error.
+**A re-sync will not be picked up by an incremental build.** Editing a kernel
+source invalidates no `.hsaco` and no `.aks2`: `v3src/CMakeLists.txt`'s
+`add_custom_command` for each image lists only `DEPENDS aotriton_venv_flydsl`,
+never the source, and the repack rule hangs off a phony target rather than the
+JSON. So an incremental build after a re-sync regenerates the C++ shim against
+the new ABI and keeps the old code objects — a silent wrong-kernarg launch
+rather than an error.
+
+This is a **build-system limitation, not a flyc one**: Triton kernels behave
+the same way, which is why a Triton kernel change is also tested from scratch.
+The standing workaround is to delete `CMakeCache.txt` and `<build>/v3src`
+before rebuilding — cheaper than a full clean, and enough to force
+regeneration. The real fix is to register Triton+ATI and FlyDSL+ATI as CMake
+custom languages, at which point dependency tracking becomes CMake's job and
+this whole paragraph goes away. Do not add ad-hoc `DEPENDS` entries in the
+meantime: they would catch a direct edit and still miss a transitive one (a
+helper module the kernel imports), which is the failure mode that is hardest
+to notice.
 
 ## Open FlyDSL issues, verified against upstream
 
