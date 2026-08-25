@@ -30,6 +30,8 @@ from .debug_simulate_encoded_softmax import debug_simulate_encoded_softmax
 from .aiter_fwd import aiter_fmha_v3_fwd
 from .aiter_bwd import aiter_fmha_v3_bwd
 from .flyc_attn_fwd import flyc_attn_fwd
+from .flyc_bwd_dkdv import flyc_bwd_dkdv
+from .flyc_bwd_dq import flyc_bwd_dq
 
 
 # --- triton metro backends (transpiled, never executed) -------------------
@@ -79,6 +81,31 @@ def metro_bwd(params):
     bwd_kernel_dq(params)
 
 
+# The same shape as metro_bwd with the FlyDSL kernels in place of the two key
+# Triton ones, and the SAME Triton preprocess step in front. As with
+# metro_fwd_flyc, the mix is the point rather than a convenience.
+#
+# bwd_preprocess stays Triton because FlyDSL has no equivalent: the flyc dK/dV
+# and dQ kernels both READ `Delta = rowsum(dO * O)` and neither produces it
+# (FlyDSL's own interfaces compute it in torch, on the host). bwd_preprocess
+# computes exactly that quantity in fp32, so it feeds them directly with no
+# adapter -- and the num_seqlens branch selecting the varlen variant is
+# unchanged, since that is a property of the layout rather than of the DSL.
+#
+# No @ati.hints.union_precedence: a flyc kdesc contributes no func_cfields
+# (ir/flyc/kdesc.py), so this metro adds nothing to the operator's params-struct
+# union -- every operand it touches already arrives via metro_bwd.
+@ati.start
+@ati.metro_kernel
+def metro_bwd_flyc(params):
+    if params.num_seqlens > 0:
+        bwd_preprocess_varlen(params)
+    else:
+        bwd_preprocess(params)
+    flyc_bwd_dkdv(params)
+    flyc_bwd_dq(params)
+
+
 # --- operators (declarative @ati.operator form) ---------------------------
 #
 # Stacked-@: @ati.start (top) ends the stack; @ati.operator (bottom, next to def)
@@ -106,6 +133,11 @@ def op_attn_fwd():
 @ati.start
 @ati.tune.binning(max_seqlen_q=ati.tune.binning.le,
                   max_seqlen_k=ati.tune.binning.le)
+# flyc, index 3 -- the metro, so the Delta the flyc kernels read is produced.
+# Same linker ordering as the forward's flyc backend: flyc kdescs are built
+# before the operators and have their functional space bound afterwards
+# (ir/ops/infer.py).
+@ati.backend(3, metro_bwd_flyc, 'flyc')
 @ati.backend(2, aiter_fmha_v3_bwd, 'aiter')
 @ati.backend(1, bwd_kernel_fuse, 'triton_fuse')
 @ati.backend(0, metro_bwd, 'triton_split')
