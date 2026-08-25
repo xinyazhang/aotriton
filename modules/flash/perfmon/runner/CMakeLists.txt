@@ -15,9 +15,11 @@
 # --- AOTRITON_ROOT (T12 spec, verbatim) -----------------------------------
 # "CMake takes AOTRITON_ROOT and compiles against that root's include/,
 # linking that root's libaotriton*_v2.so. No system AOTriton." AOTRITON_ROOT
-# is exactly one subject's install prefix (perfmon-rev0.md §11 file plan:
-# `perfmon/subjects/<id>/aotriton/`), i.e. it has `include/aotriton/*.h`
-# under it and `lib/libaotriton*_v2.so` under it (the `*` is load-bearing,
+# is exactly one subject's install prefix -- which is the SUBJECT DIRECTORY
+# ITSELF, not a nested aotriton/ inside it: a subject is one ordinary Linux
+# install tree (bin/, lib/, include/) shared by AOTriton and perfmon's own
+# artifacts. So it has `include/aotriton/*.h` under it and
+# `lib/libaotriton*_v2.so` under it (the `*` is load-bearing,
 # not sloppy spec wording: v3src/CMakeLists.txt:387 sets
 # `OUTPUT_NAME "aotriton${AOTRITON_NAME_SUFFIX}_v2"`, and T13 always builds
 # with `AOTRITON_NAME_SUFFIX=pmon`, so the real file is
@@ -84,7 +86,7 @@ endif()
 if(NOT DEFINED AOTRITON_ROOT)
   message(FATAL_ERROR
     "[perfmon_flash] AOTRITON_ROOT is required, e.g.\n"
-    "  cmake -DAOTRITON_ROOT=/path/to/perfmon/subjects/<id>/aotriton "
+    "  cmake -DAOTRITON_ROOT=/path/to/installed/perfmon/<arch>/<tag> "
     "-DPERFMON_CORE_ROOT=/path/to/perfmon/core/install ...\n"
     "It must contain include/aotriton/*.h and lib/libaotriton*_v2.so from "
     "ONE subject's own AOTriton build (rev0 D4) -- never a system AOTriton.")
@@ -248,18 +250,80 @@ target_link_libraries(perfmon_flash PRIVATE
 # path. Fixed here rather than silently leaving T13's Verify step unable to
 # pass on a real machine.
 #
-# `_perfmon_aotriton_lib`/`_perfmon_core_lib` are absolute paths (from
-# file(GLOB ...)/find_library() above), so their directories are exactly
-# AOTRITON_ROOT's and PERFMON_CORE_ROOT's own lib dirs -- baked in verbatim
-# rather than relying on CMAKE_INSTALL_RPATH_USE_LINK_PATH's own path
-# derivation, so this stays correct even if a future CMake version changes
-# that automatic behavior.
+# --- $ORIGIN-relative, because the whole hierarchy relocates --------------
+# The earlier version baked ABSOLUTE paths to AOTriton's and perfmon_core's
+# lib dirs into both binaries. That works only on the machine that built
+# them: subjects are built on the build node under its own workdir and then
+# rsynced to GPU workers, whose workdir path differs -- at which point
+# `ldd bin/runner` reports `libperfmon_core.so => not found`. Observed
+# exactly that way.
+#
+# So every dependency INSIDE the synced hierarchy is expressed relative to
+# $ORIGIN and the whole tree can be moved anywhere as a unit:
+#
+#     <prefix>/<arch>/<tag>/bin/runner              this executable
+#     <prefix>/<arch>/<tag>/lib/                    perfmon_flash + aotriton
+#     <prefix>/<arch>/core/rocm-<ver>/lib/          perfmon_core, shared by
+#                                                   every subject in the column
+#
+# perfmon_core deliberately sits OUTSIDE the subject dir -- it is built once
+# per ROCm and reused by every subject (rev0 D4), so it cannot live under any
+# one of them -- but it is still inside <prefix>/<arch>/, which is what
+# sync_workdir.sh ships. `$ORIGIN/../../core/rocm-<ver>/lib` therefore stays
+# valid after relocation, which an absolute path does not.
+#
+# The ROCm runtime dirs stay ABSOLUTE, and that is not an oversight: they are
+# genuinely outside this hierarchy and are not shipped with it (see
+# PerfmonRocmRuntime.cmake -- on theRock they are not ${ROCM_PATH}/lib, and a
+# measurement node need not have the build-time ROCm package at all).
 get_filename_component(_perfmon_aotriton_libdir "${_perfmon_aotriton_lib}" DIRECTORY)
 get_filename_component(_perfmon_core_libdir "${_perfmon_core_lib}" DIRECTORY)
 
+get_filename_component(_perfmon_install_prefix "${CMAKE_INSTALL_PREFIX}" ABSOLUTE)
+set(_perfmon_install_libdir "${_perfmon_install_prefix}/${CMAKE_INSTALL_LIBDIR}")
+set(_perfmon_install_bindir "${_perfmon_install_prefix}/${CMAKE_INSTALL_BINDIR}")
+
+# Express `target_dir` as an $ORIGIN-relative RPATH entry for a binary that
+# will be installed into `anchor_dir`.
+function(perfmon_origin_relative out_var anchor_dir target_dir)
+  get_filename_component(_a "${anchor_dir}" ABSOLUTE)
+  get_filename_component(_t "${target_dir}" ABSOLUTE)
+  file(RELATIVE_PATH _rel "${_a}" "${_t}")
+  if(_rel STREQUAL "")
+    set(${out_var} "$ORIGIN" PARENT_SCOPE)
+  else()
+    set(${out_var} "$ORIGIN/${_rel}" PARENT_SCOPE)
+  endif()
+endfunction()
+
+perfmon_origin_relative(_rpath_aotriton_from_lib "${_perfmon_install_libdir}" "${_perfmon_aotriton_libdir}")
+perfmon_origin_relative(_rpath_core_from_lib     "${_perfmon_install_libdir}" "${_perfmon_core_libdir}")
+perfmon_origin_relative(_rpath_aotriton_from_bin "${_perfmon_install_bindir}" "${_perfmon_aotriton_libdir}")
+perfmon_origin_relative(_rpath_core_from_bin     "${_perfmon_install_bindir}" "${_perfmon_core_libdir}")
+
+# With AOTriton installed into the subject prefix itself, its lib dir IS the
+# subject's lib dir, so the aotriton entry collapses onto the $ORIGIN one.
+# Deduplicate rather than emit it twice -- kept general, because AOTRITON_ROOT
+# is still a free parameter and a caller may point it elsewhere.
+set(_rpath_flash "$ORIGIN;${_rpath_aotriton_from_lib};${_rpath_core_from_lib};${_perfmon_rocm_rpath}")
+set(_rpath_runner
+    "$ORIGIN/../${CMAKE_INSTALL_LIBDIR};${_rpath_aotriton_from_bin};${_rpath_core_from_bin};${_perfmon_rocm_rpath}")
+list(REMOVE_DUPLICATES _rpath_flash)
+list(REMOVE_DUPLICATES _rpath_runner)
+
+message(STATUS "[perfmon_flash] RUNPATH lib/libperfmon_flash.so: ${_rpath_flash}")
+message(STATUS "[perfmon_flash] RUNPATH bin/runner: ${_rpath_runner}")
+
+# DT_RUNPATH, not DT_RPATH. RUNPATH is not transitive -- it does NOT help
+# resolve a dependency's own dependencies -- which is precisely why
+# libperfmon_flash.so needs its own entry for perfmon_core below rather than
+# relying on the runner's. Requested explicitly rather than left to the
+# linker's default, since that default is a distro build-time choice.
+target_link_options(perfmon_flash PRIVATE "LINKER:--enable-new-dtags")
+
 set_target_properties(perfmon_flash PROPERTIES
   BUILD_WITH_INSTALL_RPATH TRUE
-  INSTALL_RPATH "${_perfmon_aotriton_libdir};${_perfmon_core_libdir};${_perfmon_rocm_rpath}")
+  INSTALL_RPATH "${_rpath_flash}")
 
 # --- `runner` executable (T13 gap-fill) -----------------------------------
 # Links this project's own just-built `perfmon_flash` (which resolves
@@ -284,14 +348,15 @@ target_link_libraries(runner PRIVATE
   hip::host
   "${_perfmon_core_lib}")
 
-# `$ORIGIN/../<libdir>` finds this same install's own `perfmon_flash.so`
-# (T13 spec: "with the subject's lib dir on rpath") regardless of where the
-# subject's install prefix ends up on disk; the two absolute entries find
-# AOTriton's and perfmon_core's install locations, which are NOT generally
-# siblings of this subject's own install prefix.
+# `$ORIGIN/../<libdir>` finds this same install's own `perfmon_flash.so` and
+# (post-flattening) AOTriton too; the computed entries reach perfmon_core in
+# the sibling `core/rocm-<ver>/` column. All relative -- see the RPATH block
+# above for why nothing inside the hierarchy may be absolute.
+target_link_options(runner PRIVATE "LINKER:--enable-new-dtags")
+
 set_target_properties(runner PROPERTIES
   BUILD_WITH_INSTALL_RPATH TRUE
-  INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR};${_perfmon_aotriton_libdir};${_perfmon_core_libdir};${_perfmon_rocm_rpath}")
+  INSTALL_RPATH "${_rpath_runner}")
 
 install(TARGETS perfmon_flash
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

@@ -35,12 +35,23 @@
 #                     nothing of "workdir" -- that is a tuner concept, and
 #                     perfmon is not the tuner.
 #
-# Produces <install_prefix><arch>/<tag>/ containing a
-# `subject_id` file (aotriton-<tag>+rocm<rocm>, perfmon-rev0.md §9/§11) and:
-#   aotriton/            AOTRITON_ROOT: shim-built include/+lib/, plus
-#                         (released tags only) fetched lib/aotriton.images/
-#   bin/runner            the executable T13's own Verify step checks
-#   lib/libperfmon_flash.so
+# Produces <install_prefix><arch>/<tag>/ -- ONE ordinary Linux install tree,
+# not a nest of them. AOTriton and perfmon's own artifacts share it:
+#
+#   subject_id                    aotriton-<tag>+rocm<rocm> (rev0 §9/§11)
+#   bin/runner                    the executable T13's Verify step checks
+#   lib/libperfmon_flash.so       this subject's adapter
+#   lib/libaotritonpmon_v2.so*    the shim-built AOTriton
+#   lib/aotriton.images/          that release's fetched kernel images
+#   include/aotriton/             the shim's headers
+#
+# and beside it, shared by every subject in the column:
+#
+#   <install_prefix><arch>/core/rocm-<ver>/lib/libperfmon_core.so
+#
+# bin/runner reaches all of it through $ORIGIN-relative RUNPATHs, so the
+# whole hierarchy can be rsynced to a GPU worker at a different path and
+# still resolve -- see the RPATH block in the runner's CMakeLists.txt.
 #
 # RUN AND VERIFIED for `head 7.14.0 gfx942` on an 8x gfx942 node with
 # theRock ROCm 7.14: T13's Verify step passes (see the runner CMakeLists).
@@ -52,7 +63,7 @@
 # separate full (non-shim) gfx942 build's images were copied in by hand:
 #   .ci/build-test.sh gfx942 <prebuilt-triton-wheel>
 #   cp -r build-0.14-test-gfx942/install_dir/lib/aotriton.images \
-#         perfmon/subjects/aotriton-head+rocm7.14.0/aotriton/lib/
+#         perfmon/subjects/aotriton-head+rocm7.14.0/lib/
 # Originally verified only via `bash -n` (syntax check) and manual re-reading
 # against .ci/build-shim.sh, .ci/common-build.sh, v3src/CMakeLists.txt's
 # install() rules, and .ci/runc-manylinux-build-tar.sh's tarball-naming
@@ -95,15 +106,17 @@
 #    branch), so there is nothing to build it FROM in an old tag's tree; the
 #    harness source is one thing, built repeatedly against many AOTriton
 #    roots, exactly as documented in `modules/flash/perfmon/runner/
-#    CMakeLists.txt`'s own "runner executable target" comment. A concrete,
-#    KNOWN, DISCLOSED consequence: if a released tag's AOTriton headers/API
-#    have drifted from what `adapter_v3.cc` (a "starting template per API
-#    generation", perfmon-rev0.md D4) expects, that subject's build will
-#    fail to compile until it gets its own `overrides/<tag>.cc` -- explicitly
-#    out of scope for T13, whose own title is "Build the first subject:
-#    head" (the one case where this cannot happen, since `head` IS this
-#    branch). Non-head tags are therefore an implemented-but-unexercised
-#    path, more so than the rest of this already-unverified script.
+#    CMakeLists.txt`'s own "runner executable target" comment.
+#
+#    That the API drifts per tag is now HANDLED rather than merely disclosed:
+#    the harness has one adapter directory per tag,
+#    `modules/flash/perfmon/runner/<tag>/adapter.cc`, selected by the
+#    PERFMON_FLASH_TAG passed below, with API-independent routines in
+#    `runner/lib/`. (An earlier note here predicted a single adapter_v3.cc
+#    plus per-tag `overrides/<tag>.cc`; the real drift turned out to be
+#    structural enough -- four generations across six tags -- that whole
+#    per-tag files are what it took.) A tag with no adapter directory now
+#    fails with a one-line reason instead of a compiler dump.
 #
 # 4. Step 3's `tag == head` case: spec text says "For head, the local build
 #    already has them [images]" -- but step 2's shim build always passes
@@ -287,11 +300,47 @@ build_one_subject() {
   # since changed stays identifiable rather than silently assumed current.
   SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
   SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${TAG}"
-  AOTRITON_ROOT="${SUBJECT_DIR}/aotriton"
+
+  # AOTriton installs into the subject prefix ITSELF, not a nested
+  # <subject>/aotriton/. A subject is one self-contained install tree with
+  # the ordinary Linux layout:
+  #
+  #     <subject>/bin/runner
+  #     <subject>/lib/libperfmon_flash.so
+  #     <subject>/lib/libaotritonpmon_v2.so*
+  #     <subject>/lib/aotriton.images/
+  #     <subject>/include/aotriton/
+  #
+  # The earlier nesting put AOTriton's include/ and lib/ one level down
+  # while perfmon's own bin/ and lib/ sat at the top, so the tree had two
+  # unrelated lib/ dirs and matched no convention. Nothing needs them
+  # separated: the names do not collide (libaotritonpmon_v2 vs
+  # libperfmon_flash), and merging them is what lets bin/runner reach every
+  # in-subject dependency through a single `$ORIGIN/../lib`.
+  AOTRITON_ROOT="${SUBJECT_DIR}"
 
   echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
   echo "[build_subject] subject_dir=${SUBJECT_DIR}" >&2
   mkdir -p "${SUBJECT_DIR}"
+
+  # Sweep out layouts this script no longer produces. Without this, a subject
+  # dir built by an older revision keeps its nested aotriton/ tree beside the
+  # new flat include/ and lib/, and the result is worse than either -- two
+  # copies of the same headers, and a `lib/` that looks right while a stale
+  # `aotriton/lib/` still holds the library ldd actually resolved last time.
+  #
+  # Only paths the CURRENT code never creates are listed, so this can never
+  # delete live output: aotriton/ is the old nesting, src/ was an in-subject
+  # clone before --src_prefix existed, and build-flash/ and .images-download/
+  # were build scratch before --build_prefix moved it out.
+  for _stale in aotriton src build-flash .images-download; do
+    if [ -e "${SUBJECT_DIR}/${_stale}" ]; then
+      echo "[build_subject] removing stale ${SUBJECT_DIR}/${_stale}" \
+           "(no longer produced by this script)" >&2
+      rm -rf "${SUBJECT_DIR:?}/${_stale}"
+    fi
+  done
+
   printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
 
   # --- Step 1: source tree ------------------------------------------------
