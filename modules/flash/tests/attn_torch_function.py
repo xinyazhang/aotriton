@@ -83,6 +83,18 @@ class AttentionExtraArgs:
     fillnan : bool = False
     return_logsumexp : bool = False
     illaddr_handler : Callable = empty_handler
+    # PER-CALL backend override, taking precedence over the FWD_IMPL/BWD_IMPL
+    # environment when set. None keeps the env behaviour, so every existing
+    # caller is unaffected.
+    #
+    # The env variables pin a backend for a whole PROCESS, which is right for a
+    # test pass but useless for comparing backends against each other: two
+    # processes differ in clock state, allocator state and thermal history, and
+    # that difference lands entirely in the measurement. performance_forward.py
+    # and performance_backward.py use these to put every backend in one process,
+    # interleaved by triton.testing.do_bench.
+    force_fwd_backend_index : int | None = None
+    force_bwd_backend_index : int | None = None
 
 VERBOSE=False
 DEFAULT_PHILOX_SEED = 0x1BF52
@@ -170,7 +182,10 @@ class _attention(torch.autograd.Function):
         else:
             atomic = torch.empty([0], device=q.device, dtype=torch.int32)
 
-        if FORCE_FWD_BACKEND:
+        if attn_extra_args.force_fwd_backend_index is not None:
+            extargs = attn_options()
+            extargs.force_backend_index = attn_extra_args.force_fwd_backend_index
+        elif FORCE_FWD_BACKEND:
             extargs = attn_options()
             extargs.force_backend_index = FWD_IMPL
         else:
@@ -254,7 +269,10 @@ class _attention(torch.autograd.Function):
         delta = lazy_delta(L)
         seqlen_q = q.shape[2]
         seqlen_k = k.shape[2]
-        if FORCE_BWD_BACKEND:
+        if attn_extra_args.force_bwd_backend_index is not None:
+            extargs = attn_options()
+            extargs.force_backend_index = attn_extra_args.force_bwd_backend_index
+        elif FORCE_BWD_BACKEND:
             extargs = attn_options()
             extargs.force_backend_index = BWD_IMPL
         else:
