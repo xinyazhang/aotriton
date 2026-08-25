@@ -262,6 +262,18 @@ build_one_subject() {
     echo "[build_subject] tag=head -> using working tree ${SRC_DIR}" >&2
   else
     WORKTREE_DIR="${SUBJECT_DIR}/src"
+    # Check the ref before `git worktree add`, whose own failure ("fatal:
+    # invalid reference") says nothing about why it is missing or who is
+    # supposed to supply it. aotriton.src is cloned shallow and single-branch,
+    # so it carries no release tags until prepwkdir --workload perfmon fetches
+    # them on the dev node -- this container cannot fetch them itself, since
+    # origin points at a path that exists only there.
+    if ! git -C "${REPO_ROOT}" rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+      echo "[build_subject] ERROR: tag '${TAG}' is not present in ${REPO_ROOT}." \
+           "Run 'prepwkdir <workdir> --workload perfmon' on the dev node to" \
+           "fetch the configured tags, then re-deploy." >&2
+      exit 1
+    fi
     if [ -f "${WORKTREE_DIR}/.git" ] || [ -d "${WORKTREE_DIR}/.git" ]; then
       echo "[build_subject] reusing existing worktree ${WORKTREE_DIR}" >&2
     else
