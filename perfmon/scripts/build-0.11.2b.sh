@@ -226,9 +226,22 @@ echo "[build-0.11.2b] build_dir=${BUILD_DIR}" >&2
 # caller's, and dropping it would be its own surprise.
 export CMAKE_PREFIX_PATH="${ROCM_PATH}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
 
+# GCC, not hipcc, builds the AOTriton library.
+#
+# hipcc is clang, and clang makes -Wc++11-narrowing an ERROR where GCC does
+# not; this tag's own v2src/flash/attn_fwd.cc narrows int32_t to uint32_t in an
+# initializer list and simply does not compile under it. That is not a bug to
+# work around here: AOTriton's own CI never used hipcc for this. Neither
+# .ci/build-release.sh nor .ci/common-build.sh sets CMAKE_CXX_COMPILER at any
+# tag in range, so cmake picks the platform default -- g++ on Debian -- and
+# that is what these releases were built and tested with.
+#
+# The shim needs only HIP's HOST API, which hip::host supplies to any C++
+# compiler; nothing here compiles device code. (perfmon/core is the opposite
+# case and does need hipcc -- it has a __global__ kernel in fill.cc.)
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER="${CXX:-hipcc}" \
+  -DCMAKE_CXX_COMPILER="${AOTRITON_CXX:-g++}" \
   -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
   -DAOTRITON_TARGET_ARCH="${ARCH}" \
   -DAOTRITON_NOIMAGE_MODE=ON \

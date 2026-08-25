@@ -139,10 +139,11 @@ SRC_DIR="$(cd "${SRC_DIR}" && pwd)"
 mkdir -p "${INSTALL_DIR}"
 INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
 
-CXX="${CXX:-hipcc}"
-if ! command -v "${CXX}" >/dev/null 2>&1; then
-  echo "Error: C++ compiler '${CXX}' not found on PATH." >&2
-  echo "       This build expects hipcc (\$CXX overrides it)." >&2
+AOTRITON_CXX="${AOTRITON_CXX:-g++}"
+if ! command -v "${AOTRITON_CXX}" >/dev/null 2>&1; then
+  echo "Error: C++ compiler '${AOTRITON_CXX}' not found on PATH." >&2
+  echo "       AOTriton's own CI builds this with the platform default (g++);" >&2
+  echo "       set \$AOTRITON_CXX to override." >&2
   exit 1
 fi
 
@@ -175,7 +176,7 @@ fi
 echo "[build-0.10b] src_dir=${SRC_DIR}" >&2
 echo "[build-0.10b] install_dir=${INSTALL_DIR}" >&2
 echo "[build-0.10b] arch=${ARCH}" >&2
-echo "[build-0.10b] CXX=${CXX}" >&2
+echo "[build-0.10b] CXX=${AOTRITON_CXX}" >&2
 echo "[build-0.10b] ROCM_PATH=${ROCM_PATH}" >&2
 
 # Out-of-source build, entirely outside <src_dir> -- the contract only asks
@@ -207,10 +208,23 @@ trap cleanup EXIT
 # caller's, and dropping it would be its own surprise.
 export CMAKE_PREFIX_PATH="${ROCM_PATH}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"
 
+# GCC, not hipcc, builds the AOTriton library.
+#
+# hipcc is clang, and clang makes -Wc++11-narrowing an ERROR where GCC does
+# not; this tag's own v2src/flash/attn_fwd.cc narrows int32_t to uint32_t in an
+# initializer list and simply does not compile under it. That is not a bug to
+# work around here: AOTriton's own CI never used hipcc for this. Neither
+# .ci/build-release.sh nor .ci/common-build.sh sets CMAKE_CXX_COMPILER at any
+# tag in range, so cmake picks the platform default -- g++ on Debian -- and
+# that is what these releases were built and tested with.
+#
+# The shim needs only HIP's HOST API, which hip::host supplies to any C++
+# compiler; nothing here compiles device code. (perfmon/core is the opposite
+# case and does need hipcc -- it has a __global__ kernel in fill.cc.)
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_COMPILER="${CXX}" \
+  -DCMAKE_CXX_COMPILER="${AOTRITON_CXX}" \
   -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
   -DAOTRITON_TARGET_ARCH="${ARCH}" \
   -DAOTRITON_NOIMAGE_MODE=ON \
