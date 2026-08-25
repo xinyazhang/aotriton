@@ -218,8 +218,15 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
   -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
   -DAOTRITON_NAME_SUFFIX=pmon
 
-cmake --build "${BUILD_DIR}"
-cmake --install "${BUILD_DIR}"
+# Build AND install in ONE `ninja install`, never `cmake --build` followed by
+# `cmake --install`.
+#
+# This tag's own README.md says so explicitly: "do not run `ninja` separately,
+# due to the limit of the current build system, `ninja install` will run the
+# whole build process unconditionally." Splitting the two -- which is exactly
+# what cmake --build then cmake --install does -- is the documented way to
+# trip that bug. The note is present in the README of every tag in range.
+ninja -C "${BUILD_DIR}" install
 
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
   echo "Error: build finished but ${INSTALL_DIR}/include/aotriton is missing." >&2
