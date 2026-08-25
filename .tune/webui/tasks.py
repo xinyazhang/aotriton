@@ -535,11 +535,11 @@ class BuildLibrariesCommand(CommandBuilder):
 
 
 class BuildTestLibrariesCommand(CommandBuilder):
-    """Build testing version of AOTriton libraries inside container via remotebld --test"""
+    """Build testing version of AOTriton libraries inside container via remotebld"""
     RELATIVE = '.tune/bin/remotebld'
 
     def exec(self, workdir, single_arch: str | None = None, use_installed_db: bool = True, dry_run: bool = False):
-        args = [workdir, '--test']
+        args = [workdir, '--workload', 'test']
         if single_arch:
             args += ['--single_arch', single_arch]
         if not use_installed_db:
@@ -1103,9 +1103,24 @@ def fetch_tuning_build(workdir, dry_run: bool = False):
     hostname = cfg.get('hostname', '')
     if not hostname:
         return {'status': 'error', 'message': 'Remote build node hostname is not configured'}
-    cmd = ['.tune/bin/fetchbuild', workdir, '--tuning']
+    cmd = ['.tune/bin/fetchbuild', workdir, '--workload', 'tune']
     return run_command(cmd, cwd=AOTRITON_ROOT, workdir=workdir,
                        description=f'Fetch tuning build from {hostname}', dry_run=dry_run)
+
+
+def fetch_perfmon_build(workdir, dry_run: bool = False):
+    """Fetch perfmon subjects from the remote build node.
+
+    Subjects are built on the build node (build_perfmon.sh) but deployed to
+    GPU workers from here, so they have to come back to the server first.
+    """
+    cfg = get_build_node_config(workdir)
+    hostname = cfg.get('hostname', '')
+    if not hostname:
+        return {'status': 'error', 'message': 'Remote build node hostname is not configured'}
+    cmd = ['.tune/bin/fetchbuild', workdir, '--workload', 'perfmon']
+    return run_command(cmd, cwd=AOTRITON_ROOT, workdir=workdir,
+                       description=f'Fetch perfmon subjects from {hostname}', dry_run=dry_run)
 
 
 def fetch_test_build(workdir, dry_run: bool = False):
@@ -1114,7 +1129,7 @@ def fetch_test_build(workdir, dry_run: bool = False):
     hostname = cfg.get('hostname', '')
     if not hostname:
         return {'status': 'error', 'message': 'Remote build node hostname is not configured'}
-    cmd = ['.tune/bin/fetchbuild', workdir, '--test']
+    cmd = ['.tune/bin/fetchbuild', workdir, '--workload', 'test']
     return run_command(cmd, cwd=AOTRITON_ROOT, workdir=workdir,
                        description=f'Fetch test build from {hostname}', dry_run=dry_run)
 

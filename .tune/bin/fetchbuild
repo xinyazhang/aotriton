@@ -8,35 +8,57 @@
 #   buildnode::hostname          SSH hostname of the build node
 #   buildnode::workdir_override  Remote workdir (resolved via get_buildnode_workdir)
 #
-#   --tuning (default)  Fetch tuning libraries: rsync installed/ from remote,
-#                       excluding installed/database/ and installed/test/.
-#   --test              Fetch testing libraries: rsync installed/test/ from remote.
+#   --workload tune | kernel (default)
+#                       Fetch tuning libraries: rsync installed/ from remote,
+#                       excluding installed/database/, installed/test/ and
+#                       installed/perfmon/.
+#   --workload test | op
+#                       Fetch testing libraries: rsync installed/test/.
+#   --workload perfmon  Fetch perfmon subjects: rsync installed/perfmon/.
+#                       This is how subjects built on the build node reach the
+#                       server, so they can then be deployed to GPU workers.
+#
+#   --tuning / --test are deprecated aliases for --workload tune / test.
 #
 # Usage:
-#   fetchbuild <workdir>          # fetch tuning build (default)
-#   fetchbuild <workdir> --test   # fetch test build
-#   fetchbuild --test <workdir>   # same, order-independent
+#   fetchbuild <workdir>                     # fetch tuning build (default)
+#   fetchbuild <workdir> --workload test     # fetch test build
+#   fetchbuild --workload perfmon <workdir>  # same, order-independent
 
 set -euo pipefail
 
 MODE="tuning"
 WORKDIR=""
 
+NEXT_IS_WORKLOAD=0
 for arg in "$@"; do
+  if [ "$NEXT_IS_WORKLOAD" -eq 1 ]; then
+    MODE="$arg"; NEXT_IS_WORKLOAD=0; continue
+  fi
   case "$arg" in
-    --test)   MODE="test" ;;
-    --tuning) MODE="tuning" ;;
+    --workload) NEXT_IS_WORKLOAD=1 ;;
+    --test)   MODE="test" ;;      # deprecated alias
+    --tuning) MODE="tuning" ;;    # deprecated alias
     *)        WORKDIR="$arg" ;;
   esac
 done
 
+case "$MODE" in
+  tune|kernel|tuning) MODE="tuning" ;;
+  test|op)            MODE="test" ;;
+  perfmon)            MODE="perfmon" ;;
+  *) echo "Error: unknown workload '$MODE' (expected tune|kernel|test|op|perfmon)" >&2
+     exit 1 ;;
+esac
+
 if [ -z "$WORKDIR" ]; then
   cat >&2 <<EOF
-Usage: $0 <workdir> [--tuning|--test]
+Usage: $0 <workdir> [--workload tune|test|perfmon]
 
-  --tuning (default)  Fetch tuning libraries from remote installed/ (excludes
-                      installed/database/ and installed/test/).
-  --test              Fetch testing libraries from remote installed/test/.
+  --workload tune (default)  Fetch tuning libraries from remote installed/
+                             (excludes database/, test/ and perfmon/).
+  --workload test            Fetch testing libraries from installed/test/.
+  --workload perfmon         Fetch perfmon subjects from installed/perfmon/.
 
 Build node config (workers.db config table):
   buildnode::hostname          SSH hostname of the build node.
@@ -69,7 +91,13 @@ fi
 REMOTE_WORKDIR="$(get_buildnode_workdir "$WORKDIR")"
 
 # MUST NOT USE rsync --delete. `installed/` is a shared location for various artifacts.
-if [ "$MODE" = "test" ]; then
+if [ "$MODE" = "perfmon" ]; then
+  echo "Fetching perfmon subjects from $BUILD_NODE_HOST:$REMOTE_WORKDIR/installed/perfmon/ ..."
+  mkdir -p "$WORKDIR/installed/perfmon"
+  rsync -az --checksum --info=progress2 \
+    "$BUILD_NODE_HOST:$REMOTE_WORKDIR/installed/perfmon/" \
+    "$WORKDIR/installed/perfmon/"
+elif [ "$MODE" = "test" ]; then
   echo "Fetching test build from $BUILD_NODE_HOST:$REMOTE_WORKDIR/installed/test/ ..."
   mkdir -p "$WORKDIR/installed/test"
   rsync -az --checksum --info=progress2 \
@@ -81,6 +109,7 @@ else
   rsync -az --checksum --info=progress2 \
     --exclude '/database/' \
     --exclude '/test/' \
+    --exclude '/perfmon/' \
     "$BUILD_NODE_HOST:$REMOTE_WORKDIR/installed/" \
     "$WORKDIR/installed/"
 fi

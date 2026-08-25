@@ -476,6 +476,14 @@ def api_reset_perfmon_tags():
     return jsonify(result)
 
 
+@bp.route('/api/builds/fetch-perfmon', methods=['POST'])
+def api_fetch_perfmon_build():
+    """Fetch perfmon subjects from the remote build node."""
+    workdir = current_app.config['WORKDIR']
+    result = tasks.fetch_perfmon_build(workdir, dry_run=should_dryrun())
+    return jsonify(result)
+
+
 @bp.route('/api/builds/perfmon', methods=['POST'])
 def api_build_perfmon_artifacts():
     """Build perfmon artifacts for every selected (arch, tag) pair.

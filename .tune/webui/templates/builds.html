@@ -237,6 +237,12 @@
         <button type="submit" style="margin-top: 0.75rem;">Build Selected</button>
         <span id="perfmon-build-spinner" class="htmx-indicator">⏳ Building...</span>
     </form>
+    <button hx-post="/api/builds/fetch-perfmon"
+            hx-swap="none"
+            hx-indicator="#fetch-perfmon-spinner"
+            style="margin-top: 0.5rem;"
+            {% if not build_node_config.hostname %}disabled title="Configure a remote build node hostname first"{% endif %}>Fetch Subjects from Remote Build Node{% if build_node_config.hostname %} ({{ build_node_config.hostname }}){% endif %}</button>
+    <span id="fetch-perfmon-spinner" class="htmx-indicator">⏳ Fetching...</span>
     <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
         Each checked cell is a separate <code>build_subject.sh</code> run, so
         one failure does not stop the others &mdash; the matrix is a batch, not
