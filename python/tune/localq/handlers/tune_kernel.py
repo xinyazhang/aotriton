@@ -2,25 +2,26 @@
 # SPDX-License-Identifier: MIT
 
 """
-Message handlers for local queue DAG workflow.
+Handlers for the `tune_kernel` DAG:
 
-TODO: These handlers are NOT part of the execution framework, and should not
-live inside `localq/`. `pq` + `localq` + `exaid` is a general distributed
-execution framework -- a queue, a DAG runner, and crash-isolated CLI runners
--- and it should be DAG-neutral. Everything in this file, by contrast,
-describes exactly one DAG: the `tune_kernel` workflow
-(preprocess -> probe -> N x tune_impl -> postprocess), with AOTriton-specific
-knowledge baked in (`ImplSelector`, `save_tuning_result`, tuning levels).
+    tune_kernel -> preprocess -> probe -> N x tune_impl -> impl_result
+                                                        -> postprocess
 
-`generic_worker.py` is already neutral; it only knows "find the handler
-registered for this message class". The coupling is entirely in this module
-plus the registration lists in `gpu_worker_socket.py` / `cpu_worker.py`.
+AOTriton-specific throughout (`ImplSelector`, `save_tuning_result`, tuning
+levels), which is exactly why it is separated from the framework (perfmon
+rev2 R03). Adding a second DAG costs a sibling module and a registration
+list, not edits to a shared file.
 
-The intended shape is one handler package per DAG class, owned by the
-workload rather than the framework, with `localq/` keeping only the base
-class and the class-agnostic handlers (graceful cancel, mark failed). A
-second DAG (performance measurement) is what makes this concrete: adding it
-should cost a handler module and a registration, not edits to a shared file.
+Message classes are namespaced with this DAG's name -- `tune_kernel/probe`,
+not `probe`. Without that, a second DAG wanting its own `probe` step would
+silently collide with this one in the worker's handler registry. The
+DAG-START message keeps the bare name `tune_kernel`, because that string is
+the task_queue.class value the PG reader forwards verbatim.
+
+NOT namespaced, and not to be confused with these: the wire DSL commands the
+exaid proxy writes to a runner process (`probe`, `benchmark`,
+`prepare_data`). Those are a different protocol entirely, spoken to a C++
+binary over a pipe -- see exaid.py.
 """
 
 import json
@@ -32,63 +33,13 @@ from typing import Dict, Any, List
 import psycopg
 from psycopg.types.json import Jsonb
 
-from ..exaid import exaid_create, ExaidSubprocessNotOK
-from ..tdesc import ImplSelector
-from ..pq.queue import TaskQueue
-from ..pq.results import save_tuning_result
+from ...exaid import exaid_create, ExaidSubprocessNotOK
+from ...tdesc import ImplSelector
+from ...pq.queue import TaskQueue
+from ...pq.results import save_tuning_result
+from .base import MessageHandler
 
 logger = logging.getLogger(__name__)
-
-
-class MessageHandler:
-    """Base class for message handlers"""
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        """Get message class this handler processes"""
-        raise NotImplementedError
-
-    def handle(self, message: dict) -> dict | List[dict] | None:
-        """
-        Process message and return result message(s) (or None).
-
-        Result message is automatically forwarded to its target_queue.
-
-        Args:
-            message: Input message
-
-        Returns:
-            Result message, list of result messages, or None
-        """
-        raise NotImplementedError
-
-    def resolve_dependency(self, blocked_msg: dict, incoming_msg: dict) -> bool:
-        """
-        Called when incoming_msg arrives that might resolve blocked_msg's dependency.
-
-        Args:
-            blocked_msg: Message waiting for dependencies
-            incoming_msg: Newly arrived message
-
-        Returns:
-            True if dependency is resolved (unblock message)
-        """
-        return False
-
-    def teardown_with_unmet_dependency(self, message: dict) -> dict | None:
-        """
-        Called during graceful shutdown when message has unmet dependencies.
-
-        Default implementation returns None (no action needed).
-        Override in subclasses if teardown requires specific actions.
-
-        Args:
-            message: Blocked message being torn down
-
-        Returns:
-            Result message to enqueue (or None)
-        """
-        return None
 
 
 class TuneKernelHandler(MessageHandler):
@@ -105,7 +56,7 @@ class TuneKernelHandler(MessageHandler):
 
     def handle(self, message: dict) -> dict:
         return {
-            'class': 'preprocess',
+            'class': 'tune_kernel/preprocess',
             'target_queue': 'gpu_queue',
             'task_id': message['task_id'],
             'task_config': message['task_config'],
@@ -125,7 +76,7 @@ class PreprocessHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "preprocess"
+        return "tune_kernel/preprocess"
 
     def handle(self, message: dict) -> dict | None:
         task_config = message['task_config']
@@ -161,7 +112,7 @@ class PreprocessHandler(MessageHandler):
 
         # Return probe message
         return {
-            'class': 'probe',
+            'class': 'tune_kernel/probe',
             'target_queue': 'gpu_queue',
             'task_id': message['task_id'],
             'task_config': task_config
@@ -196,7 +147,7 @@ class ProbeHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "probe"
+        return "tune_kernel/probe"
 
     def handle(self, message: dict) -> List[dict] | dict | None:
         task_config = message['task_config']
@@ -273,7 +224,7 @@ class ProbeHandler(MessageHandler):
             for impl_index in range(len(limited)):
                 impl_tasks.append((iface_name, impl_index))
                 results.append({
-                    'class': 'tune_impl',
+                    'class': 'tune_kernel/tune_impl',
                     'target_queue': 'gpu_queue',
                     'task_id': task_id,
                     'task_config': task_config,
@@ -286,11 +237,11 @@ class ProbeHandler(MessageHandler):
             expected_impls.setdefault(name, []).append(index)
 
         results.append({
-            'class': 'postprocess',
+            'class': 'tune_kernel/postprocess',
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'task_config': task_config,
-            'depends': ['impl_result'],
+            'depends': ['tune_kernel/impl_result'],
             'expected_impls': expected_impls,
             'received_impls': defaultdict(dict),
         })
@@ -317,7 +268,7 @@ class TuneImplHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "tune_impl"
+        return "tune_kernel/tune_impl"
 
     def handle(self, message: dict) -> dict:
         task_config = message['task_config']
@@ -353,7 +304,7 @@ class TuneImplHandler(MessageHandler):
             report['error'] = {'stdout': e.stdout, 'stderr': e.stderr}
 
         return {
-            'class': 'impl_result',
+            'class': 'tune_kernel/impl_result',
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'iface_name': iface_name,
@@ -380,7 +331,7 @@ class WriteImplResultHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "impl_result"
+        return "tune_kernel/impl_result"
 
     def handle(self, message: dict) -> None:
         task_id = message['task_id']
@@ -419,7 +370,7 @@ class PostprocessHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "postprocess"
+        return "tune_kernel/postprocess"
 
     def resolve_dependency(self, blocked_msg: dict, incoming_msg: dict) -> bool:
         """
@@ -429,7 +380,7 @@ class PostprocessHandler(MessageHandler):
         IMPORTANT: This method is called in the BROKER context, not the CPU worker context.
         Do NOT access self.db_conn here — it will be None.
         """
-        if blocked_msg['class'] != 'postprocess':
+        if blocked_msg['class'] != 'tune_kernel/postprocess':
             return False
 
         if incoming_msg['class'] not in blocked_msg['depends']:
@@ -513,83 +464,4 @@ class PostprocessHandler(MessageHandler):
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'arch': arch
-        }
-
-
-class GracefulCancelRunningTaskHandler(MessageHandler):
-    """
-    Moves task state back to pending when gracefully cancelled.
-
-    This handler is used during graceful shutdown to cancel running tasks
-    that have unmet dependencies (incomplete tune_hsaco work).
-    """
-
-    def __init__(self, db_conn):
-        self.db_conn = db_conn
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        return "graceful_cancel_running_task"
-
-    def handle(self, message: dict) -> None:
-        task_id = message['task_id']
-        arch = message['arch']
-
-        logger.info(f"Gracefully cancelling task_id={task_id}, moving back to pending")
-
-        # Move task back to pending state
-        task_queue = TaskQueue(self.db_conn)
-        task_queue.mark_pending(task_id, arch)
-
-        logger.info(f"Task {task_id} moved back to pending state")
-
-        # No result message
-        return None
-
-
-class MarkTaskFailedHandler(MessageHandler):
-    """
-    Marks task as failed in database.
-
-    This handler is used when GPU workers encounter exceptions during
-    preprocess or probe stages. GPU workers don't have DB access, so they
-    send this message to CPU workers to write the failure to the database.
-    """
-
-    def __init__(self, db_conn):
-        self.db_conn = db_conn
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        return "mark_task_failed"
-
-    def handle(self, message: dict) -> dict:
-        task_id = message['task_id']
-        arch = message['arch']
-        error = message['error']
-
-        logger.info(f"Marking task_id={task_id} as failed: {error}")
-
-        # Mark task as failed in database
-        task_queue = TaskQueue(self.db_conn)
-        task_queue.mark_failed(task_id, arch=arch, error_message=error)
-
-        logger.info(f"Task {task_id} marked as failed in database")
-
-        # Remove prepared data from tmpfs to free space
-        tmpdir = message.get('tmpdir')
-        if tmpdir:
-            tmpdir_path = Path(tmpdir)
-            if tmpdir_path.exists():
-                try:
-                    shutil.rmtree(tmpdir_path)
-                    logger.info(f"Removed tmpdir {tmpdir_path} for failed task {task_id}")
-                except OSError as e:
-                    logger.warning(f"Failed to remove tmpdir {tmpdir_path}: {e}")
-
-        # Return nak (negative ack) message to unblock PG reader
-        return {
-            'class': 'dag_ack',
-            'task_id': task_id,
-            'negative': True
         }

@@ -234,7 +234,8 @@ class GenericWorker:
             # raising. See handlers.py for the implementation.
             #
             # This fallback is only effective for CPU workers (which have db_conn).
-            if msg_class in ['tune_kernel', 'preprocess', 'probe'] and task_id and self.db_conn:
+            if msg_class in ['tune_kernel', 'tune_kernel/preprocess', 'tune_kernel/probe'] \
+                    and task_id and self.db_conn:
                 try:
                     # Extract arch from message if available
                     arch = message.get('task_config', {}).get('arch')

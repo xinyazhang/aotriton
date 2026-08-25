@@ -321,7 +321,7 @@ class LocalBroker:
 
         for blocked_msg in blocked_list:
             # Import here to avoid circular dependency
-            from .handlers import PostprocessHandler
+            from .handlers.tune_kernel import PostprocessHandler
 
             # Create temporary handler instance to call resolve_dependency
             # (In production, broker should maintain handler registry)
@@ -462,7 +462,7 @@ class LocalBroker:
         logger.info(f"Tearing down {total} blocked messages")
 
         # Import PostprocessHandler for teardown
-        from .handlers import PostprocessHandler
+        from .handlers.tune_kernel import PostprocessHandler
 
         # Create handler instance (with db_conn=None for broker context)
         postprocess_handler = PostprocessHandler(db_conn=None)
@@ -474,7 +474,7 @@ class LocalBroker:
                     continue
 
                 # Only postprocess messages need teardown (they're the only ones that can be blocked)
-                if msg_class == 'postprocess':
+                if msg_class == 'tune_kernel/postprocess':
                     logger.info(f"Calling teardown for {msg_class}: task_id={msg.get('task_id')}")
                     result_msg = postprocess_handler.teardown_with_unmet_dependency(msg)
 

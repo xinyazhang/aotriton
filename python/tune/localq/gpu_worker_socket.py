@@ -14,7 +14,8 @@ import argparse
 import signal
 
 from .generic_worker import GenericWorker
-from .handlers import TuneKernelHandler, PreprocessHandler, ProbeHandler, TuneImplHandler
+from .handlers.tune_kernel import (TuneKernelHandler, PreprocessHandler, ProbeHandler,
+                                   TuneImplHandler)
 from ..utils import configure_logging_with_flush
 
 configure_logging_with_flush()

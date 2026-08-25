@@ -15,7 +15,8 @@ import signal
 from psycopg.rows import dict_row
 
 from .generic_worker import GenericWorker
-from .handlers import WriteImplResultHandler, PostprocessHandler, GracefulCancelRunningTaskHandler, MarkTaskFailedHandler
+from .handlers.tune_kernel import WriteImplResultHandler, PostprocessHandler
+from .handlers.base import GracefulCancelRunningTaskHandler, MarkTaskFailedHandler
 from ..utils import get_db_connection_params, configure_logging_with_flush
 from ..pq.connection import ReconnectableConn
 
