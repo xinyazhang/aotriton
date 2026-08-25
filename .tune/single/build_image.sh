@@ -85,36 +85,60 @@ if [ "$WORKLOAD" = "perfmon" ]; then
     echo "       $HOSTNAME is not registered as a worker in $WORKDIR/workers.db." >&2
     exit 1
   fi
+
+  # Generate the Dockerfile NOW, from this server's state, and ship it with the
+  # build. What the perfmon image contains is decided entirely by its
+  # Dockerfile -- it has zero COPY/ADD, so the build context contributes
+  # nothing -- and that Dockerfile is generated here from workers.db
+  # (perfmon::default_rocm) plus config.rc.
+  #
+  # Building from a previously synced copy would make the result depend on when
+  # the workdir was last deployed: change the ROCm on the PerfmonConfig tab,
+  # press build, and you would silently get an image built to the old value
+  # with no indication anything was stale. The server is the only authority on
+  # what this image is, so it must not be possible to build a different one.
   DOCKERFILE_REL="image.build/Dockerfile.$WORKLOAD.$arch"
-  if [ ! -f "$WORKDIR/$DOCKERFILE_REL" ]; then
-    echo "Error: $WORKDIR/$DOCKERFILE_REL does not exist." >&2
-    echo "       Generate it first:  prepwkdir $WORKDIR --workload $WORKLOAD" >&2
-    echo "       then sync the workdir to $HOSTNAME before building." >&2
+  if ! bash "$TUNE_ROOT/lib/create_perfmon_dockerfile.sh" "$WORKDIR" "$arch"; then
+    echo "Error: could not generate $DOCKERFILE_REL" >&2
     exit 1
   fi
+
+  # Push it, then build with image.build/ as the context: it holds only
+  # generated Dockerfiles, so the upload is negligible, whereas the full
+  # workdir would be sent for a build that reads none of it.
+  BUILD_CONTEXT="$WORKER_WORKDIR/image.build"
+  ssh "$HOSTNAME" "mkdir -p '$BUILD_CONTEXT' && cat > '$WORKER_WORKDIR/$DOCKERFILE_REL'" \
+    < "$WORKDIR/$DOCKERFILE_REL"
+
   # Tag by workload AND arch. Workload because two images that serve different
   # DAGs must not share a name; arch because the perfmon image bakes an
   # arch-specific ROCm payload, so on a multi-arch fleet a shared tag would let
   # the second build silently overwrite the first, leaving an image whose name
   # says nothing about which GPU it can serve.
   IMAGE_TAG="${CELERY_WORKER_IMAGE}-${WORKLOAD}_${arch}"
-  echo "Workload $WORKLOAD: $DOCKERFILE_REL -> $IMAGE_TAG"
+  echo "Workload $WORKLOAD: $DOCKERFILE_REL -> $IMAGE_TAG (generated and pushed just now)"
 else
   # kernel and op share the tuning worker image: same DAG, same container. The
   # workload axis is finer than the image axis, so it does not appear here.
+  #
+  # This one is NOT regenerated-and-pushed: it COPYs config.rc, image.scripts
+  # and files from aotriton.src, so it genuinely needs the synced workdir as
+  # its build context and cannot be made independent of the deploy.
   DOCKERFILE_REL="image.build/Dockerfile"
+  BUILD_CONTEXT="$WORKER_WORKDIR"
   IMAGE_TAG="$CELERY_WORKER_IMAGE"
 fi
 
 # Certain nodes need --network=host to access internet
 if [ -n "$FOLLOW" ]; then
   # Use tsp -t to tail/follow output in real-time
-  ssh "$HOSTNAME" bash -s "$WORKER_WORKDIR" "$IMAGE_TAG" "$DOCKERFILE_REL" <<'EOF'
+  ssh "$HOSTNAME" bash -s "$WORKER_WORKDIR" "$IMAGE_TAG" "$DOCKERFILE_REL" "$BUILD_CONTEXT" <<'EOF'
 WORKER_WORKDIR="$1"
 IMAGE_TAG="$2"
 DOCKERFILE_REL="$3"
+BUILD_CONTEXT="$4"
 
-jobid=$(tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $WORKER_WORKDIR)
+jobid=$(tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $BUILD_CONTEXT)
 echo "Job ID: $jobid"
 if [ "$(tsp -s "$jobid")" = "queued" ]; then
   echo "Waiting for tsp job $jobid to start..."
@@ -123,5 +147,5 @@ fi
 tsp -t $jobid
 EOF
 else
-  ssh -n "$HOSTNAME" "tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $WORKER_WORKDIR"
+  ssh -n "$HOSTNAME" "tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $BUILD_CONTEXT"
 fi

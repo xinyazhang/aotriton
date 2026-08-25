@@ -89,18 +89,17 @@
     <button hx-post="/api/workers/{{ build_node_config.hostname }}/build-image"
             hx-vals='{"workload": "perfmon"}'
             hx-swap="none"
-            hx-confirm="Build the perfmon image on {{ build_node_config.hostname }}? Requires Prepare Workdir to have run with the Perfmon workload selected."
+            hx-confirm="Build the perfmon image on {{ build_node_config.hostname }}?"
             hx-indicator="#build-perfmon-image-spinner"
             {% if not build_node_config.hostname %}disabled title="Configure a remote build node hostname first"
             {% elif not perfmon_rocm %}disabled title="Set perfmon::default_rocm on the PerfmonConfig tab first"{% endif %}>Build Perfmon Image on Remote Build Node{% if build_node_config.hostname %} ({{ build_node_config.hostname }}){% endif %}</button>
     <span id="build-perfmon-image-spinner" class="htmx-indicator">⏳ Building Perfmon Image...</span>
     <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
-        The perfmon image is built from
-        <code>image.build/Dockerfile.perfmon.&lt;arch&gt;</code> and tagged
-        <code>{{ config.CELERY_WORKER_IMAGE }}-perfmon_&lt;arch&gt;</code>.
-        Generate that Dockerfile by selecting <strong>Perfmon</strong> as the
-        Workload on the Workers tab and running <em>Prepare Workdir</em>, then
-        deploy before building.
+        Tagged <code>{{ config.CELERY_WORKER_IMAGE }}-perfmon_&lt;arch&gt;</code>,
+        for the target host's registered architecture.
+        The Dockerfile is generated from this server's settings and pushed with
+        the build, so no Prepare or Deploy is needed first and the image always
+        reflects the ROCm currently set on the PerfmonConfig tab.
         {% if not perfmon_rocm %}
         <br><strong style="color: #a15c00;">perfmon::default_rocm is not set</strong>
         &mdash; set it on the PerfmonConfig tab first.
