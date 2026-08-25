@@ -175,35 +175,51 @@ perfmon_rocm_runtime_dirs(_perfmon_rocm_rpath "${_perfmon_rocm_path}")
 # CMakeLists.txt). T13's build_subject.sh is responsible for installing this
 # into `perfmon/subjects/<id>/lib/` and rpath-linking `bin/runner` against
 # it from there.
-# --- Which adapter source ------------------------------------------------
-# NOT hardcoded to adapter_v3.cc. rev0 §5 calls adapter_v3.cc "a starting
+# --- Which adapter -------------------------------------------------------
+# One directory per AOTriton tag: <tag>/adapter.cc, with routines that do
+# not depend on the drifting part of the API factored into lib/ (see
+# lib/common.h for exactly where that line is drawn).
+#
+# NOT hardcoded to a single source. rev0 §5 calls the v3 adapter "a starting
 # template per API generation; where a tag's structs diverge, that subject
 # gets its own copy ... never a branch in a file other subjects also
-# compile", and rev0 §4 warns "Do not assume v3 struct stability". Both
-# turned out to be right, and the drift is finer than rev0's two-adapter
-# table assumed -- see build_subject.sh's own adapter table for the four
-# generations the tag range actually spans.
+# compile", and rev0 §4 warns "Do not assume v3 struct stability". Both were
+# right, and the drift is finer than rev0's two-adapter table assumed -- the
+# tag range spans four generations. Hardcoding one source is what made every
+# historical tag compile HEAD's adapter and die in "no member named ..."
+# errors that said nothing about the real cause.
 #
-# Hardcoding one source here is what made every historical tag compile
-# HEAD's adapter and fail with a wall of "no member named ..." errors
-# instead of saying it has no adapter yet.
-if(NOT DEFINED PERFMON_FLASH_ADAPTER)
+# Tags whose API is identical are directory SYMLINKS rather than copies
+# (0.11b -> 0.11.2b, 0.12.1b -> head, 0.13b -> head), so the two can never
+# silently drift apart. When one of them does diverge, replace its symlink
+# with a real directory.
+if(NOT DEFINED PERFMON_FLASH_TAG)
   message(FATAL_ERROR
-    "[perfmon_flash] PERFMON_FLASH_ADAPTER is required: the adapter source "
-    "for THIS subject's AOTriton API generation, e.g. "
-    "-DPERFMON_FLASH_ADAPTER=adapter_v3.cc. build_subject.sh picks it per "
-    "tag; see its adapter table.")
+    "[perfmon_flash] PERFMON_FLASH_TAG is required: the AOTriton tag this "
+    "subject is built from, e.g. -DPERFMON_FLASH_TAG=0.13b. It selects "
+    "<tag>/adapter.cc. build_subject.sh passes it automatically.")
 endif()
-if(NOT IS_ABSOLUTE "${PERFMON_FLASH_ADAPTER}")
-  set(PERFMON_FLASH_ADAPTER "${CMAKE_CURRENT_SOURCE_DIR}/${PERFMON_FLASH_ADAPTER}")
-endif()
-if(NOT EXISTS "${PERFMON_FLASH_ADAPTER}")
-  message(FATAL_ERROR
-    "[perfmon_flash] adapter source ${PERFMON_FLASH_ADAPTER} does not exist.")
-endif()
-message(STATUS "[perfmon_flash] adapter: ${PERFMON_FLASH_ADAPTER}")
 
-add_library(perfmon_flash SHARED "${PERFMON_FLASH_ADAPTER}")
+set(_perfmon_adapter "${CMAKE_CURRENT_SOURCE_DIR}/${PERFMON_FLASH_TAG}/adapter.cc")
+if(NOT EXISTS "${_perfmon_adapter}")
+  message(FATAL_ERROR
+    "[perfmon_flash] no adapter for tag '${PERFMON_FLASH_TAG}': "
+    "${_perfmon_adapter} does not exist.\n"
+    "Every tag needs one, because the public flash API is not stable across "
+    "releases -- compiling a neighbouring tag's adapter instead only yields "
+    "a wall of 'no member named ...' errors. Write it against that tag's own "
+    "include/aotriton/{flash,util}.h, or symlink this directory to an "
+    "existing tag whose API you have verified is identical.")
+endif()
+message(STATUS "[perfmon_flash] tag ${PERFMON_FLASH_TAG} -> ${_perfmon_adapter}")
+
+# lib/ is compiled fresh per subject alongside the adapter -- "shared" means
+# shared SOURCE, never a shared binary. The one genuinely shared binary is
+# libperfmon_core, which sees no AOTriton header at all (rev0 D4).
+add_library(perfmon_flash SHARED
+  "${_perfmon_adapter}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/lib/common.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/lib/vtable.cc")
 
 target_include_directories(perfmon_flash PRIVATE
   "${AOTRITON_ROOT}/include"

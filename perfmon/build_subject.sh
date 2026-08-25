@@ -379,54 +379,39 @@ build_one_subject() {
 
   # --- Step 4: libperfmon_flash@<subject> + bin/runner (T13 spec item 4) ---
 
-  # Which adapter source this tag's AOTriton API needs.
+  # The flash adapter is selected by TAG: modules/flash/perfmon/runner/<tag>/
+  # adapter.cc, with API-independent routines factored into runner/lib/.
   #
-  # rev0 §4's table assumed exactly two adapters -- v2 for 0.9.x, one
-  # adapter_v3 for everything from 0.10b -- while §4 itself warned "Do not
-  # assume v3 struct stability". The warning won: the public flash API drifts
-  # WITHIN the v3 line, so the tag range spans FOUR generations, not two.
-  # Confirmed by reading each tag's own include/aotriton/{flash,util}.h:
+  # rev0 §4's table assumed exactly two adapters -- v2 for 0.9.x, one v3 for
+  # everything from 0.10b -- while the same section warned "Do not assume v3
+  # struct stability". The warning won: the public flash API drifts WITHIN
+  # the v3 line, so the tag range spans FOUR generations. Read from each
+  # tag's own include/aotriton/{flash,util}.h:
   #
-  #   0.9.2b            v2 only. No attn_fwd_params/attn_options/CausalType at
-  #                     all; the entry point is the v2::flash::attn_fwd(...)
-  #                     free function.
-  #   0.10b             v3 params exist (attn_fwd_params, attn_options,
-  #                     CausalType, VarlenType, WindowValue) but there is NO
-  #                     LazyTensor, NO attn_options::force_backend_index and
-  #                     NO attn_bwd_params::DQ_ACC.
-  #   0.11b, 0.11.2b    LazyTensor, force_backend_index and DQ_ACC all exist,
-  #                     but LazyTensor is cookie-style -- {cookie, acquire,
-  #                     dispose} with `acquire(void* cookie)` and no `eager`
-  #                     member.
-  #   0.12.1b, 0.13b    LazyTensor gains `TensorView<Rank> eager`, and
-  #   (and head)        acquire/dispose take `LazyTensor<Rank>* self`. This is
-  #                     what adapter_v3.cc is written against.
+  #   0.9.2b            v2 only. No params struct at all; the entry points
+  #                     are long positional v2::flash free functions, and
+  #                     backends cannot be forced.
+  #   0.10b             v3 params exist, but attn_options is EMPTY (no
+  #                     force_backend_index), there is no LazyTensor, and
+  #                     attn_bwd_params has no DQ_ACC.
+  #   0.11b, 0.11.2b    LazyTensor, force_backend_index and DQ_ACC all
+  #                     exist, but LazyTensor is cookie-style --
+  #                     acquire(void*), no `eager` member.
+  #   0.12.1b, 0.13b    LazyTensor gains `eager`; acquire/dispose take
+  #   (and head)        LazyTensor<Rank>* self.
   #
-  # A tag with no adapter fails HERE, naming what is missing, rather than
-  # compiling HEAD's adapter against a five-year-older header and burying the
-  # reason in fifty "no member named ..." diagnostics.
-  case "${TAG}" in
-    0.9.2b)             FLASH_ADAPTER="adapter_v2.cc" ;;
-    0.10b)              FLASH_ADAPTER="adapter_v3_nolazy.cc" ;;
-    0.11b|0.11.2b)      FLASH_ADAPTER="adapter_v3_lazycookie.cc" ;;
-    0.12.1b|0.13b|head) FLASH_ADAPTER="adapter_v3.cc" ;;
-    *)
-      echo "[build_subject] ERROR: no adapter mapping for tag '${TAG}'." \
-           "Add one to build_subject.sh's adapter table after reading that" \
-           "tag's include/aotriton/{flash,util}.h -- do NOT assume it shares" \
-           "an API generation with its neighbours." >&2
-      exit 1
-      ;;
-  esac
-
-  FLASH_ADAPTER_PATH="${REPO_ROOT}/modules/flash/perfmon/runner/${FLASH_ADAPTER}"
-  if [ ! -f "${FLASH_ADAPTER_PATH}" ]; then
-    echo "[build_subject] ERROR: ${TAG} needs ${FLASH_ADAPTER}, which does not" \
-         "exist yet. Its AOTriton API generation differs from the one" \
-         "adapter_v3.cc targets (see the adapter table in this script);" \
-         "building it with adapter_v3.cc anyway only produces a wall of" \
-         "'no member named ...' errors. Write ${FLASH_ADAPTER} against that" \
-         "tag's own headers, or drop ${TAG} from the perfmon tag list." >&2
+  # Tags sharing a generation are directory symlinks, so they cannot drift
+  # apart unnoticed. A tag with no directory fails HERE rather than
+  # compiling a neighbour's adapter against the wrong headers and burying
+  # the reason in fifty "no member named ..." diagnostics.
+  FLASH_ADAPTER_DIR="${REPO_ROOT}/modules/flash/perfmon/runner/${TAG}"
+  if [ ! -f "${FLASH_ADAPTER_DIR}/adapter.cc" ]; then
+    echo "[build_subject] ERROR: no flash adapter for tag '${TAG}'." \
+         "Expected ${FLASH_ADAPTER_DIR}/adapter.cc. The public flash API is" \
+         "not stable across releases, so every tag needs its own adapter;" \
+         "write it against that tag's own include/aotriton/{flash,util}.h," \
+         "or symlink that directory to a tag whose API you have verified is" \
+         "identical." >&2
     exit 1
   fi
 
@@ -434,7 +419,7 @@ build_one_subject() {
   mkdir -p "${FLASH_BUILD_DIR}"
   echo "[build_subject] configuring modules/flash/perfmon/runner against" \
        "AOTRITON_ROOT=${AOTRITON_ROOT} PERFMON_CORE_ROOT=${PERFMON_CORE_ROOT}" \
-       "adapter=${FLASH_ADAPTER}" >&2
+       "adapter=${TAG}/adapter.cc" >&2
   cmake -S "${REPO_ROOT}/modules/flash/perfmon/runner" -B "${FLASH_BUILD_DIR}" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -442,7 +427,7 @@ build_one_subject() {
     -DCMAKE_INSTALL_PREFIX="${SUBJECT_DIR}" \
     -DAOTRITON_ROOT="${AOTRITON_ROOT}" \
     -DPERFMON_CORE_ROOT="${PERFMON_CORE_ROOT}" \
-    -DPERFMON_FLASH_ADAPTER="${FLASH_ADAPTER_PATH}"
+    -DPERFMON_FLASH_TAG="${TAG}"
   cmake --build "${FLASH_BUILD_DIR}"
   cmake --install "${FLASH_BUILD_DIR}"
 
