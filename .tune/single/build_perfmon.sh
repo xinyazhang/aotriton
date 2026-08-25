@@ -15,7 +15,8 @@
 # (<CELERY_WORKER_IMAGE>-perfmon_<arch>, built by build_image.sh --workload
 # perfmon), and the remote workdir is bind-mounted at /wkdir, so subjects land
 # in <remote workdir>/installed/perfmon/<arch>/<tag>/ -- inside the tree
-# sync_workdir.sh --workload perfmon knows how to ship.
+# sync_workdir.sh --workload perfmon knows how to ship. build_subject.sh is
+# handed that path as a plain install prefix; it has no notion of a workdir.
 #
 # All tags for one arch go in a single invocation: build_subject.sh validates
 # the shared, ROCm-scoped libperfmon_core once for the batch instead of once
@@ -92,7 +93,8 @@ PERFMON_IMAGE="${CELERY_WORKER_IMAGE}-perfmon_${ARCH}"
 
 echo "Build node:   $BUILD_NODE_HOST ($REMOTE_WORKDIR)"
 echo "Image:        $PERFMON_IMAGE"
-echo "ROCm / arch:  $ROCM / $ARCH"
+echo "Image ROCm:   $ROCM (subjects label themselves from the probed toolchain)"
+echo "Arch:         $ARCH"
 echo "Tags:         ${TAGS[*]}"
 
 # --user keeps artifacts owned by the invoking uid:gid, matching how the
@@ -110,7 +112,7 @@ DOCKER_RUN="docker run --rm --network=host --user \$(id -u):\$(id -g)"
 DOCKER_RUN="$DOCKER_RUN --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir"
 DOCKER_RUN="$DOCKER_RUN $PERFMON_IMAGE"
 DOCKER_RUN="$DOCKER_RUN bash /wkdir/aotriton.src/perfmon/build_subject.sh"
-DOCKER_RUN="$DOCKER_RUN $ROCM $ARCH /wkdir ${TAGS[*]}"
+DOCKER_RUN="$DOCKER_RUN $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
 
 if [ -n "$FOLLOW" ]; then
   # Use tsp -t to tail/follow output in real-time

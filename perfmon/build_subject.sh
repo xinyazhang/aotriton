@@ -10,7 +10,7 @@
 # that image carries. .tune/single/build_perfmon.sh is what puts it there; this
 # script is not meant to be invoked on the webui server, which has no ROCm.
 #
-# Usage: build_subject.sh <rocm> <arch> <workdir> <tag> [<tag>...]
+# Usage: build_subject.sh <arch> <install_prefix> <tag> [<tag>...]
 #   Several tags in one invocation, because the ROCm-scoped work -- validating
 #   PERFMON_CORE_ROOT, and the shared libperfmon_core it points at -- is done
 #   once for the batch rather than repeated per tag. Each tag still builds in
@@ -23,21 +23,19 @@
 #           path still exists behind PERFMON_ALLOW_HEAD=1 -- it is the path
 #           T13 actually exercised -- but no UI reaches it. The released-tag
 #           path is implemented per spec but UNVERIFIED, see disclosures.
-#   <rocm>  a nominal ROCm version label (perfmon-rev0.md §9:
-#           `perfmon::subject::<subject_id>` keys/values, e.g. "7.14.0")
-#           used ONLY to build `subject_id` and this script's default
-#           PERFMON_CORE_ROOT guess -- it does NOT select a ROCm install by
-#           itself. The actual toolchain is located exactly the way every
-#           other script in this repo already does it: via the `ROCM_PATH`
-#           environment variable (perfmon/core/CMakeLists.txt's and
-#           .ci/common-vars.sh's own convention), which the CALLER must set
-#           before invoking this script. Inventing a `<rocm>` -> `ROCM_PATH`
-#           naming convention that nothing in this repo defines would be
-#           guessing at infrastructure this task was not asked to build.
-#   <arch>  GPU arch, e.g. "gfx942" -- forwarded verbatim as
-#           AOTRITON_TARGET_ARCH.
+#   The ROCm version is PROBED, not passed: this script cannot locate a ROCm
+#   install from a version string -- it uses whatever ROCM_PATH/hipcc the
+#   environment provides -- so accepting one could only let the label disagree
+#   with the toolchain actually used, and that label goes into subject_id.
+#   <arch>            GPU arch, e.g. "gfx942" -- forwarded verbatim as
+#                     AOTRITON_TARGET_ARCH.
+#   <install_prefix>  Where subjects go: each lands in
+#                     <install_prefix><arch>/<tag>/, the trailing slash carried
+#                     by the prefix as autotools does. This script knows
+#                     nothing of "workdir" -- that is a tuner concept, and
+#                     perfmon is not the tuner.
 #
-# Produces <workdir>/installed/perfmon/<arch>/<tag>/ containing a
+# Produces <install_prefix><arch>/<tag>/ containing a
 # `subject_id` file (aotriton-<tag>+rocm<rocm>, perfmon-rev0.md §9/§11) and:
 #   aotriton/            AOTRITON_ROOT: shim-built include/+lib/, plus
 #                         (released tags only) fetched lib/aotriton.images/
@@ -152,22 +150,19 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-if [ "$#" -lt 4 ]; then
-  echo "Usage: build_subject.sh <rocm> <arch> <workdir> <tag> [<tag>...]" >&2
-  echo '  <rocm>:  nominal ROCm version label (e.g. 7.14.0) -- see this' >&2
-  echo '           script'"'"'s own header comment for why this is NOT how' >&2
-  echo '           the ROCm toolchain itself is located (set ROCM_PATH)' >&2
-  echo '  <arch>:  GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
-  echo '  <workdir>: project workdir; each subject installs under' >&2
-  echo '           <workdir>/installed/perfmon/<arch>/<tag>/' >&2
-  echo '  <tag>...: one or more git tags, e.g. 0.13b 0.12.1b' >&2
+if [ "$#" -lt 3 ]; then
+  echo "Usage: build_subject.sh <arch> <install_prefix> <tag> [<tag>...]" >&2
+  echo '  <arch>:           GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
+  echo '  <install_prefix>: where subjects go; each lands in' >&2
+  echo '                    <install_prefix><arch>/<tag>/. Carry the trailing' >&2
+  echo '                    slash yourself, autotools-style.' >&2
+  echo '  <tag>...:         one or more git tags, e.g. 0.13b 0.12.1b' >&2
   exit 1
 fi
 
-ROCM="$1"
-ARCH="$2"
-PERFMON_WORKDIR="$3"
-shift 3
+ARCH="$1"
+INSTALL_PREFIX="$2"
+shift 2
 TAGS=("$@")
 
 # HEAD is not a supported subject. A released tag is shim-built and paired
@@ -196,26 +191,56 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Subjects install into the WORKDIR's installed/ tree, not into the checkout.
-# installed/ is the one directory the deploy machinery knows how to ship
-# per-arch (installed/<arch>, installed/test/<arch>, installed/database), so
-# putting subjects anywhere else would leave them unsyncable -- and a build
-# artifact living inside the git checkout is wrong regardless.
-if [ ! -d "${PERFMON_WORKDIR}" ]; then
-  echo "Error: workdir '${PERFMON_WORKDIR}' does not exist." >&2
+# The ROCm version is PROBED from the toolchain actually in use, never taken
+# as input. This script cannot locate a ROCm install from a version string --
+# it uses whatever ROCM_PATH/hipcc the environment provides -- so accepting one
+# would only let the label disagree with the thing being used, and that label
+# ends up in subject_id, i.e. in what the published numbers claim they were
+# measured against.
+probe_rocm_version() {
+  local v=""
+  if command -v rocm-sdk >/dev/null 2>&1; then
+    v="$(rocm-sdk version 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$v" ] && command -v hipconfig >/dev/null 2>&1; then
+    v="$(hipconfig --version 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$v" ] && [ -n "${ROCM_PATH:-}" ] && [ -f "${ROCM_PATH}/.info/version" ]; then
+    v="$(head -1 "${ROCM_PATH}/.info/version" || true)"
+  fi
+  v="$(printf '%s' "$v" | tr -d '[:space:]')"
+  printf '%s' "${v%%-*}"          # 6.2.41134-abcdef -> 6.2.41134
+}
+
+ROCM="$(probe_rocm_version)"
+if [ -z "${ROCM}" ]; then
+  echo "Error: could not determine the ROCm version." >&2
+  echo "       Tried rocm-sdk, hipconfig and \$ROCM_PATH/.info/version. This" >&2
+  echo "       script must run where the ROCm toolchain is -- inside the" >&2
+  echo "       perfmon image, not on the WebUI server." >&2
+  exit 1
+fi
+echo "[build_subject] probed ROCm ${ROCM}" >&2
+
+# Subjects install under the caller's prefix. This script has no idea what a
+# "workdir" is -- that is a tuner concept, and perfmon is not the tuner. The
+# caller (.tune/single/build_perfmon.sh) passes
+# <workdir>/installed/perfmon/ and this puts <prefix><arch>/<tag>/ beneath it,
+# with the trailing slash carried by the prefix as autotools does.
+if [ -z "${INSTALL_PREFIX}" ]; then
+  echo "Error: empty install prefix." >&2
   exit 1
 fi
 
 build_one_subject() {
   local TAG="$1"
 
-  # The ROCm is NOT a path segment: one workdir pins one ROCm
-  # (perfmon::default_rocm), so <arch>/<tag> is already unique within it. It is
-  # recorded inside the subject instead, so a directory built against a ROCm that
-  # has since been changed is still identifiable rather than silently assumed
-  # current.
+  # The ROCm is NOT a path segment: one prefix serves one ROCm, so
+  # <arch>/<tag> is already unique beneath it. The probed version is recorded
+  # inside the subject instead, so a directory built against a ROCm that has
+  # since changed stays identifiable rather than silently assumed current.
   SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
-  SUBJECT_DIR="${PERFMON_WORKDIR}/installed/perfmon/${ARCH}/${TAG}"
+  SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${TAG}"
   AOTRITON_ROOT="${SUBJECT_DIR}/aotriton"
 
   echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
@@ -359,12 +384,32 @@ build_one_subject() {
 # ROCm-scoped, not per-tag: check it ONCE, before any subject is built. Failing
 # after the first tag's AOTriton build would waste the expensive part of the run
 # to report a precondition that was already false at the start.
-PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-/opt/perfmon/rocm-${ROCM}}"
+# Default it next to this script rather than to an absolute path nothing
+# creates: /opt/perfmon/rocm-<ver> was a location no part of this repo ever
+# writes, so the default could only ever fail. perfmon/core is a standalone
+# CMake project living beside this file, so its install belongs beside it too.
+PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${SCRIPT_DIR}/core/install-rocm${ROCM}}"
+
+# Build it if it is not there. It is AOTriton-neutral and ROCm-scoped, so this
+# happens at most once per ROCm and is reused by every subject -- which is the
+# property that makes cross-version timings comparable (rev0 D4). Requiring a
+# separate manual step here would just be a prerequisite nothing performs.
 if [ ! -f "${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" ]; then
-  echo "[build_subject] ERROR: PERFMON_CORE_ROOT (${PERFMON_CORE_ROOT}) has no" \
-       "include/perfmon/perfmon_abi.h -- build and install perfmon/core" \
-       "(T11) for rocm ${ROCM} first, or set PERFMON_CORE_ROOT to point at" \
-       "an existing install (see this script's header comment, item 6)." >&2
+  echo "[build_subject] libperfmon_core not found at ${PERFMON_CORE_ROOT}" >&2
+  echo "[build_subject] building perfmon/core for rocm ${ROCM} (once per ROCm)" >&2
+  CORE_BUILD_DIR="${SCRIPT_DIR}/core/build-rocm${ROCM}"
+  cmake -S "${SCRIPT_DIR}/core" -B "${CORE_BUILD_DIR}" \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER="${CXX:-hipcc}" \
+    -DCMAKE_INSTALL_PREFIX="${PERFMON_CORE_ROOT}"
+  cmake --build "${CORE_BUILD_DIR}"
+  cmake --install "${CORE_BUILD_DIR}"
+fi
+
+if [ ! -f "${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" ]; then
+  echo "[build_subject] ERROR: still no ${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" \
+       "after building perfmon/core -- check the cmake output above." >&2
   exit 1
 fi
 
