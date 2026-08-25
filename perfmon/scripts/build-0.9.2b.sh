@@ -172,6 +172,12 @@ BUILD_DIR="${AOTRITON_BUILD_PATH:-${TMPDIR:-/tmp}/aotriton-0.9.2b-shim-${ARCH}}"
 
 mkdir -p "${BUILD_DIR}" "${INSTALL_DIR}"
 
+# Resolve to absolute paths: we are about to hand these to an out-of-source
+# cmake invocation, and a relative INSTALL_DIR would end up interpreted
+# relative to BUILD_DIR (cmake's cwd), not the caller's.
+SRC_DIR="$(cd "${SRC_DIR}" && pwd)"
+INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
+
 echo "[build-0.9.2b] src_dir=${SRC_DIR}" >&2
 echo "[build-0.9.2b] build_dir=${BUILD_DIR}" >&2
 echo "[build-0.9.2b] install_dir=${INSTALL_DIR}" >&2

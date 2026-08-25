@@ -163,6 +163,12 @@ BUILD_DIR="${AOTRITON_BUILD_PATH:-${TMPDIR:-/tmp}/aotriton-0.13b-shim-${ARCH}}"
 
 mkdir -p "${BUILD_DIR}" "${INSTALL_DIR}"
 
+# Resolve to absolute paths: .ci/build-release.sh changes directory before it
+# reaches cmake, so a relative AOTRITON_INSTALL_PATH / AOTRITON_BUILD_PATH
+# would be interpreted against its cwd rather than the caller's.
+SRC_DIR="$(cd "${SRC_DIR}" && pwd)"
+INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
+
 echo "[build-0.13b] src_dir=${SRC_DIR}" >&2
 echo "[build-0.13b] build_dir=${BUILD_DIR}" >&2
 echo "[build-0.13b] install_dir=${INSTALL_DIR}" >&2
