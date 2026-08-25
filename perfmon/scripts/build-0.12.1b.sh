@@ -214,6 +214,39 @@ ninja -C "${BUILD_DIR}" install
 
 # Verify the contract this script promises to its caller, rather than trust
 # a zero exit status from cmake alone.
+# --- kernel images --------------------------------------------------------
+# The shim built above is deliberately NOIMAGE: the kernels under test must be
+# the ones this release actually shipped, not ones rebuilt now. They come from
+# the release itself.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/release_asset.sh"
+
+# Which images asset serves this arch. The grouping is release-specific --
+# gfx11xx split into gfx110x and gfx115x at this release, and gfx1250
+# appeared. +asan variants also exist and are never selected.
+case "${ARCH%%:*}" in
+    gfx90a) IMAGES_GROUP="gfx90a" ;;
+    gfx942) IMAGES_GROUP="gfx942" ;;
+    gfx950) IMAGES_GROUP="gfx950" ;;
+    gfx1250) IMAGES_GROUP="gfx1250" ;;
+    gfx1100) IMAGES_GROUP="gfx110x" ;;
+    gfx1101) IMAGES_GROUP="gfx110x" ;;
+    gfx1150) IMAGES_GROUP="gfx115x" ;;
+    gfx1151) IMAGES_GROUP="gfx115x" ;;
+    gfx1200) IMAGES_GROUP="gfx120x" ;;
+    gfx1201) IMAGES_GROUP="gfx120x" ;;
+    *)
+      echo "Error: AOTriton 0.12.1b publishes no kernel-image asset covering" >&2
+      echo "       '${ARCH}'. See https://github.com/ROCm/aotriton/releases/tag/0.12.1b" >&2
+      exit 1
+      ;;
+esac
+
+ASSET="aotriton-0.12.1b-images-amd-${IMAGES_GROUP}.tar.gz"
+IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
+
+TARBALL_NAME="$(fetch_release_asset "0.12.1b" "${ASSET}" "${IMAGES_DL_DIR}")"
+install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"
+
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
   echo "[build-0.12.1b] ERROR: ${INSTALL_DIR}/include/aotriton missing after install." >&2
   exit 1

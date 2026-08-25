@@ -44,8 +44,8 @@
 #
 # RUN AND VERIFIED for `head 7.14.0 gfx942` on an 8x gfx942 node with
 # theRock ROCm 7.14: T13's Verify step passes (see the runner CMakeLists).
-# The <tag> != head path is still UNRUN, as is the `gh release download`
-# images fetch in step 3 -- disclosure #5 below stands unchanged.
+# The <tag> != head path now builds the shim as far as step 3; the images
+# fetch there is still UNRUN -- disclosure #5 below stands unchanged.
 #
 # Disclosure #4 (below) was CONFIRMED in practice: the shim build produces
 # no lib/aotriton.images/ even for `head`, so T14 could only run after a
@@ -123,21 +123,17 @@
 #    stated primary target ("head") over a condition its own Verify step
 #    does not test.
 #
-# 5. Step 3's released-tag path: nothing in this repository's committed CI
-#    configuration (`.ci/`, `.github/` -- both grepped in full) actually
-#    publishes `aotriton-<sha>-images-<arch>.tar.gz` to GitHub Releases;
-#    `.ci/runc-manylinux-build-tar.sh` (lines 116-122) only shows how that
-#    exact filename is PRODUCED locally inside a release build container,
-#    written to a bind-mounted `/output`, with no further step in this repo
-#    that uploads it anywhere `gh release download` could reach. Rather than
-#    inventing an unconfirmed publishing pipeline and hardcoding a `gh`
-#    invocation as if it were known to work, this script tries `gh release
-#    download` as a first-cut, documented BEST EFFORT (disclosed as
-#    unverified, since this environment has no network and no `gh`), and
-#    provides `PERFMON_IMAGES_TARBALL=<path>` as an explicit escape hatch for
-#    a manually-obtained tarball -- so a human on a real machine is never
-#    blocked by this script's guess being wrong, only by silence about it.
-#
+# 5. Kernel images are fetched by perfmon/scripts/build-<tag>.sh, not here,
+#    because their asset naming drifts as hard as the build system does:
+#    0.9.2b and 0.10b publish no images asset at all (kernels come from the
+#    -shared runtime tarball), 0.11b/0.11.2b publish gfx11xx as one group, and
+#    0.12.1b/0.13b split that into gfx110x/gfx115x and add gfx1250. Each tag's
+#    script names its own asset, verified against that release's actual asset
+#    list; the download and extraction mechanics they share live in
+#    scripts/lib/release_asset.sh. PERFMON_IMAGES_TARBALL=<path> still
+#    overrides the download for a tarball obtained some other way.
+
+
 # 6. `PERFMON_CORE_ROOT`: T13's fixed `<tag> <rocm> <arch>` CLI has no slot
 #    for it (a genuine gap already disclosed in `modules/flash/perfmon/
 #    runner/CMakeLists.txt`'s own header comment). Read as the
@@ -351,78 +347,19 @@ build_one_subject() {
     exit 1
   fi
 
-  # --- Step 3: kernel images (T13 spec item 3) ------------------------------
-  if [ "${TAG}" == "head" ]; then
-    if [ -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
-      echo "[build_subject] ${AOTRITON_ROOT}/lib/aotriton.images already present" >&2
-    else
-      echo "[build_subject] WARNING: no lib/aotriton.images under ${AOTRITON_ROOT}." \
-           "T13's own spec text says \"For head, the local build already has" \
-           "them\", but a NOIMAGE_MODE=ON shim build (step 2, always run" \
-           "regardless of tag) never populates that directory --" \
-           "v3src/CMakeLists.txt gates its own images install() on" \
-           "'NOT AOTRITON_NOIMAGE_MODE'. This is a disclosed spec" \
-           "inconsistency (see this script's own header comment, item 4)," \
-           "not a bug in this script. Continuing: T13's own Verify step does" \
-           "not exercise enumerate/measure, so it does not need images." >&2
-    fi
-  else
-    echo "[build_subject] fetching kernel images for released tag ${TAG}" >&2
-    GIT_SHA="$(git -C "${SRC_DIR}" rev-parse --short=12 "${TAG}")"
-    # Matches .ci/runc-manylinux-build-tar.sh's own tarball naming
-    # (tarbase=aotriton-${GIT_SHORT}${asan_suffix}-images, one file per arch
-    # under aotriton/lib/aotriton.images/) -- '*' absorbs an optional
-    # '+asan' suffix this script does not otherwise select.
-    IMAGES_PATTERN="aotriton-${GIT_SHA}*-images-${ARCH}.tar.gz"
-    IMAGES_DL_DIR="${SUBJECT_DIR}/.images-download"
-    rm -rf "${IMAGES_DL_DIR}"
-    mkdir -p "${IMAGES_DL_DIR}"
-
-    if [ -n "${PERFMON_IMAGES_TARBALL:-}" ]; then
-      echo "[build_subject] using PERFMON_IMAGES_TARBALL override: ${PERFMON_IMAGES_TARBALL}" >&2
-      cp "${PERFMON_IMAGES_TARBALL}" "${IMAGES_DL_DIR}/"
-    elif command -v gh >/dev/null 2>&1; then
-      # See this script's header comment, disclosure #5: this publishing step
-      # is NOT confirmed to exist anywhere in this repo's own CI config; this
-      # is a documented best-effort guess, not a verified integration.
-      echo "[build_subject] gh release download ${TAG} -p '${IMAGES_PATTERN}'" >&2
-      if ! gh release download "${TAG}" -p "${IMAGES_PATTERN}" -D "${IMAGES_DL_DIR}" --clobber; then
-        echo "[build_subject] ERROR: 'gh release download' did not find an asset" \
-             "matching '${IMAGES_PATTERN}' on release '${TAG}'. This repo has no" \
-             "confirmed step that publishes that tarball to GitHub Releases" \
-             "(see this script's header comment, disclosure #5) -- if you have" \
-             "the tarball some other way, re-run with" \
-             "PERFMON_IMAGES_TARBALL=/path/to/it.tar.gz set." >&2
-        exit 1
-      fi
-    else
-      echo "[build_subject] ERROR: 'gh' CLI not found and PERFMON_IMAGES_TARBALL" \
-           "is not set -- cannot fetch images for released tag '${TAG}'." \
-           "Set PERFMON_IMAGES_TARBALL=/path/to/aotriton-<sha>-images-${ARCH}.tar.gz" \
-           "or install the GitHub CLI." >&2
-      exit 1
-    fi
-
-    TARBALL="$(find "${IMAGES_DL_DIR}" -maxdepth 1 -name '*.tar.gz' | head -n 1)"
-    if [ -z "${TARBALL}" ]; then
-      echo "[build_subject] ERROR: no .tar.gz found in ${IMAGES_DL_DIR} after fetch." >&2
-      exit 1
-    fi
-    # Tarball root is "aotriton/" (runc-manylinux-build-tar.sh tars from
-    # inside AOTRITON_INSTALL_PREFIX, whose child is "aotriton/"), so
-    # extracting at SUBJECT_DIR lands it at
-    # ${SUBJECT_DIR}/aotriton/lib/aotriton.images/<arch>/ -- exactly beside
-    # the shim-built libaotriton*_v2.so already sitting in
-    # ${AOTRITON_ROOT}/lib/ (T13 spec item 3: "beside the built .so").
-    tar xzf "${TARBALL}" -C "${SUBJECT_DIR}"
-    rm -rf "${IMAGES_DL_DIR}"
-
-    if [ ! -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
-      echo "[build_subject] ERROR: extracted ${TARBALL} but" \
-           "${AOTRITON_ROOT}/lib/aotriton.images still does not exist --" \
-           "unexpected tarball layout." >&2
-      exit 1
-    fi
+  # Kernel images are fetched by the per-tag script above, not here.
+  #
+  # They have to be: the asset naming drifts as hard as the build system does.
+  # 0.9.2b and 0.10b publish NO images asset at all (their kernels come out of
+  # the -shared runtime tarball); 0.11b/0.11.2b publish gfx11xx as one group;
+  # 0.12.1b/0.13b split that into gfx110x and gfx115x and add gfx1250. There
+  # is no git sha in any of those names -- the version of this step that lived
+  # here matched on one, and so could never have found anything.
+  if [ ! -d "${AOTRITON_ROOT}/lib/aotriton.images" ]; then
+    echo "[build_subject] ERROR: ${TAG_BUILD} left no" \
+         "${AOTRITON_ROOT}/lib/aotriton.images -- the subject would have no" \
+         "kernels to measure." >&2
+    exit 1
   fi
 
   # --- Step 4: libperfmon_flash@<subject> + bin/runner (T13 spec item 4) ---

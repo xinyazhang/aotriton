@@ -223,6 +223,22 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
 # trip that bug. The note is present in the README of every tag in range.
 ninja -C "${BUILD_DIR}" install
 
+# --- kernel images --------------------------------------------------------
+# The shim built above is deliberately NOIMAGE: the kernels under test must be
+# the ones this release actually shipped, not ones rebuilt now. They come from
+# the release itself.
+# 0.9.2b ships NO images asset -- only -shared runtime tarballs. The
+# kernels of this release exist nowhere else, so they are taken from the
+# shared tarball. rocm7.0 is the newest variant this release offers; the
+# choice is immaterial to the images themselves, which are GPU code
+# objects, not ROCm-linked binaries.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/release_asset.sh"
+ASSET="aotriton-0.9.2b-manylinux_2_28_x86_64-rocm7.0-shared.tar.gz"
+IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
+
+TARBALL_NAME="$(fetch_release_asset "0.9.2b" "${ASSET}" "${IMAGES_DL_DIR}")"
+install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"
+
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
   echo "[build-0.9.2b] ERROR: install finished but ${INSTALL_DIR}/include/aotriton is missing." >&2
   exit 1
