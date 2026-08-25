@@ -566,18 +566,30 @@ class BuildPerfmonArtifactsCommand(CommandBuilder):
                          dry_run=dry_run)
 
 
-class BuildImagesCommand(BuildCommand):
+class BuildImagesCommand(CommandBuilder):
     RELATIVE = '.tune/bin/imgbld'
     DESCRIPTION = 'Build Docker images'
 
+    def exec(self, workdir, workload: str = 'kernel', dry_run: bool = False):
+        return self._run(self.RELATIVE, [workdir, '--workload', workload], workdir,
+                         f'Build {workload} images on all workers', dry_run=dry_run)
+
 
 class BuildImageOnWorkerCommand(CommandBuilder):
-    """Build Docker image on a single worker"""
+    """Build Docker image on a single worker, for one workload.
+
+    kernel and op resolve to the same tuning worker image; perfmon has its
+    own, built per-arch from image.build/Dockerfile.perfmon.<arch>. The
+    workload is always passed explicitly rather than left to the script's
+    default, so the command line in the log says which image was built.
+    """
     RELATIVE = '.tune/single/build_image.sh'
 
-    def exec(self, workdir, hostname, dry_run: bool = False):
+    def exec(self, workdir, hostname, workload: str = 'kernel', dry_run: bool = False):
         """Execute build_image.sh for a specific worker with --follow for web UI"""
-        return self._run(self.RELATIVE, [workdir, hostname, '--follow'], workdir, f'Build image on {hostname}', dry_run=dry_run)
+        args = [workdir, hostname, '--workload', workload, '--follow']
+        return self._run(self.RELATIVE, args, workdir,
+                         f'Build {workload} image on {hostname}', dry_run=dry_run)
 
 
 class DeployCommand(CommandBuilder):
@@ -585,9 +597,10 @@ class DeployCommand(CommandBuilder):
     RELATIVE = None  # Subclass must define
     DESCRIPTION = None  # Subclass must define
 
-    def exec(self, workdir, dry_run: bool = False):
-        """Execute deployment script"""
-        return self._run(self.RELATIVE, [workdir], workdir, self.DESCRIPTION, dry_run=dry_run)
+    def exec(self, workdir, *extra_args, dry_run: bool = False):
+        """Execute deployment script, appending any extra CLI arguments."""
+        return self._run(self.RELATIVE, [workdir, *extra_args], workdir,
+                         self.DESCRIPTION, dry_run=dry_run)
 
 
 class DeployAllCommand(DeployCommand):
@@ -602,12 +615,15 @@ class PrepareWorkdirCommand(DeployCommand):
     RELATIVE = '.tune/bin/prepwkdir'
     DESCRIPTION = 'Prepare workdir'
 
-    def exec(self, workdir, dry_run: bool = False):
+    def exec(self, workdir, workload: str = 'kernel', dry_run: bool = False):
         # Ensure log directory exists (use /scratch which is excluded from sync)
         log_dir = Path(workdir) / 'scratch' / 'webui-commands'
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        return super().exec(workdir, dry_run=dry_run)
+        # The workload decides which Dockerfiles get generated; without it a
+        # perfmon fleet would prepare only the tuning image and then fail at
+        # build time with "Dockerfile.perfmon.<arch> does not exist".
+        return super().exec(workdir, '--workload', workload, dry_run=dry_run)
 
 
 # Global command instances
@@ -999,14 +1015,19 @@ def fetch_test_build(workdir, dry_run: bool = False):
                        description=f'Fetch test build from {hostname}', dry_run=dry_run)
 
 
-def build_images(workdir, dry_run: bool = False):
-    """Build Docker images"""
-    return _build_images.exec(workdir, dry_run=dry_run)
+def build_images(workdir, workload: str = 'kernel', dry_run: bool = False):
+    """Build Docker images on all workers, for the given workload."""
+    return _build_images.exec(workdir, workload=workload, dry_run=dry_run)
 
 
-def build_image_on_worker(workdir, hostname, dry_run: bool = False):
-    """Build Docker image on specific worker"""
-    return _build_image_on_worker.exec(workdir, hostname, dry_run=dry_run)
+def build_image_on_worker(workdir, hostname, workload: str = 'kernel', dry_run: bool = False):
+    """Build Docker image on specific worker for the given workload."""
+    if workload == 'perfmon' and not get_perfmon_rocm(workdir):
+        return {'success': False,
+                'error': "perfmon::default_rocm is not set in workers.db, so no "
+                         "perfmon Dockerfile can have been generated. Set it on "
+                         "the PerfmonConfig tab, then Prepare Workdir and deploy."}
+    return _build_image_on_worker.exec(workdir, hostname, workload=workload, dry_run=dry_run)
 
 
 # Deploy functions
@@ -1023,9 +1044,9 @@ def deploy_workdir_single(workdir, hostname, extra_args=None, tuning_mode: str =
     return _deploy_worker.exec(workdir, hostname, extra_args=combined or None, dry_run=dry_run)
 
 
-def prepare_workdir(workdir, dry_run: bool = False):
-    """Prepare workdir"""
-    return _prepare_workdir.exec(workdir, dry_run=dry_run)
+def prepare_workdir(workdir, workload: str = 'kernel', dry_run: bool = False):
+    """Prepare workdir, generating the Dockerfiles the workload needs."""
+    return _prepare_workdir.exec(workdir, workload=workload, dry_run=dry_run)
 
 
 # Worker management functions

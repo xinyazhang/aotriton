@@ -235,9 +235,13 @@ def api_probe_worker_status(hostname):
 
 @bp.route('/api/workers/<hostname>/build-image', methods=['POST'])
 def api_build_image_on_worker(hostname):
-    """Build Docker image on specific worker"""
+    """Build Docker image on specific worker, for one workload."""
     workdir = current_app.config['WORKDIR']
-    result = tasks.build_image_on_worker(workdir, hostname, dry_run=should_dryrun())
+    # Fall back to the saved Workload, not a fixed 'kernel': on a perfmon fleet
+    # this button must build the perfmon image, not the tuning one.
+    workload = request.form.get('workload') or tasks.get_tuning_mode(workdir)
+    result = tasks.build_image_on_worker(workdir, hostname, workload=workload,
+                                         dry_run=should_dryrun())
     return jsonify(result)
 
 
@@ -509,9 +513,10 @@ def api_fetch_test_build():
 
 @bp.route('/api/builds/images', methods=['POST'])
 def api_build_images():
-    """Build Docker images"""
+    """Build Docker images on all workers, for the selected workload."""
     workdir = current_app.config['WORKDIR']
-    result = tasks.build_images(workdir, dry_run=should_dryrun())
+    workload = request.form.get('workload') or tasks.get_tuning_mode(workdir)
+    result = tasks.build_images(workdir, workload=workload, dry_run=should_dryrun())
     return jsonify(result)
 
 
@@ -540,9 +545,16 @@ def api_deploy_single(hostname):
 
 @bp.route('/api/deploy/prepare', methods=['POST'])
 def api_prepare_workdir():
-    """Prepare workdir"""
+    """Prepare workdir for the selected workload.
+
+    Falls back to the saved Workload rather than a fixed default, the same way
+    /api/deploy/workdir already does: the workload decides which Dockerfiles
+    get generated, so preparing a perfmon fleet as `kernel` would leave the
+    perfmon build with nothing to build.
+    """
     workdir = current_app.config['WORKDIR']
-    result = tasks.prepare_workdir(workdir, dry_run=should_dryrun())
+    workload = request.form.get('workload') or tasks.get_tuning_mode(workdir)
+    result = tasks.prepare_workdir(workdir, workload=workload, dry_run=should_dryrun())
     return jsonify(result)
 
 

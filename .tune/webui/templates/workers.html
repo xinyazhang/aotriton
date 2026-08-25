@@ -46,7 +46,8 @@
     </div>
     <button hx-post="/api/deploy/prepare"
             hx-swap="none"
-            hx-indicator="#prepare-spinner">Prepare Workdir</button>
+            hx-indicator="#prepare-spinner"
+            hx-vals='js:{workload: getTuningMode()}'>Prepare Workdir</button>
     <span id="prepare-spinner" class="htmx-indicator">⏳ Preparing...</span>
     <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
         Initialize the working directory structure, sync configuration files and tuning framework code.
@@ -74,6 +75,7 @@
     <button hx-post="/api/builds/images"
             hx-swap="none"
             hx-indicator="#build-images-spinner"
+            hx-vals='js:{workload: getTuningMode()}'
             style="margin-top: 0.5rem; background-color: #17a2b8; color: white;">Build Images on All Workers</button>
     <span id="build-images-spinner" class="htmx-indicator">⏳ Building...</span>
     <button hx-post="/api/workers/probe-all-status"
@@ -268,6 +270,7 @@
                             style="font-size: 0.8em; padding: 0.3rem 0.5rem; background-color: #17a2b8; color: white;">Deploy</button>
                     <button hx-post="/api/workers/{{ worker.hostname }}/build-image"
                             hx-swap="none"
+                            hx-vals='js:{workload: getTuningMode()}'
                             style="font-size: 0.8em; padding: 0.3rem 0.5rem; background-color: #17a2b8; color: white;">Build Image</button>
                 </td>
                 {% else %}

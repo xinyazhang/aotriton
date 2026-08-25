@@ -80,6 +80,32 @@
             hx-indicator="#build-image-buildnode-spinner"
             {% if not build_node_config.hostname %}disabled title="Configure a remote build node hostname first"{% endif %}>Build Image on Remote Build Node{% if build_node_config.hostname %} ({{ build_node_config.hostname }}){% endif %}</button>
     <span id="build-image-buildnode-spinner" class="htmx-indicator">⏳ Building Image...</span>
+
+    {# Perfmon needs its own image: debian base, no distro ROCm, TheRock
+       installed into the venv, and no torch. It is built per-arch, so the
+       target host must be a registered worker -- its registered arch selects
+       image.build/Dockerfile.perfmon.<arch>. #}
+    <br>
+    <button hx-post="/api/workers/{{ build_node_config.hostname }}/build-image"
+            hx-vals='{"workload": "perfmon"}'
+            hx-swap="none"
+            hx-confirm="Build the perfmon image on {{ build_node_config.hostname }}? Requires Prepare Workdir to have run with the Perfmon workload selected."
+            hx-indicator="#build-perfmon-image-spinner"
+            {% if not build_node_config.hostname %}disabled title="Configure a remote build node hostname first"
+            {% elif not perfmon_rocm %}disabled title="Set perfmon::default_rocm on the PerfmonConfig tab first"{% endif %}>Build Perfmon Image on Remote Build Node{% if build_node_config.hostname %} ({{ build_node_config.hostname }}){% endif %}</button>
+    <span id="build-perfmon-image-spinner" class="htmx-indicator">⏳ Building Perfmon Image...</span>
+    <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
+        The perfmon image is built from
+        <code>image.build/Dockerfile.perfmon.&lt;arch&gt;</code> and tagged
+        <code>{{ config.CELERY_WORKER_IMAGE }}-perfmon_&lt;arch&gt;</code>.
+        Generate that Dockerfile by selecting <strong>Perfmon</strong> as the
+        Workload on the Workers tab and running <em>Prepare Workdir</em>, then
+        deploy before building.
+        {% if not perfmon_rocm %}
+        <br><strong style="color: #a15c00;">perfmon::default_rocm is not set</strong>
+        &mdash; set it on the PerfmonConfig tab first.
+        {% endif %}
+    </p>
 </section>
 
 <section>
