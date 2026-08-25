@@ -1025,6 +1025,11 @@ def set_perfmon_tags(workdir, tags: list[str]):
             return {'success': False,
                     'error': "HEAD is not a supported subject: it has no published "
                              "kernel images, so it would need a full AOTriton build."}
+        if t.lower() == 'core':
+            return {'success': False,
+                    'error': "'core' is reserved: it names libperfmon_core's "
+                             "directory at installed/perfmon/<arch>/core/, "
+                             "sharing the slot tags occupy."}
         if not _PERFMON_TAG_RE.fullmatch(t):
             return {'success': False, 'error': f"{t!r} is not a valid git tag."}
         if t not in clean:

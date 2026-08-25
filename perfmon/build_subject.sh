@@ -174,6 +174,14 @@ TAGS=("$@")
 # PERFMON_ALLOW_HEAD=1 keeps the working-tree path reachable for the GPU
 # session that has been exercising it by hand; no UI path sets it.
 for _t in "${TAGS[@]}"; do
+  # `core` is not a tag, it is the slot libperfmon_core occupies at
+  # <install_prefix><arch>/core/. The layout is only safe while no AOTriton
+  # tag is called that, so enforce it rather than trusting it.
+  if [ "$_t" = "core" ]; then
+    echo "Error: 'core' is reserved -- it names libperfmon_core's directory" >&2
+    echo "       at <install_prefix><arch>/core/, not an AOTriton tag." >&2
+    exit 1
+  fi
   case "$_t" in
     head|HEAD)
       if [ "${PERFMON_ALLOW_HEAD:-0}" != "1" ]; then
@@ -384,17 +392,28 @@ build_one_subject() {
 # ROCm-scoped, not per-tag: check it ONCE, before any subject is built. Failing
 # after the first tag's AOTriton build would waste the expensive part of the run
 # to report a precondition that was already false at the start.
-# libperfmon_core lives under the same prefix as the subjects, keyed by
-# (ROCm, arch). It is AOTriton-neutral -- that is what makes a timing
-# comparison between two AOTriton versions meaningful (rev0 D4) -- but it is
-# NOT arch-neutral: fill.cc carries a __global__ kernel, so the library embeds
-# a GPU code object. Both keys are therefore part of the path, and one build
-# is shared by every subject in that (ROCm, arch) column.
+# libperfmon_core lives INSIDE the arch subtree, beside that arch's subjects:
 #
-# The previous default, /opt/perfmon/rocm-<ver>, was a path nothing in this
+#     <install_prefix><arch>/core/rocm-<version>/
+#     <install_prefix><arch>/<tag>/
+#
+# It is AOTriton-neutral -- that is what makes a timing comparison between two
+# AOTriton versions meaningful (rev0 D4) -- but it is NOT arch-neutral:
+# fill.cc carries a __global__ kernel, so the library embeds a GPU code
+# object.
+#
+# `core` simply occupies the <tag> slot, which is safe because no AOTriton tag
+# is named that (asserted below rather than assumed). Arch has to lead because
+# that is the unit that gets deployed: sync_workdir.sh --workload perfmon
+# ships installed/perfmon/<arch>/, so a core parked beside the arch dirs
+# rather than inside one would never reach the worker, and the runner would
+# arrive without the libperfmon_core.so its RPATH points at. ROCm is the inner
+# key so one build is shared by every subject in that column.
+#
+# The original default, /opt/perfmon/rocm-<ver>, was a path nothing in this
 # repo ever writes, so it could only fail -- which is what the build node
 # reported.
-PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${INSTALL_PREFIX}core/rocm-${ROCM}/${ARCH}}"
+PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${INSTALL_PREFIX}${ARCH}/core/rocm-${ROCM}}"
 
 # Build it if it is not there: leaving it a manual prerequisite meant a
 # prerequisite nothing performed.
