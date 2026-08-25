@@ -74,6 +74,24 @@ add_library(perfmon_core SHARED
 target_include_directories(perfmon_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(perfmon_core PUBLIC hip::host)
 
+# fill.cc carries a __global__ kernel, so this library embeds a GPU code
+# object and is NOT arch-neutral despite being AOTriton-neutral. Without an
+# explicit target, hipcc compiles for its own default arch list, and a
+# mismatch does not surface until run time as "no kernel image is available
+# for execution on the device" -- long after the build looked successful.
+# Name the arch instead, and say so if nobody did.
+set(PERFMON_TARGET_ARCH "" CACHE STRING
+    "GPU architecture to compile device code for, e.g. gfx942")
+if(PERFMON_TARGET_ARCH)
+  target_compile_options(perfmon_core PRIVATE --offload-arch=${PERFMON_TARGET_ARCH})
+  message(STATUS "[perfmon_core] device code for ${PERFMON_TARGET_ARCH}")
+else()
+  message(WARNING
+    "[perfmon_core] PERFMON_TARGET_ARCH is not set; fill.cc's kernel will be "
+    "built for hipcc's default architectures, which may not include the GPU "
+    "this library ends up running on.")
+endif()
+
 set_target_properties(perfmon_core PROPERTIES
   BUILD_WITH_INSTALL_RPATH TRUE
   INSTALL_RPATH "${_perfmon_rocm_rpath}")

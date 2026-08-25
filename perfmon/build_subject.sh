@@ -11,9 +11,9 @@
 # script is not meant to be invoked on the webui server, which has no ROCm.
 #
 # Usage: build_subject.sh <arch> <install_prefix> <tag> [<tag>...]
-#   Several tags in one invocation, because the ROCm-scoped work -- validating
-#   PERFMON_CORE_ROOT, and the shared libperfmon_core it points at -- is done
-#   once for the batch rather than repeated per tag. Each tag still builds in
+#   Several tags in one invocation, because the (ROCm, arch)-scoped work --
+#   building the shared libperfmon_core -- is done once for the batch rather
+#   than repeated per tag. Each tag still builds in
 #   its own subshell, so one failure does not abort the rest; the exit status
 #   is nonzero if any failed.
 #
@@ -384,24 +384,34 @@ build_one_subject() {
 # ROCm-scoped, not per-tag: check it ONCE, before any subject is built. Failing
 # after the first tag's AOTriton build would waste the expensive part of the run
 # to report a precondition that was already false at the start.
-# Default it next to this script rather than to an absolute path nothing
-# creates: /opt/perfmon/rocm-<ver> was a location no part of this repo ever
-# writes, so the default could only ever fail. perfmon/core is a standalone
-# CMake project living beside this file, so its install belongs beside it too.
-PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${SCRIPT_DIR}/core/install-rocm${ROCM}}"
+# libperfmon_core lives under the same prefix as the subjects, keyed by
+# (ROCm, arch). It is AOTriton-neutral -- that is what makes a timing
+# comparison between two AOTriton versions meaningful (rev0 D4) -- but it is
+# NOT arch-neutral: fill.cc carries a __global__ kernel, so the library embeds
+# a GPU code object. Both keys are therefore part of the path, and one build
+# is shared by every subject in that (ROCm, arch) column.
+#
+# The previous default, /opt/perfmon/rocm-<ver>, was a path nothing in this
+# repo ever writes, so it could only fail -- which is what the build node
+# reported.
+PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${INSTALL_PREFIX}core/rocm-${ROCM}/${ARCH}}"
 
-# Build it if it is not there. It is AOTriton-neutral and ROCm-scoped, so this
-# happens at most once per ROCm and is reused by every subject -- which is the
-# property that makes cross-version timings comparable (rev0 D4). Requiring a
-# separate manual step here would just be a prerequisite nothing performs.
+# Build it if it is not there: leaving it a manual prerequisite meant a
+# prerequisite nothing performed.
 if [ ! -f "${PERFMON_CORE_ROOT}/include/perfmon/perfmon_abi.h" ]; then
   echo "[build_subject] libperfmon_core not found at ${PERFMON_CORE_ROOT}" >&2
-  echo "[build_subject] building perfmon/core for rocm ${ROCM} (once per ROCm)" >&2
-  CORE_BUILD_DIR="${SCRIPT_DIR}/core/build-rocm${ROCM}"
+  echo "[build_subject] building perfmon/core for rocm ${ROCM} / ${ARCH}" \
+       "(once per ROCm+arch)" >&2
+  # Build tree goes to TMPDIR, not under the prefix: everything beneath
+  # <install_prefix> is rsynced to GPU workers, and shipping a CMake build
+  # tree there would be pure waste. perfmon/core is five translation units,
+  # so re-configuring on a rebuild costs seconds.
+  CORE_BUILD_DIR="${TMPDIR:-/tmp}/perfmon-core-rocm${ROCM}-${ARCH}"
   cmake -S "${SCRIPT_DIR}/core" -B "${CORE_BUILD_DIR}" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER="${CXX:-hipcc}" \
+    -DPERFMON_TARGET_ARCH="${ARCH}" \
     -DCMAKE_INSTALL_PREFIX="${PERFMON_CORE_ROOT}"
   cmake --build "${CORE_BUILD_DIR}"
   cmake --install "${CORE_BUILD_DIR}"
