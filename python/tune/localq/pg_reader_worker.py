@@ -32,16 +32,29 @@ configure_logging_with_flush()
 logger = logging.getLogger(__name__)
 
 
-# workload -> (task_queue.class, tuning_mode) for fetch_tasks().
+# workload -> (task_queue.class, task_queue.subclass) for fetch_tasks().
 #
-# The workload a node serves determines BOTH, so it is the only thing callers
-# pass. `tuning_mode` is meaningless for perf_measure -- it selects a module
-# filter over the tuning LUT surface, and a perfmon row is not on that surface
-# -- so it is pinned to the tuning default there rather than invented.
+# The workload a node serves determines both, so it is the only thing callers
+# pass.
+#
+# `tuning_mode` is fetch_tasks' parameter name for the SECOND element, and the
+# name is misleading: it is not a module filter, it is matched literally
+# against the denormalized task_queue.subclass column (`AND subclass = %s`).
+# So the value is not free-form, it must be one the schema permits for that
+# class. schema.sql enforces the vocabulary:
+#
+#     CHECK ((class = 'tune_kernel'  AND subclass IN ('kernel', 'op')) OR
+#            (class = 'perf_measure' AND subclass = ''))
+#
+# which is why perfmon maps to the EMPTY string and not to 'kernel'. Pairing
+# perf_measure with 'kernel' produces a predicate the CHECK guarantees can
+# never match, so the worker claims nothing and does so silently -- no error,
+# no warning, just an idle reader. An earlier revision of this table did
+# exactly that on the theory that subclass was inert for perfmon.
 _WORKLOAD_TASK_SELECTOR: dict[str, tuple[str, str]] = {
     'kernel':  ('tune_kernel', 'kernel'),
     'op':      ('tune_kernel', 'op'),
-    'perfmon': ('perf_measure', 'kernel'),
+    'perfmon': ('perf_measure', ''),
 }
 
 
