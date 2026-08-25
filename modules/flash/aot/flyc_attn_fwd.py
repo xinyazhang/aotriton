@@ -131,9 +131,12 @@ def _flyc_fwd_disabled(f):
 #
 # The kernel, NOT the Python launcher: the launcher is host code that the C++ shim
 # replaces (it computes the grid and marshals arguments), while the @flyc.kernel
-# def is what fixes the kernarg layout. The two lists differ — the launcher passes
-# its `batch_size` into the kernel's `num_seqlens` slot, and carries a `stream` the
-# kernel does not have.
+# def is what fixes the kernarg layout. The two lists differ — the launcher carries
+# a `stream` and a `batch_size` that the kernel does not have. `batch_size` left
+# the kernarg in FlyDSL 67a3ace0 and survives only on the host side, where the
+# launcher folds it into the grid; AOTriton computes its own grid, so nothing
+# here declares it. `FlycAttnFwdContext::grid_calculator()` still needs a batch
+# count and still derives one — see modules/flash/csrc/flyc_attn_fwd.cc.
 #
 # The order is frozen and load-bearing: fmha_common_gfx1201.py:137 records that
 # switching these pointers to fx.Tensor would grow the kernarg segment from 268 to
@@ -156,14 +159,17 @@ def _flyc_fwd_disabled(f):
 # rank annotation carry its own justification. `contiguous=-1` would be actively
 # WRONG here: it indexes the matched stride list, which has three entries, so it
 # would mark `stride_q_seq` as the unit stride.
-@ati.tensor('Q',    'T_io', rank=4, strides='stride_q_*', wires_to='Q')
-@ati.tensor('K',    'T_io', rank=4, strides='stride_k_*', wires_to='K')
-@ati.tensor('V',    'T_io', rank=4, strides='stride_v_*', wires_to='V')
-@ati.tensor('O',    'T_io', rank=4, strides='stride_o_*', wires_to='Out')
-# L is always compact: the kernel derives both pitches from LSE_LAYOUT, num_head_q
-# and the token count, so it has no stride arguments by design.
-@ati.tensor('L',    '*fp32:16', rank=2, wires_to='L')
-@ati.tensor('Bias', 'T_io', rank=4, strides='stride_b?', wires_to='B')
+@ati.tensor('Q',   'T_io', rank=4, strides='stride_q_*', wires_to='Q')
+@ati.tensor('K',   'T_io', rank=4, strides='stride_k_*', wires_to='K')
+@ati.tensor('V',   'T_io', rank=4, strides='stride_v_*', wires_to='V')
+# B sits between V and O, and its three strides are batch, head and QUERY ROW --
+# the bias is (B, H, Sq, Sk), so the axis the KV tile walks is the contiguous
+# one and has no argument, exactly as D does for Q/K/V/O above.
+@ati.tensor('B',   'T_io', rank=4, strides='stride_b_*', wires_to='B')
+@ati.tensor('O',   'T_io', rank=4, strides='stride_o_*', wires_to='Out')
+# LSE is always compact: the kernel derives both pitches from LSE_LAYOUT,
+# num_head_q and the token count, so it has no stride arguments by design.
+@ati.tensor('LSE', '*fp32:16', rank=2, wires_to='L')
 # varlen seqinfo: FlyDSL splits each side into a (base, stride) pair rather than
 # AOTriton's cu_seqlens/seq_strides naming; the operands are the same tensors.
 @ati.tensor('seqinfo_q0', '*i32:16', rank=1, wires_to='cu_seqlens_q')
@@ -179,29 +185,26 @@ def _flyc_fwd_disabled(f):
 # `varlen_bits` is FlyDSL's layout descriptor; AOTriton has no such operand, and
 # this is also where the MODE half of `Num_seqlens` lands.
 @ati.scalar('varlen_bits', 'i32', wires_to=ati.context_helper('flyc_varlen_bits'))
-# `batch_size` and `num_seqlens` are a PAIR, and neither is a rename.
+# `num_seqlens` is not a rename of AOTriton's `Num_seqlens`, because the two
+# encodings differ in both range and meaning.
 #
-# FlyDSL's contract (fmha_abi_gfx1201.varlen_args docstring): `batch_size` is
-# q.size(0) always, whatever the layout; `num_seqlens` is how many sequences are
-# packed into a 1HTD tensor, and 0 when nothing is packed. Dense is (B, 0);
-# packed with N sequences is (1, N). The kernel then branches on the pair:
-#     nseq_idx = (num_seqlens != 0).select(num_seqlens, batch_size)
+# FlyDSL's contract (fmha_abi_gfx1201.varlen_args docstring): `num_seqlens` is
+# how many sequences are packed into a 1HTD tensor, and 0 when nothing is
+# packed. AOTriton's `Num_seqlens` is SIGNED and three-way: >0 packed count,
+# 0 dense, <0 BHSD-padded varlen. A negative value is padded rather than
+# packed, so FlyDSL wants 0 there and the layout rides in `varlen_bits`
+# instead -- which is why this helper and `flyc_varlen_bits` must agree on the
+# padded case, and why they are computed together in one place.
 #
-# AOTriton spells the same information differently: a `Batch` operand plus a
-# SIGNED three-way `Num_seqlens` (>0 packed count, 0 dense, <0 BHSD-padded
-# varlen). So:
-#
-#   batch_size   <- params.Q->size(0), NOT params.Batch. Under packed varlen Q
-#                   is 1HTD, so q.size(0) is 1 while Batch is not.
-#   num_seqlens  <- max(Num_seqlens, 0). A negative Num_seqlens is padded, not
-#                   packed, so FlyDSL wants 0 and the layout rides in
-#                   varlen_bits. VERIFY against flyc_varlen_bits: the two
-#                   helpers must agree on how the padded case is encoded.
-#
-# Getting this pair wrong fails SILENTLY -- FlyDSL's own docstring: "it launches
-# N programs over a tensor whose batch axis is 1, and every one of them
-# addresses a plausible row." Assert in the shim, do not rely on the helper.
-@ati.scalar('batch_size', 'i32', wires_to=ati.context_helper('flyc_batch_size'))
+# The `batch_size` half of this pair left the kernarg upstream (FlyDSL
+# 67a3ace0). It still exists host-side: the kernel reads a batch count from
+# its grid's z extent, and the launcher computed it as
+# `nseq_idx = num_seqlens != 0 ? num_seqlens : batch_size`. That expression
+# now lives in grid_calculator() rather than in an argument, and the shim
+# still asserts AOTriton and FlyDSL agree on it -- because getting it wrong
+# fails SILENTLY. FlyDSL's own docstring: "it launches N programs over a
+# tensor whose batch axis is 1, and every one of them addresses a plausible
+# row."
 @ati.scalar('num_seqlens', 'i32', wires_to=ati.context_helper('flyc_num_seqlens'))
 #
 # --- plain renames ------------------------------------------------------------
@@ -228,11 +231,13 @@ def _flyc_fwd_disabled(f):
 @ati.scalar('dropout_scale', 'fp32', wires_to=ati.context_helper('flyc_dropout_scale'))
 #
 # --- plain renames, continued -------------------------------------------------
-@ati.scalar('num_head_q',   'i32',  wires_to='Num_head_q')
-@ati.scalar('num_head_k',   'i32',  wires_to='Num_head_k')
-@ati.scalar('hdim_qk',      'i32',  wires_to='Hdim_qk')
-@ati.scalar('hdim_vo',      'i32',  wires_to='Hdim_vo')
-@ati.scalar('sm_scale_arg', 'fp32', wires_to='Sm_scale')
+@ati.scalar('num_head_q', 'i32',  wires_to='Num_head_q')
+@ati.scalar('num_head_k', 'i32',  wires_to='Num_head_k')
+@ati.scalar('hdim_qk',    'i32',  wires_to='Hdim_qk')
+@ati.scalar('hdim_vo',    'i32',  wires_to='Hdim_vo')
+# Last scalar before the stride block, where the backward kernels also put it
+# (FlyDSL 1b58fb93 made one kernarg convention across all four).
+@ati.scalar('sm_scale',   'fp32', wires_to='Sm_scale')
 #
 # --- why `ati.context_helper` and not an inline expression --------------------
 #

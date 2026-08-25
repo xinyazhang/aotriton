@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: 93d8d497f8e9bbc66106617feb851cf0fb12acd3
+commit: caee9257  (was 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
 path:   kernels/attention/parity/
 ```
 
@@ -211,6 +211,36 @@ Two things that would have made it expensive, neither of which happened: a new
 branch-local helper (would need a `flyc_polyfill.py` entry) or a kernarg reorder (would
 need the description's operand list re-ordered, and it is order-sensitive). Check both
 explicitly on every re-sync — the AST order check is the cheap way.
+
+## Re-sync cost, measured at `caee9257`
+
+The second of the two predicted expensive cases happened: **a kernarg reorder**. FlyDSL
+`1b58fb93` gave the forward and all three backward kernels one convention, and `67a3ace0`
+dropped `batch_size` from the kernarg.
+
+| | |
+|---|---|
+| upstream commits spanned | 11 (`f967e90b`..`caee9257`) |
+| vendored files changed upstream | 2 of 5 — `flash_attn_func_gfx1201_aiw.py` (68 lines), `fmha_abi_gfx1201.py` (61) |
+| our re-wiring | the same 4 lines as always, **plus** the forward kernarg ABI below |
+| polyfill changes needed | none — `kernels/common/` is byte-identical across the span |
+| ATI description changes needed | **yes** — see the table |
+
+Forward kernarg changes, 44 parameters down to 43:
+
+| | at `93d8d497` | at `caee9257` |
+|---|---|---|
+| bias tensor | `Bias`, after `L` | `B`, between `V` and `O` |
+| logsumexp | `L` | `LSE`, after `O` |
+| batch | `batch_size` is a kernarg | dropped; the launcher keeps it for the grid |
+| scale | `sm_scale_arg`, last | `sm_scale`, ahead of the strides |
+| bias strides | `stride_b0/1/2` | `stride_b_batch/head/seq_q` |
+
+`batch_size` leaving the kernarg is the one with a C++ consequence: the generated context no
+longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lost that member
+— but `grid_calculator()` still needs a batch count, since the grid's z extent is
+`num_seqlens != 0 ? num_seqlens : batch_size`. It now comes off `FlycVarlenRow` directly
+(`modules/flash/csrc/flyc_common.h`).
 
 ## Re-sync procedure
 
