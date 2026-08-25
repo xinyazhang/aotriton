@@ -2,13 +2,24 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# Shim-only AOTriton build for tag 0.11.2b ONLY. Every AOTriton release tag
-# gets its own build-<tag>.sh because the `.ci/` build interface drifts across
-# releases (see perfmon/build_subject.sh's header) -- this script need not,
-# and does not try to, work for any tag but 0.11.2b.
+# Shim-only AOTriton build for the 0.11 LINE: tags 0.11b and 0.11.2b, the
+# latter being the file and the former a symlink to it. Every AOTriton release
+# tag gets its own build-<tag>.sh because the `.ci/` build interface drifts
+# across releases (see perfmon/build_subject.sh's header); these two are one
+# file because the build they need is identical, not because tags are assumed
+# interchangeable in general. Nothing here is claimed to hold for any other
+# tag, and the guard below refuses to run as one.
 #
-# Usage: build-0.11.2b.sh <src_dir> <install_dir> <arch>
-#   <src_dir>     existing `git clone --depth 1 --branch 0.11.2b` of AOTriton.
+# The two tags do differ in .ci/ -- 0.11b has NO build-shim.sh (it arrives at
+# 0.11.2b), and its common_build() takes exactly 3 positional args with one
+# cmake-option slot rather than 0.11.2b's build_type/suffix/arch/build_for.
+# That difference costs nothing here precisely because this script invokes
+# cmake directly and sources nothing from .ci/ at either tag; see the .ci/
+# section below for why. Should the two ever need different cmake flags,
+# replace the symlink with a real script rather than branching on ${TAG}.
+#
+# Usage: build-<tag>.sh <src_dir> <install_dir> <arch>
+#   <src_dir>     existing `git clone --depth 1 --branch <tag>` of AOTriton.
 #                 Read-only: this script builds out-of-source in a scratch
 #                 dir, never inside <src_dir>.
 #   <install_dir> install prefix. On success this holds:
@@ -184,6 +195,31 @@
 
 set -euo pipefail
 
+# The tag comes from the name this script was INVOKED as, not from a literal,
+# so that a tag whose build is byte-identical can be a symlink to this file --
+# build-0.11b.sh is one (see the note above). bash does not resolve symlinks
+# in BASH_SOURCE, so through that link this still reads "0.11b", and the
+# images asset fetched below is 0.11b's rather than 0.11.2b's. Hardcoding the
+# tag instead would make such a symlink silently build one release's source
+# and install another release's kernels into it.
+TAG="$(basename "${BASH_SOURCE[0]}" .sh)"
+TAG="${TAG#build-}"
+
+# Only the 0.11 line may share this file. Everything below -- the cmake option
+# names, the arch->images-group mapping, the reasoning about .ci/ -- was read
+# against 0.11b/0.11.2b and is not claimed to hold elsewhere. A symlink from
+# some other tag should fail here and loudly, rather than build that tag under
+# 0.11-era assumptions.
+case "${TAG}" in
+  0.11b|0.11.2b) ;;
+  *)
+    echo "[build-${TAG}] ERROR: this script implements the 0.11 line only," \
+         "but was invoked as build-${TAG}.sh. Give ${TAG} its own script;" \
+         "the .ci/ build interface is not stable across releases." >&2
+    exit 1
+    ;;
+esac
+
 if [ "$#" -ne 3 ]; then
   echo "Usage: $0 <src_dir> <install_dir> <arch>" >&2
   exit 1
@@ -194,7 +230,7 @@ INSTALL_DIR="$2"
 ARCH="$3"
 
 if [ ! -f "${SRC_DIR}/CMakeLists.txt" ]; then
-  echo "[build-0.11.2b] ERROR: ${SRC_DIR}/CMakeLists.txt not found -- is <src_dir> an AOTriton checkout?" >&2
+  echo "[build-${TAG}] ERROR: ${SRC_DIR}/CMakeLists.txt not found -- is <src_dir> an AOTriton checkout?" >&2
   exit 1
 fi
 SRC_DIR="$(cd "${SRC_DIR}" && pwd)"
@@ -205,13 +241,13 @@ INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
 # Out-of-source build in a scratch dir, never inside <src_dir> (that tree is
 # read-only as far as this script is concerned). Cleaned up on exit either
 # way -- nothing under <install_dir> depends on it surviving.
-BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aotriton-0.11.2b-build.XXXXXX")"
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aotriton-${TAG}-build.XXXXXX")"
 trap 'rm -rf "${BUILD_DIR}"' EXIT
 
-echo "[build-0.11.2b] src_dir=${SRC_DIR}" >&2
-echo "[build-0.11.2b] install_dir=${INSTALL_DIR}" >&2
-echo "[build-0.11.2b] arch=${ARCH}" >&2
-echo "[build-0.11.2b] build_dir=${BUILD_DIR}" >&2
+echo "[build-${TAG}] src_dir=${SRC_DIR}" >&2
+echo "[build-${TAG}] install_dir=${INSTALL_DIR}" >&2
+echo "[build-${TAG}] arch=${ARCH}" >&2
+echo "[build-${TAG}] build_dir=${BUILD_DIR}" >&2
 
 # CMAKE_PREFIX_PATH is exported as an ENVIRONMENT variable, not passed as -D.
 #
@@ -279,25 +315,25 @@ case "${ARCH%%:*}" in
     gfx1200) IMAGES_GROUP="gfx120x" ;;
     gfx1201) IMAGES_GROUP="gfx120x" ;;
     *)
-      echo "Error: AOTriton 0.11.2b publishes no kernel-image asset covering" >&2
-      echo "       '${ARCH}'. See https://github.com/ROCm/aotriton/releases/tag/0.11.2b" >&2
+      echo "Error: AOTriton ${TAG} publishes no kernel-image asset covering" >&2
+      echo "       '${ARCH}'. See https://github.com/ROCm/aotriton/releases/tag/${TAG}" >&2
       exit 1
       ;;
 esac
 
-ASSET="aotriton-0.11.2b-images-amd-${IMAGES_GROUP}.tar.gz"
+ASSET="aotriton-${TAG}-images-amd-${IMAGES_GROUP}.tar.gz"
 IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
 
-TARBALL_NAME="$(fetch_release_asset "0.11.2b" "${ASSET}" "${IMAGES_DL_DIR}")"
+TARBALL_NAME="$(fetch_release_asset "${TAG}" "${ASSET}" "${IMAGES_DL_DIR}")"
 install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"
 
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
-  echo "[build-0.11.2b] ERROR: build reported success but ${INSTALL_DIR}/include/aotriton is missing." >&2
+  echo "[build-${TAG}] ERROR: build reported success but ${INSTALL_DIR}/include/aotriton is missing." >&2
   exit 1
 fi
 if ! compgen -G "${INSTALL_DIR}/lib/libaotriton*_v2.so" >/dev/null; then
-  echo "[build-0.11.2b] ERROR: build reported success but no ${INSTALL_DIR}/lib/libaotriton*_v2.so was installed." >&2
+  echo "[build-${TAG}] ERROR: build reported success but no ${INSTALL_DIR}/lib/libaotriton*_v2.so was installed." >&2
   exit 1
 fi
 
-echo "[build-0.11.2b] ok: ${INSTALL_DIR}" >&2
+echo "[build-${TAG}] ok: ${INSTALL_DIR}" >&2
