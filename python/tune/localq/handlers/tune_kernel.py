@@ -7,7 +7,7 @@ Handlers for the `tune_kernel` DAG:
     tune_kernel -> preprocess -> probe -> N x tune_impl -> impl_result
                                                         -> postprocess
 
-AOTriton-specific throughout (`ImplSelector`, `save_tuning_result`, tuning
+AOTriton-specific throughout (`ImplSelector`, `save_task_report`, tuning
 levels), which is exactly why it is separated from the framework (perfmon
 rev2 R03). Adding a second DAG costs a sibling module and a registration
 list, not edits to a shared file.
@@ -36,7 +36,7 @@ from psycopg.types.json import Jsonb
 from ...exaid import exaid_create, ExaidSubprocessNotOK
 from ...tdesc import ImplSelector
 from ...pq.queue import TaskQueue
-from ...pq.results import save_tuning_result
+from ...pq.results import save_task_report
 from .base import MessageHandler
 
 logger = logging.getLogger(__name__)
@@ -286,7 +286,14 @@ class TuneImplHandler(MessageHandler):
         tmpdir = Path(task_config['tmpdir'])
 
         impl_selector = ImplSelector(tuning_level=level, iface_name=iface_name, impl_index=impl_index)
-        report = {'tuning_level': level, 'iface_name': iface_name, 'impl_index': impl_index}
+        # The report names its own place in the (arch, class) shard tree.
+        # `subclass` is the generic column; this DAG's concrete name for it
+        # is tuning_level, and the translation happens here, at the boundary
+        # between the workload and the framework (rev2 section 5 layering).
+        report = {'arch': task_config['arch'],
+                  'class': 'tune_kernel',
+                  'subclass': level,
+                  'iface_name': iface_name, 'impl_index': impl_index}
         try:
             result_data = exaid.benchmark(tmpdir, impl_selector)
             report['result'] = 'OK'
@@ -315,12 +322,12 @@ class TuneImplHandler(MessageHandler):
 
 class WriteImplResultHandler(MessageHandler):
     """
-    Writes an impl benchmark result to the unified tuning_results table.
+    Writes an impl benchmark result to the unified task_reports table.
 
     Unified (modular-tune.md §4.1-§4.3): replaces the former
     WriteHsacoResultHandler/WriteBackendResultHandler pair, both of which
-    wrote to two separate tables (tuning_results/optune_results); now a
-    single save_tuning_result() call, distinguished by report['tuning_level'].
+    wrote to two separate tables (task_reports/optune_results); now a
+    single save_task_report() call, distinguished by report['subclass'].
 
     Input: impl_result message
     Output: None (triggers dependency resolution for postprocess)
@@ -337,10 +344,10 @@ class WriteImplResultHandler(MessageHandler):
         task_id = message['task_id']
         report = message['report']
 
-        save_tuning_result(task_id, report, self.db_conn)
+        save_task_report(task_id, report, self.db_conn)
 
         logger.debug(f"Wrote impl result for task_id={task_id} "
-                    f"{report['iface_name']}[{report['impl_index']}] (tuning_level={report['tuning_level']})")
+                    f"{report['iface_name']}[{report['impl_index']}] (subclass={report['subclass']})")
         return None
 
 

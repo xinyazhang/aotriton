@@ -539,7 +539,7 @@ class TaskQueue:
 
         delete_results is keyword-only and REQUIRED because it is destructive
         and the destruction is not implied by the method name. With it set,
-        the tasks' tuning_results and most_accurate_tuning_results rows are
+        the tasks' task_reports and most_accurate_tuning_results rows are
         dropped as well -- GPU-hours of measurements -- so that a re-run
         starts clean instead of mixing new results with stale ones. Pass False
         to requeue while keeping the existing rows.
@@ -560,8 +560,8 @@ class TaskQueue:
                     'WHERE tuning_level = %s AND task_id = ANY(%s)',
                     (tuning_level, row_ids))
                 cur.execute(
-                    'DELETE FROM tuning_results '
-                    'WHERE tuning_level = %s AND task_id = ANY(%s)',
+                    'DELETE FROM task_reports '
+                    'WHERE subclass = %s AND task_id = ANY(%s)',
                     (tuning_level, row_ids))
             cur.execute("""
                 UPDATE task_queue

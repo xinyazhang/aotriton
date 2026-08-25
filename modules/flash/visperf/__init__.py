@@ -23,7 +23,7 @@ DESCRIPTOR: dict = {
     'label': 'Flash Attention',
 
     # Unified schema (modular-tune.md §4.3/§4.7): kernel-level and op-level
-    # rows share the same best_tuning_results/tuning_results tables and the
+    # rows share the same best_tuning_results/task_reports tables and the
     # same iface_name column; tuning_level ('kernel' | 'op') is the sole
     # discriminator, since iface_name collides across levels (e.g. bare
     # 'attn_fwd' is valid at both levels -- see modules/flash/tune/level_op.py).

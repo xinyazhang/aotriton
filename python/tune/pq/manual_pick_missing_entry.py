@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: MIT
 
 """
-Force a specific tuning_results row to be the "best" result for its
+Force a specific task_reports row to be the "best" result for its
 (task_id, iface_name), overriding whatever compute_best_results picked --
 without touching most_accurate_tuning_results.
 
-Unified schema (modular-tune.md §4.3/§4.7): tuning_results/best_tuning_results
+Unified schema (modular-tune.md §4.3/§4.7): task_reports/best_tuning_results
 serve both tuning levels; iface_name/impl_index replace the old
 kernel_name/hsaco_index and op_name/backend_index column pairs, and
 tuning_level distinguishes 'kernel' from 'op' rows sharing the same table.
@@ -25,7 +25,7 @@ manual pick made here. If the override needs to survive, re-run this command
 again after any such full recompute.
 
 Usage:
-    python -m aotriton.tune.pq.manual_pick_missing_entry --workdir /path/to/workdir --id <tuning_results.id>
+    python -m aotriton.tune.pq.manual_pick_missing_entry --workdir /path/to/workdir --id <task_reports.id>
     python -m aotriton.tune.pq.manual_pick_missing_entry --workdir /path/to/workdir --id <id> --tuning_mode op
     python -m aotriton.tune.pq.manual_pick_missing_entry --workdir /path/to/workdir --id <id> --dry_run
 """
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 def pick(conn, sql: SqlStatements, result_id: int, *, dry_run: bool = False) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            f'SELECT task_id, tuning_level, {sql.key_col}, {sql.index_col}, result, result_data '
+            f'SELECT task_id, subclass, {sql.key_col}, {sql.index_col}, result, result_data '
             f'FROM {sql.results_table} WHERE id = %s',
             (result_id,))
         row = cur.fetchone()
@@ -124,7 +124,7 @@ def main() -> None:
     )
     parser.add_argument('--workdir', required=True, type=Path)
     parser.add_argument('--id', required=True, type=int,
-                        help='tuning_results.id to pick as best (must belong to the '
+                        help='task_reports.id to pick as best (must belong to the '
                              'tuning_level given by --tuning_mode)')
     parser.add_argument('--tuning_mode', choices=['kernel', 'op'], default='kernel')
     parser.add_argument('--dry_run', action='store_true',

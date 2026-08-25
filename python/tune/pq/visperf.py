@@ -18,11 +18,11 @@ def _build_query(desc: dict, arch: str, kernel_or_op: str, mode: str,
                  seqlen_min: int, seqlen_max: int) -> tuple[str, list]:
     """Build the SELECT query for a single kernel/op using the descriptor.
 
-    best_tuning_results/tuning_results are a single pair of tables shared by
+    best_tuning_results/task_reports are a single pair of tables shared by
     both tuning levels (modular-tune.md §4.3/§4.7); iface_name collides
     across levels (e.g. 'attn_fwd' is valid at both kernel and op level), so
     every predicate on iface_name below is paired with an explicit
-    tuning_level filter. Joins tuning_results to retrieve BATCH and N_HEADS
+    tuning_level filter. Joins task_reports to retrieve BATCH and N_HEADS
     from result_data->'bim', so the TFLOPS formula accounts for the actual
     benchmark dimensions.
     """
@@ -33,7 +33,7 @@ def _build_query(desc: dict, arch: str, kernel_or_op: str, mode: str,
     dim_selects = ',\n    '.join(f'{expr} AS {alias}' for expr, alias in desc['dims'])
     dim_groups  = ', '.join(alias for _, alias in desc['dims'])
 
-    # Join tuning_results on the exact winning row to get bim BATCH/N_HEADS.
+    # Join task_reports on the exact winning row to get bim BATCH/N_HEADS.
     # N_HEADS may be a JSON array (GQA); take the first element in that case.
     sql = f"""
         SELECT
@@ -47,9 +47,9 @@ def _build_query(desc: dict, arch: str, kernel_or_op: str, mode: str,
                 ELSE (r.result_data->'bim'->>'N_HEADS')::int
             END AS n_heads
         FROM {table} b
-        JOIN tuning_results r
+        JOIN task_reports r
           ON r.task_id = b.task_id
-         AND r.tuning_level = b.tuning_level
+         AND r.subclass = b.tuning_level
          AND r.{name_col} = b.{name_col}
          AND r.impl_index = b.impl_index
         WHERE b.arch = %s
@@ -144,11 +144,11 @@ def query_all_best_results(conn, descriptor_id: str = 'flash') -> dict:
 
 def query_cell_detail(conn, task_id: int, kernel: str, mode: str = 'kernel') -> dict:
     """
-    Fetch all candidate tuning_results rows for a single (task_id, kernel)
+    Fetch all candidate task_reports rows for a single (task_id, kernel)
     cell, plus the per-(test_case, tensor_name) accuracy threshold from
     most_accurate_tuning_results.
 
-    tuning_results/most_accurate_tuning_results are shared by both tuning
+    task_reports/most_accurate_tuning_results are shared by both tuning
     levels and iface_name collides across them, so both queries below filter
     on tuning_level in addition to task_id/iface_name.
 
@@ -176,7 +176,7 @@ def query_cell_detail(conn, task_id: int, kernel: str, mode: str = 'kernel') -> 
         }
     """
     assert mode in ('kernel', 'op'), f"query_cell_detail: invalid mode {mode!r}"
-    results_table = 'tuning_results'
+    results_table = 'task_reports'
     accuracy_table = 'most_accurate_tuning_results'
     name_col = 'iface_name'
     idx_col = 'impl_index'
@@ -186,7 +186,7 @@ def query_cell_detail(conn, task_id: int, kernel: str, mode: str = 'kernel') -> 
         cur.execute(f"""
             SELECT {idx_col}, result, result_data
               FROM {results_table}
-             WHERE task_id = %s AND tuning_level = %s AND {name_col} = %s
+             WHERE task_id = %s AND subclass = %s AND {name_col} = %s
              ORDER BY {idx_col}
         """, (task_id, mode, kernel))
         for index, result, rd in cur:

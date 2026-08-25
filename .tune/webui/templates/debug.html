@@ -126,10 +126,10 @@ document.getElementById('tune_lookup_btn').addEventListener('click', function() 
     {% endif %}
 </section>
 
-{# ── tuning_results (kernel level) ───────────────────────────────────────── #}
+{# ── task_reports (kernel level) ───────────────────────────────────────── #}
 <section>
-    <h3>tuning_results ({{ debug_data.tuning_results | length }} rows) <small style="font-weight: normal; color: #777;">— tuning_level = 'kernel'</small></h3>
-    {% if debug_data.tuning_results %}
+    <h3>task_reports ({{ debug_data.task_reports | length }} rows) <small style="font-weight: normal; color: #777;">— subclass = 'kernel'</small></h3>
+    {% if debug_data.task_reports %}
     <table style="width: 100%;">
         <thead>
             <tr>
@@ -145,7 +145,7 @@ document.getElementById('tune_lookup_btn').addEventListener('click', function() 
             </tr>
         </thead>
         <tbody>
-            {% for r in debug_data.tuning_results %}
+            {% for r in debug_data.task_reports %}
             {% set rd = r.result_data %}
             <tr>
                 <td><code>{{ r.id }}</code></td>
@@ -180,7 +180,7 @@ document.getElementById('tune_lookup_btn').addEventListener('click', function() 
         </tbody>
     </table>
     {% else %}
-    <p>No tuning_results rows.</p>
+    <p>No task_reports rows.</p>
     {% endif %}
 </section>
 
@@ -248,9 +248,9 @@ document.getElementById('tune_lookup_btn').addEventListener('click', function() 
     {% endif %}
 </section>
 
-{# ── tuning_results (op level) ───────────────────────────────────────────── #}
+{# ── task_reports (op level) ───────────────────────────────────────────── #}
 <section>
-    <h3>optune_results ({{ debug_data.optune_results | length }} rows) <small style="font-weight: normal; color: #777;">— tuning_results WHERE tuning_level = 'op'</small></h3>
+    <h3>optune_results ({{ debug_data.optune_results | length }} rows) <small style="font-weight: normal; color: #777;">— task_reports WHERE subclass = 'op'</small></h3>
     {% if debug_data.optune_results %}
     <table style="width: 100%;">
         <thead>

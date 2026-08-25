@@ -137,33 +137,45 @@ CREATE INDEX IF NOT EXISTS idx_worker_heartbeat_alive
     ON worker_heartbeat (last_heartbeat DESC)
     WHERE status = 'active';
 
--- Tuning results table (stores individual per-impl-variant benchmark
--- results). Unified: this single table replaces the former
--- tuning_results/optune_results pair -- one row per (task_id, iface_name,
--- impl_index) regardless of tuning_level. `tuning_level` is denormalized
--- here (not just on task_queue) because this table is frequently queried by
--- (iface_name, impl_index) alone, without a task_queue join, and
--- `iface_name` collides across levels (highest-risk area #2 of
--- modular-tune.md: e.g. 'attn_fwd' is a valid iface_name at both the kernel
--- and op level).
-CREATE TABLE IF NOT EXISTS tuning_results (
-    id BIGSERIAL PRIMARY KEY,
+-- Per-task report rows: one row per (task_id, iface_name, impl_index).
+--
+-- Named `task_reports`, not `tuning_results`, because it now carries the
+-- output of every DAG class, not just tuning (perfmon rev2 R06). The name is
+-- the same correction `tuning_level` -> `subclass` makes: a framework table
+-- must not be named after one of the workloads it serves.
+--
+-- `subclass` is denormalized here (not just on task_queue) because this
+-- table is frequently queried by (iface_name, impl_index) alone, without a
+-- task_queue join, and `iface_name` collides across subclasses -- e.g.
+-- 'attn_fwd' is valid at both the kernel and op level (highest-risk area #2
+-- of modular-tune.md). That reasoning is unchanged by the rename, and every
+-- existing consumer already filters on it, so a second class cannot leak
+-- into the best-results pipeline.
+--
+-- `arch` and `class` are new. Both are required by the shard key; `arch` is
+-- additionally what makes pruning possible when reading one column of the
+-- matrix.
+CREATE TABLE IF NOT EXISTS task_reports (
+    id BIGSERIAL,
     task_id BIGINT NOT NULL,
-    tuning_level TEXT NOT NULL CHECK (tuning_level IN ('kernel', 'op')),
+    arch TEXT NOT NULL,
+    class TEXT NOT NULL CHECK (class IN ('tune_kernel', 'perf_measure')),
+    subclass TEXT NOT NULL DEFAULT '',
     iface_name TEXT NOT NULL,
     impl_index INT NOT NULL,
     result TEXT NOT NULL,  -- OK/NotOK/crash/ERROR
     result_data JSONB,
     error JSONB,
     gpu_id INT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_tuning_results_task
-    ON tuning_results (task_id, iface_name, impl_index);
-
-CREATE INDEX IF NOT EXISTS idx_tuning_results_iface
-    ON tuning_results (tuning_level, iface_name, result);
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (id, arch, class),
+    -- Same per-class vocabulary as task_queue: the two must agree, since a
+    -- report is written for a row that passed that CHECK.
+    CHECK (
+        (class = 'tune_kernel'  AND subclass IN ('kernel', 'op')) OR
+        (class = 'perf_measure' AND subclass = '')
+    )
+) PARTITION BY LIST (arch);
 
 -- Utility views for monitoring
 CREATE OR REPLACE VIEW queue_progress AS
@@ -300,8 +312,11 @@ DECLARE
     arch_partition TEXT;
     class_name TEXT;
     class_partition TEXT;
+    rpt_arch_partition TEXT;
+    rpt_class_partition TEXT;
 BEGIN
     arch_partition := 'task_queue_' || arch_name;
+    rpt_arch_partition := 'task_reports_' || arch_name;
 
     -- Top level: one LIST partition per arch, itself sub-partitioned by class.
     EXECUTE format(
@@ -338,6 +353,39 @@ BEGIN
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS %I ON shards.%I (created_at DESC)',
             class_partition || '_created', class_partition
+        );
+    END LOOP;
+
+    -- task_reports gets the same (arch, class) tree, for the same reason and
+    -- with the same no-DEFAULT-partition property: a report naming an
+    -- unregistered class fails loudly rather than landing in a catch-all.
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS shards.%I PARTITION OF task_reports '
+        'FOR VALUES IN (%L) PARTITION BY LIST (class)',
+        rpt_arch_partition, arch_name
+    );
+
+    FOREACH class_name IN ARRAY ARRAY['tune_kernel', 'perf_measure']
+    LOOP
+        rpt_class_partition := rpt_arch_partition || '_' || class_name;
+
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS shards.%I PARTITION OF shards.%I '
+            'FOR VALUES IN (%L)',
+            rpt_class_partition, rpt_arch_partition, class_name
+        );
+
+        -- The two read patterns this table actually has: by task, and by
+        -- (subclass, iface_name) without a task_queue join -- which is the
+        -- whole reason subclass is denormalized onto it.
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON shards.%I (task_id, iface_name, impl_index)',
+            rpt_class_partition || '_task', rpt_class_partition
+        );
+
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS %I ON shards.%I (subclass, iface_name, result)',
+            rpt_class_partition || '_iface', rpt_class_partition
         );
     END LOOP;
 END;

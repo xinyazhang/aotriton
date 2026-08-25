@@ -11,7 +11,7 @@ Provides lower network overhead, simpler infrastructure, and better visibility.
 from .queue import TaskQueue
 from .dispatcher import TaskDispatcher
 from .heartbeat import HeartbeatManager
-from .results import save_tuning_result, get_task_results
+from .results import save_task_report, get_task_results
 
 # NOTE: `Worker` (a PostgreSQL-polling worker loop) used to be exported here
 # from `.worker`, but it was dead code: `Worker.start()`/`run_once()` called
@@ -22,6 +22,6 @@ from .results import save_tuning_result, get_task_results
 # executed, and nothing in this repo constructs `Worker` (see
 # `python/tune/localq/` for the actual worker implementation, built on
 # `TaskQueue` directly). Deleted rather than fixed since it has no callers.
-__all__ = ['TaskQueue', 'TaskDispatcher', 'HeartbeatManager', 'save_tuning_result', 'get_task_results']
+__all__ = ['TaskQueue', 'TaskDispatcher', 'HeartbeatManager', 'save_task_report', 'get_task_results']
 
 __version__ = '3.5.0'

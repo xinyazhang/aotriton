@@ -636,7 +636,7 @@ def test_no_raw_tuning_db_sql_outside_pq():
     # the point of the tool, not a bypass of the pq layer.
     EXEMPT = {'.tune/bin/psql'}
     offenders = []
-    pat = re.compile(r"FROM (task_queue|tuning_results|best_tuning_results"
+    pat = re.compile(r"FROM (task_queue|task_reports|best_tuning_results"
                      r"|most_accurate_tuning_results)\b|task_config->'entry'")
     for sub in ('webui', 'libexec', 'bin', 'remote'):
         d = _REPO_ROOT / '.tune' / sub

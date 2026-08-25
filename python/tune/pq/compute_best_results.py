@@ -6,7 +6,7 @@
 Compute best_tuning_results table using Python multiprocessing.
 
 Unified (modular-tune.md §4.3/§4.7): a single results_table/accuracy_table/
-best_table trio (tuning_results/most_accurate_tuning_results/best_tuning_results)
+best_table trio (task_reports/most_accurate_tuning_results/best_tuning_results)
 serves both tuning levels; `tuning_level` ('kernel' | 'op', selected by
 --tuning_mode) is a filter column, not a table/column-name switch. iface_name/
 impl_index replace the old kernel_name/hsaco_index and op_name/backend_index
@@ -74,12 +74,12 @@ SKIP_TEST_CASES: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 # SQL name bundle — table/column names are fixed (unified schema); only
 # `tuning_level` varies with --tuning_mode, and every query against
-# tuning_results/most_accurate_tuning_results/best_tuning_results must filter
+# task_reports/most_accurate_tuning_results/best_tuning_results must filter
 # on it since iface_name collides across levels (modular-tune.md §4.3/§4.7).
 # ---------------------------------------------------------------------------
 
 class SqlStatements:
-    results_table = 'tuning_results'
+    results_table = 'task_reports'
     accuracy_table = 'most_accurate_tuning_results'
     best_table = 'best_tuning_results'
     key_col = 'iface_name'
@@ -338,7 +338,7 @@ def worker_process_arch(arch: str, worker_index: int,
                 FROM {sql.results_table} tr
                 JOIN task_queue tq ON tq.id = tr.task_id AND tq.arch = %s
                 WHERE tr.result_data IS NOT NULL
-                  AND tr.tuning_level = %s
+                  AND tr.subclass = %s
                   AND tr.task_id = ANY(%s)
                 ORDER BY tr.task_id, tr.{sql.key_col}
             """, (arch, sql.tuning_level, filter_task_ids))
@@ -352,7 +352,7 @@ def worker_process_arch(arch: str, worker_index: int,
                 FROM {sql.results_table} tr
                 JOIN task_queue tq ON tq.id = tr.task_id AND tq.arch = %s
                 WHERE tr.result_data IS NOT NULL
-                  AND tr.tuning_level = %s
+                  AND tr.subclass = %s
                   AND tr.task_id BETWEEN %s AND %s
                 ORDER BY tr.task_id, tr.{sql.key_col}
             """, (arch, sql.tuning_level, task_id_lo, task_id_hi))
@@ -546,7 +546,7 @@ def main() -> None:
 
     parser.add_argument('--tuning_mode', choices=['kernel', 'op'], default='kernel',
                         help='Selects the tuning_level filter applied to the unified '
-                             'tuning_results/best_tuning_results tables')
+                             'task_reports/best_tuning_results tables')
     parser.add_argument('--verbose', action='store_true',
                         help='Debug: print per-candidate per-tensor accuracy details (implies DEBUG log level)')
 
@@ -601,7 +601,7 @@ def main() -> None:
                     FROM {sql.results_table} tr
                     JOIN task_queue tq ON tq.id = tr.task_id
                     WHERE tr.result_data IS NOT NULL
-                      AND tr.tuning_level = %s
+                      AND tr.subclass = %s
                       AND tr.task_id IN ({placeholders})
                     ORDER BY tr.task_id, tr.{sql.key_col}
                 """, [sql.tuning_level] + args.ids)

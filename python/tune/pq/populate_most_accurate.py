@@ -7,7 +7,7 @@ Populate the most_accurate_tuning_results plain table.
 
 One most_accurate_tuning_results table serves both tuning levels. Rows are
 keyed by iface_name, and tuning_level ('kernel' | 'op', selected by
---tuning_mode) is a filter column on tuning_results rather than a table-name
+--tuning_mode) is a filter column on task_reports rather than a table-name
 switch.
 
 Full mode (no task_ids):
@@ -41,7 +41,7 @@ from ..utils import get_db_connection_params
 
 class SqlStatements:
     """Table and column names are fixed; only tuning_level varies with
-    --tuning_mode. Every query against tuning_results /
+    --tuning_mode. Every query against task_reports /
     most_accurate_tuning_results must filter on it, because iface_name
     collides across levels (e.g. 'attn_fwd' is valid at both)."""
 
@@ -67,12 +67,12 @@ SELECT
     tensor.key                                      AS tensor_name,
     MIN((tensor.value->>0)::float)                  AS target_fudge_factor,
     MIN((tensor.value->>1)::float)                  AS absolute_error
-FROM tuning_results tr
+FROM task_reports tr
 JOIN task_queue tq ON tq.id = tr.task_id
 CROSS JOIN LATERAL jsonb_each(tr.result_data->'adiffs') AS test_case(key, value)
 CROSS JOIN LATERAL jsonb_each(test_case.value)           AS tensor(key, value)
 WHERE tr.result_data IS NOT NULL
-  AND tr.tuning_level = '{self.tuning_level}'
+  AND tr.subclass = '{self.tuning_level}'
   -- Drop early-reject rows. record_early_reject() stores a negative sentinel
   -- in absolute_error for a candidate that never ran on hardware; MIN() over a
   -- group containing one makes the accuracy threshold negative, and
@@ -116,7 +116,7 @@ def populate(conn, task_ids: list[int] | None = None, tuning_mode: str = 'kernel
         task_ids:     If None, full CTAS-into-temp-table then swap (parallel).
                       If given, DELETE + INSERT for those task_ids only (small, serial ok).
         tuning_mode:  'kernel' | 'op' -- selects the tuning_level filter applied
-                      to tuning_results.
+                      to task_reports.
 
     Returns:
         Number of rows produced (rowcount after the swap-INSERT or plain INSERT).
@@ -195,7 +195,7 @@ def main() -> None:
         '--tuning_mode',
         choices=['kernel', 'op'],
         default='kernel',
-        help='Selects the tuning_level filter applied to tuning_results',
+        help='Selects the tuning_level filter applied to task_reports',
     )
     args = parser.parse_args()
 
