@@ -99,28 +99,51 @@ echo "Tags:         ${TAGS[*]}"
 
 # --user keeps artifacts owned by the invoking uid:gid, matching how the
 # perfmon image builds its venv -- otherwise installed/perfmon/ comes back
-# root-owned and the next build cannot overwrite it. It is written \$(id -u)
-# so the substitution runs on the REMOTE, not here.
+# root-owned and the next build cannot overwrite it.
 #
-# Follow and no-follow are two different ssh invocations, exactly as
-# build_image.sh and remotebld do it: the heredoc form queues and then tails
-# unconditionally, the one-liner form just queues. An earlier version passed a
-# FOLLOW flag into a single payload and branched on it inside; the branch never
-# fired, and the job was queued with its output going nowhere. Matching the
-# proven shape removes the failure mode rather than debugging it.
-DOCKER_RUN="docker run --rm --network=host --user \$(id -u):\$(id -g)"
-DOCKER_RUN="$DOCKER_RUN --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir"
-DOCKER_RUN="$DOCKER_RUN $PERFMON_IMAGE"
-DOCKER_RUN="$DOCKER_RUN bash /wkdir/aotriton.src/perfmon/build_subject.sh"
-DOCKER_RUN="$DOCKER_RUN $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
+# The two modes build the docker command by DIFFERENT means, on purpose:
+#
+#   follow    the argv is assembled inside the heredoc, where $(id -u) is a
+#             real command substitution and "${TAGS[@]}" is a real array.
+#   no-follow the argv is one string handed to the remote shell, so $(id -u)
+#             is escaped and evaluated there.
+#
+# An earlier version assembled one string and passed it as a single argument
+# to `bash -s`, then ran `tsp $DOCKER_RUN` remotely. That failed twice over:
+#
+#   * ssh does NOT preserve argument boundaries. It joins the remote argv into
+#     one command string for the remote shell to re-split, so a
+#     space-containing argument is torn apart -- `$1` ended up as just
+#     `docker`, and tsp queued exactly that, which is why the job's output was
+#     docker's usage text.
+#   * even intact, `tsp $DOCKER_RUN` word-splits but does not perform command
+#     substitution, so `$(id -u)` would have arrived at docker literally.
+#
+# Hence: every argument passed through `ssh ... bash -s` here must be a single
+# shell word (workdir path, image tag, arch, tags all are), and each mode
+# builds its own command rather than sharing a string across a substituting
+# and a non-substituting context.
 
+set -x
 if [ -n "$FOLLOW" ]; then
   # Use tsp -t to tail/follow output in real-time
   # shellcheck disable=SC2029
-  ssh "$BUILD_NODE_HOST" bash -s "$DOCKER_RUN" <<'EOF'
-DOCKER_RUN="$1"
+  ssh "$BUILD_NODE_HOST" bash -s \
+      "$REMOTE_WORKDIR" "$PERFMON_IMAGE" "$ARCH" "${TAGS[@]}" <<'EOF'
+set -x
+REMOTE_WORKDIR="$1"
+PERFMON_IMAGE="$2"
+ARCH="$3"
+shift 3
+TAGS=("$@")
 
-jobid=$(tsp $DOCKER_RUN)
+jobid=$(tsp docker run --rm \
+  --network=host \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=${REMOTE_WORKDIR},target=/wkdir" \
+  "$PERFMON_IMAGE" \
+  bash /wkdir/aotriton.src/perfmon/build_subject.sh \
+       "$ARCH" /wkdir/installed/perfmon/ "${TAGS[@]}")
 echo "Job ID: $jobid"
 if [ "$(tsp -s "$jobid")" = "queued" ]; then
   echo "Waiting for tsp job $jobid to start..."
@@ -130,5 +153,8 @@ tsp -t $jobid
 EOF
 else
   # shellcheck disable=SC2029
-  ssh -n "$BUILD_NODE_HOST" "tsp $DOCKER_RUN"
+  ssh -n "$BUILD_NODE_HOST" \
+    "tsp docker run --rm --network=host --user \$(id -u):\$(id -g)"\
+" --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir $PERFMON_IMAGE"\
+" bash /wkdir/aotriton.src/perfmon/build_subject.sh $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
 fi
