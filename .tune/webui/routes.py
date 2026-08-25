@@ -105,12 +105,14 @@ def builds():
     git_status = tasks.get_git_status(workdir)
     use_installed_db = tasks.get_test_build_use_installed_db(workdir)
     perfmon_rocm = tasks.get_perfmon_rocm(workdir)
+    perfmon_tags = tasks.get_perfmon_tags(workdir)
     return render_template('builds.html', archs=archs, hostnames=hostnames,
                            build_node_config=build_node_config,
                            default_workdir=default_workdir,
                            git_status=git_status,
                            use_installed_db=use_installed_db,
-                           perfmon_rocm=perfmon_rocm)
+                           perfmon_rocm=perfmon_rocm,
+                           perfmon_tags=perfmon_tags)
 
 
 @bp.route('/deploy')
@@ -437,6 +439,8 @@ def perfmon_config():
     workdir = current_app.config['WORKDIR']
     return render_template('perfmon_config.html',
                            perfmon_rocm=tasks.get_perfmon_rocm(workdir),
+                           perfmon_tags=tasks.get_perfmon_tags(workdir),
+                           default_tags=tasks.PERFMON_DEFAULT_TAGS,
                            archs=tasks.get_architectures(workdir))
 
 
@@ -448,13 +452,46 @@ def api_set_perfmon_rocm():
     return jsonify(result)
 
 
+@bp.route('/api/perfmon/tags/add', methods=['POST'])
+def api_add_perfmon_tag():
+    """Add an AOTriton tag to the perfmon subject list."""
+    workdir = current_app.config['WORKDIR']
+    result = tasks.add_perfmon_tag(workdir, request.form.get('tag', ''))
+    return jsonify(result)
+
+
+@bp.route('/api/perfmon/tags/remove', methods=['POST'])
+def api_remove_perfmon_tag():
+    """Remove an AOTriton tag from the perfmon subject list."""
+    workdir = current_app.config['WORKDIR']
+    result = tasks.remove_perfmon_tag(workdir, request.form.get('tag', ''))
+    return jsonify(result)
+
+
+@bp.route('/api/perfmon/tags/reset', methods=['POST'])
+def api_reset_perfmon_tags():
+    """Restore the default AOTriton tag list."""
+    workdir = current_app.config['WORKDIR']
+    result = tasks.set_perfmon_tags(workdir, [])
+    return jsonify(result)
+
+
 @bp.route('/api/builds/perfmon', methods=['POST'])
 def api_build_perfmon_artifacts():
-    """Build perfmon measurement artifacts (core + runner) for one arch."""
+    """Build perfmon artifacts for every selected (arch, tag) pair.
+
+    The matrix posts one `subject` value per checked cell, spelled
+    `<arch>:<tag>`, so arch and tag stay paired -- separate arch[] and tag[]
+    lists would only describe a full cross-product, not the sparse selection
+    the matrix allows.
+    """
     workdir = current_app.config['WORKDIR']
-    arch = request.form.get('arch', '').strip()
-    tag = request.form.get('tag', '').strip() or 'head'
-    result = tasks.build_perfmon_artifacts(workdir, arch, tag=tag, dry_run=should_dryrun())
+    subjects = []
+    for raw in request.form.getlist('subject'):
+        arch, _, tag = raw.partition(':')
+        if arch and tag:
+            subjects.append((arch, tag))
+    result = tasks.build_perfmon_artifacts(workdir, subjects, dry_run=should_dryrun())
     return jsonify(result)
 
 

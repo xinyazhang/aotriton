@@ -980,17 +980,109 @@ def set_perfmon_rocm(workdir, rocm: str):
         return {'success': False, 'error': str(e)}
 
 
-def build_perfmon_artifacts(workdir, arch: str, tag: str = 'head', dry_run: bool = False):
-    """Build perfmon core + runner for one (tag, ROCm, arch) subject."""
-    if not arch:
-        return {'success': False, 'error': 'No architecture given'}
+# AOTriton tags perfmon measures by default -- perfmon-rev0.md §4's table,
+# minus HEAD: HEAD has no published kernel images, so it would need a full
+# AOTriton build rather than the shim build build_subject.sh performs.
+# One row per minor line; patch releases within a line share an adapter.
+PERFMON_DEFAULT_TAGS = ['0.9.2b', '0.10b', '0.11b', '0.11.2b', '0.12.1b', '0.13b']
+
+# A git tag, conservatively: no whitespace or shell metacharacters, since it is
+# passed to `git worktree add` and interpolated into a subject id.
+_PERFMON_TAG_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*')
+
+
+def get_perfmon_tags(workdir) -> list[str]:
+    """AOTriton tags configured for perfmon, defaulting to PERFMON_DEFAULT_TAGS."""
+    init_workers_db(workdir)
+    db_path = Path(workdir) / 'workers.db'
+    try:
+        with sqlite3.connect(db_path.as_posix()) as conn:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key = 'perfmon::tags'").fetchone()
+        if row and row[0]:
+            tags = json.loads(row[0])
+            if isinstance(tags, list):
+                return [str(t) for t in tags]
+    except Exception:
+        pass
+    return list(PERFMON_DEFAULT_TAGS)
+
+
+def set_perfmon_tags(workdir, tags: list[str]):
+    """Replace the configured tag list. An empty list restores the defaults."""
+    clean = []
+    for t in tags:
+        t = (t or '').strip()
+        if not t:
+            continue
+        if t.lower() == 'head':
+            return {'success': False,
+                    'error': "HEAD is not a supported subject: it has no published "
+                             "kernel images, so it would need a full AOTriton build."}
+        if not _PERFMON_TAG_RE.fullmatch(t):
+            return {'success': False, 'error': f"{t!r} is not a valid git tag."}
+        if t not in clean:
+            clean.append(t)
+    init_workers_db(workdir)
+    db_path = Path(workdir) / 'workers.db'
+    try:
+        with sqlite3.connect(db_path.as_posix()) as conn:
+            if clean:
+                payload = json.dumps(clean)
+                conn.execute("""
+                    INSERT INTO config (key, value) VALUES ('perfmon::tags', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = CURRENT_TIMESTAMP
+                """, (payload, payload))
+            else:
+                conn.execute("DELETE FROM config WHERE key = 'perfmon::tags'")
+        return {'success': True,
+                'message': f"Tags set to: {', '.join(clean)}" if clean
+                           else "Tag list cleared; defaults restored"}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def add_perfmon_tag(workdir, tag: str):
+    """Append one tag to the configured list."""
+    return set_perfmon_tags(workdir, get_perfmon_tags(workdir) + [tag])
+
+
+def remove_perfmon_tag(workdir, tag: str):
+    """Drop one tag from the configured list."""
+    remaining = [t for t in get_perfmon_tags(workdir) if t != tag]
+    if not remaining:
+        return {'success': False,
+                'error': "Refusing to remove the last tag -- an empty list falls "
+                         "back to the defaults, which is not what removing the "
+                         "last entry looks like it should do."}
+    return set_perfmon_tags(workdir, remaining)
+
+
+def build_perfmon_artifacts(workdir, subjects: list[tuple[str, str]], dry_run: bool = False):
+    """Build perfmon core + runner for each (arch, tag) subject.
+
+    Returns one aggregate result; each subject is a separate build_subject.sh
+    invocation, so a failure on one does not prevent the rest from being
+    attempted -- the matrix is a batch, not a transaction.
+    """
+    if not subjects:
+        return {'success': False, 'error': 'No (arch, tag) pairs selected'}
     rocm = get_perfmon_rocm(workdir)
     if not rocm:
         return {'success': False,
                 'error': "perfmon::default_rocm is not set in workers.db. "
                          "Set it to the exact ROCm version string (e.g. "
-                         "'7.14.0') before building perfmon artifacts."}
-    return _build_perfmon_artifacts.exec(workdir, arch, rocm, tag=tag, dry_run=dry_run)
+                         "'7.14.0') on the PerfmonConfig tab first."}
+    results, failed = [], []
+    for arch, tag in subjects:
+        r = _build_perfmon_artifacts.exec(workdir, arch, rocm, tag=tag, dry_run=dry_run)
+        results.append({'arch': arch, 'tag': tag, 'result': r})
+        if not r.get('success', False):
+            failed.append(f'{tag}/{arch}')
+    return {'success': not failed,
+            'message': f"Queued {len(subjects)} perfmon build(s) on ROCm {rocm}"
+                       + (f"; failed: {', '.join(failed)}" if failed else ''),
+            'results': results}
 
 
 def fetch_tuning_build(workdir, dry_run: bool = False):

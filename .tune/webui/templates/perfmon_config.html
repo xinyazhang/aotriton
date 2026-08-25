@@ -60,6 +60,54 @@
 </section>
 
 <section>
+    <h3>AOTriton Versions</h3>
+    <p>
+        The released tags perfmon measures. Each becomes a <em>subject</em>
+        together with the ROCm above:
+        <code>aotriton-&lt;tag&gt;+rocm&lt;version&gt;</code>.
+    </p>
+    <p style="font-size: 0.9em; color: gray;">
+        <strong>HEAD is not offered.</strong> A released tag is shim-built and
+        paired with that release's prebuilt kernel images; HEAD has no
+        published images, so measuring it would need a full AOTriton build
+        &mdash; a different and far more expensive operation.
+    </p>
+
+    <table>
+        <tr><th>Tag</th><th></th></tr>
+        {% for tag in perfmon_tags %}
+        <tr>
+            <td><code>{{ tag }}</code></td>
+            <td>
+                <button hx-post="/api/perfmon/tags/remove"
+                        hx-vals='{"tag": "{{ tag }}"}'
+                        hx-swap="none"
+                        hx-on::after-request="location.reload()"
+                        style="font-size: 0.8em; padding: 0.2rem 0.5rem;">Remove</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    <form hx-post="/api/perfmon/tags/add"
+          hx-swap="none"
+          hx-on::after-request="location.reload()"
+          style="margin-top: 0.75rem;">
+        <input type="text" name="tag" placeholder="0.13.50tp" style="width: 200px;">
+        <button type="submit">Add Tag</button>
+    </form>
+
+    <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
+        Defaults: {% for t in default_tags %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        <button hx-post="/api/perfmon/tags/reset"
+                hx-swap="none"
+                hx-confirm="Restore the default AOTriton tag list?"
+                hx-on::after-request="location.reload()"
+                style="font-size: 0.8em; padding: 0.2rem 0.5rem; margin-left: 0.5rem;">Restore Defaults</button>
+    </p>
+</section>
+
+<section>
     <h3>Status</h3>
     <table>
         <tr><th>Item</th><th>Value</th></tr>

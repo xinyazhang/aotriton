@@ -183,38 +183,66 @@
 <section>
     <h3>Build Perfmon Artifacts</h3>
     <p>
-        Build the perfmon measurement runner: the AOTriton-neutral
-        <code>libperfmon_core</code> (one per ROCm, shared by every subject) plus
-        this subject's family library and <code>bin/runner</code>.
+        Build the perfmon measurement runner per <em>subject</em>: the
+        AOTriton-neutral <code>libperfmon_core</code> (one per ROCm, shared)
+        plus that subject's family library and <code>bin/runner</code>.
         Uses <code>perfmon/build_subject.sh &lt;tag&gt; &lt;rocm&gt; &lt;arch&gt;</code>.
     </p>
     <p style="font-size: 0.9em; color: gray;">
-        A <em>subject</em> is an (AOTriton tag, ROCm) pair. ROCm comes from
-        <code>perfmon::default_rocm</code> in <code>workers.db</code>:
-        {% if perfmon_rocm %}<code>{{ perfmon_rocm }}</code>{% else %}<strong style="color: #a15c00;">not set</strong>{% endif %}.
-        Only the <code>head</code> tag is buildable today; historical release
-        subjects additionally need that release's kernel image tarball.
+        ROCm <code>{% if perfmon_rocm %}{{ perfmon_rocm }}{% else %}not set{% endif %}</code>;
+        tags and ROCm are configured on the
+        <a href="/perfmon_config">PerfmonConfig</a> tab.
     </p>
+
     {% if not perfmon_rocm %}
-    <p style="font-size: 0.9em; color: #a15c00;">
-        Set <code>perfmon::default_rocm</code> to an exact ROCm version string
-        (e.g. <code>7.14.0</code>, never a truncated <code>7.14</code>) before
-        building &mdash; it is part of the subject's identity, so it is not
-        guessed.
+    <p style="color: #a15c00;">
+        <strong>perfmon::default_rocm is not set</strong> &mdash; set it on the
+        PerfmonConfig tab before building.
+    </p>
+    {% elif not archs %}
+    <p style="color: #a15c00;"><strong>No architectures registered.</strong></p>
+    {% else %}
+    <form hx-post="/api/builds/perfmon"
+          hx-swap="none"
+          hx-confirm="Build perfmon artifacts for every checked cell?"
+          hx-indicator="#perfmon-build-spinner">
+        <table>
+            <tr>
+                <th>Arch</th>
+                <th>All</th>
+                {% for tag in perfmon_tags %}<th><code>{{ tag }}</code></th>{% endfor %}
+            </tr>
+            {% for arch in archs %}
+            <tr>
+                <td><code>{{ arch }}</code></td>
+                <td style="text-align: center;">
+                    {# Row toggle only -- it has no name, so it is never submitted;
+                       the per-cell boxes it ticks are what the form posts. #}
+                    <input type="checkbox"
+                           onchange="document.querySelectorAll('.perfmon-cell-{{ arch }}').forEach(function(c){c.checked = this.checked}, this)">
+                </td>
+                {% for tag in perfmon_tags %}
+                <td style="text-align: center;">
+                    {# arch and tag travel as one value so a sparse selection
+                       stays sparse; separate lists could only mean a full
+                       cross-product. #}
+                    <input type="checkbox" name="subject"
+                           class="perfmon-cell-{{ arch }}"
+                           value="{{ arch }}:{{ tag }}">
+                </td>
+                {% endfor %}
+            </tr>
+            {% endfor %}
+        </table>
+        <button type="submit" style="margin-top: 0.75rem;">Build Selected</button>
+        <span id="perfmon-build-spinner" class="htmx-indicator">⏳ Building...</span>
+    </form>
+    <p style="font-size: 0.9em; color: gray; margin-top: 0.5rem;">
+        Each checked cell is a separate <code>build_subject.sh</code> run, so
+        one failure does not stop the others &mdash; the matrix is a batch, not
+        a transaction.
     </p>
     {% endif %}
-    <div style="margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;">
-        <span style="font-size: 0.9em; color: gray; margin-right: 0.2rem;">Build for arch:</span>
-        {% for arch in archs %}
-        <button hx-post="/api/builds/perfmon"
-                hx-vals='{"arch": "{{ arch }}", "tag": "head"}'
-                hx-swap="none"
-                hx-confirm="Build perfmon artifacts for {{ arch }} (tag head)?"
-                hx-indicator="#perfmon-build-spinner-{{ arch }}"
-                {% if not perfmon_rocm %}disabled title="Set perfmon::default_rocm first"{% endif %}>{{ arch }}</button>
-        <span id="perfmon-build-spinner-{{ arch }}" class="htmx-indicator">⏳</span>
-        {% endfor %}
-    </div>
 </section>
 
 <section>

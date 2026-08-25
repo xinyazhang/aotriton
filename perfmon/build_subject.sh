@@ -7,11 +7,12 @@
 # (libperfmon_flash@<subject> + bin/runner) linked against it.
 #
 # Usage: build_subject.sh <tag> <rocm> <arch>
-#   <tag>   git tag to build, or the literal string "head" to use the
-#           current working tree (T13's own title: "Build the first
-#           subject: head" -- that is this script's primary, exercised
-#           path; <tag> != head is implemented per spec but UNVERIFIED,
-#           see the disclosures below).
+#   <tag>   git tag to build, e.g. 0.13b. HEAD is NOT supported: it has no
+#           published kernel images, so it would need a full AOTriton build
+#           rather than the shim build this script performs. The working-tree
+#           path still exists behind PERFMON_ALLOW_HEAD=1 -- it is the path
+#           T13 actually exercised -- but no UI reaches it. The released-tag
+#           path is implemented per spec but UNVERIFIED, see disclosures.
 #   <rocm>  a nominal ROCm version label (perfmon-rev0.md §9:
 #           `perfmon::subject::<subject_id>` keys/values, e.g. "7.14.0")
 #           used ONLY to build `subject_id` and this script's default
@@ -143,7 +144,7 @@ fi
 
 if [ "$#" -ne 3 ]; then
   echo "Usage: build_subject.sh <tag> <rocm> <arch>" >&2
-  echo '  <tag>:  git tag to build, or "head" for the current working tree' >&2
+  echo '  <tag>:  git tag to build, e.g. 0.13b' >&2
   echo '  <rocm>: nominal ROCm version label (e.g. 7.14.0) -- see this' >&2
   echo '          script'"'"'s own header comment for why this is NOT how' >&2
   echo '          the ROCm toolchain itself is located (set ROCM_PATH)' >&2
@@ -154,6 +155,29 @@ fi
 TAG="$1"
 ROCM="$2"
 ARCH="$3"
+
+# HEAD is not a supported subject. A released tag is shim-built and paired
+# with that release's prebuilt kernel images; HEAD has no published images, so
+# it would need a full AOTriton build (Triton, every kernel) before it could be
+# measured -- a different and far more expensive operation than this script
+# performs. Refuse rather than half-produce a subject with no images.
+#
+# PERFMON_ALLOW_HEAD=1 keeps the working-tree path reachable for the GPU
+# session that has been exercising it by hand; no UI path sets it.
+case "${TAG}" in
+  head|HEAD)
+    if [ "${PERFMON_ALLOW_HEAD:-0}" != "1" ]; then
+      echo "Error: '${TAG}' is not a supported subject." >&2
+      echo "       Building from HEAD needs a full AOTriton build (no released" >&2
+      echo "       kernel images exist for it), which this script does not do." >&2
+      echo "       Pass a released git tag instead, e.g. 0.13b." >&2
+      echo "       (Set PERFMON_ALLOW_HEAD=1 to force the working-tree path.)" >&2
+      exit 1
+    fi
+    TAG="head"   # internal spelling of the working-tree path below
+    echo "[build_subject] PERFMON_ALLOW_HEAD=1: using the working tree" >&2
+    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
