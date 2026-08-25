@@ -20,9 +20,12 @@ TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Parse arguments
 parse_host_filter "$@"
 
-# Remove --host options from args; extract --tuning_mode
+# Remove --host options from args; extract --workload.
+# --tuning_mode is a deprecated alias for --workload here, same as in
+# .tune/bin/deploy: at this layer the value names what the NODE serves
+# (kernel|op|perfmon), not which LUT surface to filter for.
 ARGS=()
-TUNING_MODE="kernel"
+WORKLOAD="kernel"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host)
@@ -31,8 +34,8 @@ while [[ $# -gt 0 ]]; do
                 shift
             done
             ;;
-        --tuning_mode)
-            TUNING_MODE="$2"
+        --workload|--tuning_mode)
+            WORKLOAD="$2"
             shift 2
             ;;
         *)
@@ -108,7 +111,7 @@ for worker in "${WORKERS[@]}"; do
 
     case "$ACTION" in
         start)
-            "$TUNE_ROOT/single/start_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --tuning_mode "$TUNING_MODE"
+            "$TUNE_ROOT/single/start_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --workload "$WORKLOAD"
             ;;
         stop)
             "$TUNE_ROOT/single/stop_worker.sh" "$WORKDIR" "$hostname"
@@ -117,7 +120,7 @@ for worker in "${WORKERS[@]}"; do
             "$TUNE_ROOT/single/stop_worker.sh" "$WORKDIR" "$hostname" --graceful
             ;;
         restart)
-            "$TUNE_ROOT/single/restart_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --tuning_mode "$TUNING_MODE"
+            "$TUNE_ROOT/single/restart_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --workload "$WORKLOAD"
             ;;
         stopwait)
             "$TUNE_ROOT/single/stopwait_worker.sh" "$WORKDIR" "$hostname"

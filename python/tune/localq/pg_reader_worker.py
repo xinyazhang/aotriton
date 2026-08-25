@@ -32,6 +32,19 @@ configure_logging_with_flush()
 logger = logging.getLogger(__name__)
 
 
+# workload -> (task_queue.class, tuning_mode) for fetch_tasks().
+#
+# The workload a node serves determines BOTH, so it is the only thing callers
+# pass. `tuning_mode` is meaningless for perf_measure -- it selects a module
+# filter over the tuning LUT surface, and a perfmon row is not on that surface
+# -- so it is pinned to the tuning default there rather than invented.
+_WORKLOAD_TASK_SELECTOR: dict[str, tuple[str, str]] = {
+    'kernel':  ('tune_kernel', 'kernel'),
+    'op':      ('tune_kernel', 'op'),
+    'perfmon': ('perf_measure', 'kernel'),
+}
+
+
 class PGReaderWorker:
     """
     Fetches tasks from PostgreSQL and sends to broker.
@@ -302,13 +315,21 @@ def main():
     parser.add_argument('--broker_socket', type=str,
                        default=os.environ.get('AOTRITON_TUNER_BROKER_SOCKET', '/tmp/aotriton-broker.sock'),
                        help='Path to broker Unix socket')
-    parser.add_argument('--tuning_mode', type=str, default='kernel', choices=['kernel', 'op'],
-                       help='Task filter mode: kernel (default) or op')
-    parser.add_argument('--class', dest='klass', type=str, default='tune_kernel',
-                       choices=['tune_kernel', 'perf_measure'],
-                       help="Which DAG to fetch for: tune_kernel (default) or perf_measure. "
-                            "dest='klass' because 'class' is a Python keyword.")
+    # One flag, not three. `tuning_mode` (kernel|op) and `class`
+    # (tune_kernel|perf_measure) are not independent -- the workload this node
+    # serves fixes both, so asking a caller for all three lets it state a
+    # combination that cannot exist (say --workload perfmon with
+    # --class tune_kernel) and makes worker_service.sh derive downstream what
+    # it already knows upstream.
+    parser.add_argument('--workload', type=str, default='kernel',
+                       choices=list(_WORKLOAD_TASK_SELECTOR),
+                       help='What this node serves. Selects the task class and, '
+                            'for the tuning classes, the module filter: '
+                            + ', '.join(f'{w} -> class={k}, tuning_mode={t}'
+                                        for w, (k, t) in _WORKLOAD_TASK_SELECTOR.items()))
     args = parser.parse_args()
+
+    klass, tuning_mode = _WORKLOAD_TASK_SELECTOR[args.workload]
 
     # Get database connection parameters
     from pathlib import Path
@@ -320,8 +341,8 @@ def main():
         arch=args.arch,
         broker_socket=args.broker_socket,
         conn_params=conn_params,
-        tuning_mode=args.tuning_mode,
-        klass=args.klass,
+        tuning_mode=tuning_mode,
+        klass=klass,
     )
 
     # Setup signal handlers for graceful shutdown

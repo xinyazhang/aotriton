@@ -52,7 +52,10 @@ Options:
     --ncpu <n>                    Number of CPU workers to start (default: 4)
     --graceful                    (stop only) Stop PG readers first, wait for in-flight
                                   tasks to drain, then stop remaining workers
-    --tuning_mode kernel|op       Tuning mode passed to PG reader workers (default: kernel)
+    --workload kernel|op|perfmon  What this node serves (default: kernel). Passed to
+                                  the PG readers, which derive the task class and
+                                  module filter from it.
+    --tuning_mode <same>          Deprecated alias for --workload.
 
 Components started:
     - 1 broker (message router)
@@ -104,7 +107,7 @@ NODE_HOSTNAME=""
 SESSION_NAME=""
 NUM_READERS=4
 NUM_CPU=4
-TUNING_MODE="kernel"
+WORKLOAD="kernel"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -146,9 +149,19 @@ while [ $# -gt 0 ]; do
             GRACEFUL=true
             shift
             ;;
-        --tuning_mode)
+        --workload)
             shift
-            TUNING_MODE="$1"
+            WORKLOAD="$1"
+            shift
+            ;;
+        --tuning_mode)
+            # Deprecated alias. The old name described a kernel|op LUT filter;
+            # the workload it now names is a strict superset of those values
+            # (kernel, op, and additionally perfmon), and pg_reader_worker maps
+            # each back onto the filter, so the two spellings are equivalent
+            # for every value a caller can legally have passed before.
+            shift
+            WORKLOAD="$1"
             shift
             ;;
         *)
@@ -314,7 +327,14 @@ start_process_group() {
                 module_args=("--gpu_id" "$id")
                 ;;
             pg)
-                module_args=("--worker_id" "$name" "--arch" "$ARCH" "--workdir" "$WORKDIR" "--tuning_mode" "$TUNING_MODE")
+                # --workload alone. It fixes both the task class
+                # (task_queue.class: perf_measure vs tune_kernel) and the
+                # tuning_mode module filter, so pg_reader_worker derives them
+                # from it -- see _WORKLOAD_TASK_SELECTOR there. Passing the
+                # derived values as well would let this script state a
+                # combination that cannot exist.
+                module_args=("--worker_id" "$name" "--arch" "$ARCH" "--workdir" "$WORKDIR" \
+                             "--workload" "$WORKLOAD")
                 ;;
             cpu)
                 module_args=("--worker_id" "$name" "--workdir" "$WORKDIR")
