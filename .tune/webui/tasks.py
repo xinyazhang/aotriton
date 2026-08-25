@@ -560,8 +560,11 @@ class BuildPerfmonArtifactsCommand(CommandBuilder):
     RELATIVE = 'perfmon/build_subject.sh'
     DESCRIPTION = 'Build perfmon artifacts'
 
-    def exec(self, workdir, arch: str, rocm: str, tag: str = 'head', dry_run: bool = False):
-        return self._run(self.RELATIVE, [tag, rocm, arch], workdir,
+    def exec(self, workdir, arch: str, rocm: str, tag: str, dry_run: bool = False):
+        # workdir is passed twice on purpose: once as the script's 4th argument
+        # (where the subject installs, <workdir>/installed/perfmon/<arch>/<tag>)
+        # and once to _run, which uses it for the command log.
+        return self._run(self.RELATIVE, [tag, rocm, arch, workdir], workdir,
                          f'Build perfmon artifacts ({tag}+rocm{rocm}, {arch})',
                          dry_run=dry_run)
 
@@ -608,7 +611,10 @@ class DeployAllCommand(DeployCommand):
     DESCRIPTION = 'Deploy to all workers'
 
     def exec(self, workdir, tuning_mode: str = 'kernel', dry_run: bool = False):
-        return self._run(self.RELATIVE, [workdir, '--tuning_mode', tuning_mode], workdir, self.DESCRIPTION, dry_run=dry_run)
+        # `--workload`, not the deprecated `--tuning_mode` alias: the value can
+        # now be perfmon, which is not a tuning mode.
+        return self._run(self.RELATIVE, [workdir, '--workload', tuning_mode], workdir,
+                         f'{self.DESCRIPTION} ({tuning_mode})', dry_run=dry_run)
 
 
 class PrepareWorkdirCommand(DeployCommand):
@@ -912,7 +918,7 @@ def sync_build_node(workdir, dry_run: bool = False):
     hostname = cfg.get('hostname', '')
     if not hostname:
         return {'status': 'error', 'message': 'Remote build node hostname is not configured'}
-    cmd = ['.tune/single/sync_workdir.sh', workdir, hostname, '--buildnode']
+    cmd = ['.tune/single/sync_workdir.sh', workdir, hostname, '--workload', 'build']
     return run_command(cmd, cwd=AOTRITON_ROOT, workdir=workdir,
                        description=f'Sync workdir to remote build node {hostname}', dry_run=dry_run)
 
@@ -1130,10 +1136,15 @@ def deploy_workdir(workdir, tuning_mode: str = 'kernel', dry_run: bool = False):
 
 
 def deploy_workdir_single(workdir, hostname, extra_args=None, tuning_mode: str = 'kernel', dry_run: bool = False):
-    """Deploy to single worker"""
-    testnode_args = ['--testnode'] if tuning_mode == 'op' else []
-    combined = testnode_args + list(extra_args or [])
-    return _deploy_worker.exec(workdir, hostname, extra_args=combined or None, dry_run=dry_run)
+    """Deploy to single worker, shipping the installed/ subtree its workload needs.
+
+    The workload is forwarded verbatim; sync_workdir.sh maps kernel/op/perfmon
+    onto its own subtree names. Previously only 'op' was special-cased, into
+    --testnode, which left perfmon shipping tuning libraries it has no use for
+    and none of the subjects it does.
+    """
+    combined = ['--workload', tuning_mode] + list(extra_args or [])
+    return _deploy_worker.exec(workdir, hostname, extra_args=combined, dry_run=dry_run)
 
 
 def prepare_workdir(workdir, workload: str = 'kernel', dry_run: bool = False):

@@ -3,10 +3,13 @@
 # SPDX-License-Identifier: MIT
 
 # Deploy workdir to all workers
-# Usage: deploy <workdir> [--tuning_mode kernel|op]
+# Usage: deploy <workdir> [--workload <name>]
 #
-# --tuning_mode kernel (default)  Deploy to Tuner-role hosts; sync installed/<arch>/.
-# --tuning_mode op                Deploy to Tuner-role hosts; sync installed/test/<arch>/.
+# --workload kernel (default)  Deploy to Tuner-role hosts;   sync installed/<arch>/.
+# --workload op                Deploy to Tuner-role hosts;   sync installed/test/<arch>/.
+# --workload perfmon           Deploy to Perfmon-role hosts; sync installed/perfmon/<arch>/.
+#
+# --tuning_mode is a deprecated alias for --workload.
 
 set -e
 
@@ -19,29 +22,41 @@ TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKDIR="$1"
 shift
 
-TUNING_MODE="kernel"
+WORKLOAD="kernel"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tuning_mode) TUNING_MODE="$2"; shift 2 ;;
+    --workload)    WORKLOAD="$2"; shift 2 ;;
+    --tuning_mode) WORKLOAD="$2"; shift 2 ;;   # deprecated alias
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
 if [ -z "$WORKDIR" ]; then
-    echo "Usage: $0 <workdir> [--tuning_mode kernel|op]" >&2
+    echo "Usage: $0 <workdir> [--workload kernel|op|perfmon]" >&2
     exit 1
 fi
 
 load_config "$WORKDIR"
 
-echo "Deploying from $WORKDIR (tuning_mode=$TUNING_MODE)"
+echo "Deploying from $WORKDIR (workload=$WORKLOAD)"
 
-if [ "$TUNING_MODE" = "op" ]; then
-    SYNC_FLAG="--testnode"
+# The workload picks BOTH which hosts to deploy to and which installed/ subtree
+# each one gets. Previously only the subtree varied (op -> --testnode) and the
+# host list was always Tuner-role; a perfmon deploy would then have shipped
+# tuning libraries to tuning hosts, which is wrong on both counts.
+SYNC_FLAG="--workload $WORKLOAD"
+if [ "$WORKLOAD" = "perfmon" ]; then
+    DEPLOY_ROLE="Perfmon"
 else
-    SYNC_FLAG=""
+    DEPLOY_ROLE="Tuner"
 fi
-mapfile -t WORKER_DATA < <(get_workers "$WORKDIR" Tuner)
+
+mapfile -t WORKER_DATA < <(get_workers "$WORKDIR" "$DEPLOY_ROLE")
+
+if [ "${#WORKER_DATA[@]}" -eq 0 ]; then
+    echo "Warning: no hosts hold the $DEPLOY_ROLE role, so nothing will be deployed." >&2
+    echo "         Assign it on the WebUI's Workers tab." >&2
+fi
 
 for worker in "${WORKER_DATA[@]}"; do
     IFS='|' read -r hostname arch workdir_override <<< "$worker"

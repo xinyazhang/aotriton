@@ -570,10 +570,19 @@ def api_deploy_workdir():
 
 @bp.route('/api/deploy/<hostname>', methods=['POST'])
 def api_deploy_single(hostname):
-    """Deploy workdir to a single worker; pass testnode=1 to add --testnode flag"""
+    """Deploy workdir to a single worker.
+
+    `testnode=1` remains accepted for callers that force the testing subtree
+    regardless of the selected workload.
+    """
     workdir = current_app.config['WORKDIR']
-    extra_args = ['--testnode'] if request.form.get('testnode') == '1' else None
-    tuning_mode = request.form.get('tuning_mode') or tasks.get_tuning_mode(workdir)
+    extra_args = None
+    if request.form.get('testnode') == '1':
+        # Override the workload rather than appending a second --workload and
+        # relying on last-wins in the argument parser.
+        tuning_mode = 'test'
+    else:
+        tuning_mode = request.form.get('tuning_mode') or tasks.get_tuning_mode(workdir)
     result = tasks.deploy_workdir_single(workdir, hostname, extra_args=extra_args,
                                          tuning_mode=tuning_mode,
                                          dry_run=should_dryrun())

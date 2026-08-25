@@ -27,8 +27,8 @@
 #   <arch>  GPU arch, e.g. "gfx942" -- forwarded verbatim as
 #           AOTRITON_TARGET_ARCH.
 #
-# Produces perfmon/subjects/<subject_id>/ where
-# subject_id = aotriton-<tag>+rocm<rocm> (perfmon-rev0.md §9/§11), containing:
+# Produces <workdir>/installed/perfmon/<arch>/<tag>/ containing a
+# `subject_id` file (aotriton-<tag>+rocm<rocm>, perfmon-rev0.md §9/§11) and:
 #   aotriton/            AOTRITON_ROOT: shim-built include/+lib/, plus
 #                         (released tags only) fetched lib/aotriton.images/
 #   bin/runner            the executable T13's own Verify step checks
@@ -142,13 +142,16 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-if [ "$#" -ne 3 ]; then
-  echo "Usage: build_subject.sh <tag> <rocm> <arch>" >&2
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+  echo "Usage: build_subject.sh <tag> <rocm> <arch> [workdir]" >&2
   echo '  <tag>:  git tag to build, e.g. 0.13b' >&2
   echo '  <rocm>: nominal ROCm version label (e.g. 7.14.0) -- see this' >&2
   echo '          script'"'"'s own header comment for why this is NOT how' >&2
   echo '          the ROCm toolchain itself is located (set ROCM_PATH)' >&2
   echo '  <arch>: GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
+  echo '  [workdir]: project workdir; the subject installs under' >&2
+  echo '          <workdir>/installed/perfmon/<arch>/<tag>/. Defaults to' >&2
+  echo '          $PERFMON_WORKDIR.' >&2
   exit 1
 fi
 
@@ -182,13 +185,36 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Subjects install into the WORKDIR's installed/ tree, not into the checkout.
+# installed/ is the one directory the deploy machinery knows how to ship
+# per-arch (installed/<arch>, installed/test/<arch>, installed/database), so
+# putting subjects anywhere else would leave them unsyncable -- and a build
+# artifact living inside the git checkout is wrong regardless.
+PERFMON_WORKDIR="${4:-${PERFMON_WORKDIR:-}}"
+if [ -z "${PERFMON_WORKDIR}" ]; then
+  echo "Error: no workdir given. Pass it as the 4th argument or set" >&2
+  echo "       PERFMON_WORKDIR; the subject installs under" >&2
+  echo "       <workdir>/installed/perfmon/<arch>/<tag>/." >&2
+  exit 1
+fi
+if [ ! -d "${PERFMON_WORKDIR}" ]; then
+  echo "Error: workdir '${PERFMON_WORKDIR}' does not exist." >&2
+  exit 1
+fi
+
+# The ROCm is NOT a path segment: one workdir pins one ROCm
+# (perfmon::default_rocm), so <arch>/<tag> is already unique within it. It is
+# recorded inside the subject instead, so a directory built against a ROCm that
+# has since been changed is still identifiable rather than silently assumed
+# current.
 SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
-SUBJECT_DIR="${REPO_ROOT}/perfmon/subjects/${SUBJECT_ID}"
+SUBJECT_DIR="${PERFMON_WORKDIR}/installed/perfmon/${ARCH}/${TAG}"
 AOTRITON_ROOT="${SUBJECT_DIR}/aotriton"
 
 echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
 echo "[build_subject] subject_dir=${SUBJECT_DIR}" >&2
 mkdir -p "${SUBJECT_DIR}"
+printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
 
 # --- Step 1: source tree (T13 spec item 1) --------------------------------
 if [ "${TAG}" == "head" ]; then
