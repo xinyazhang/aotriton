@@ -77,20 +77,29 @@ fetch_release_asset() {
 install_images_from_tarball() {
   local tarball="$1" install_dir="$2"
 
+  mkdir -p "${install_dir}/lib"
+
+  # Extract first and judge the result, rather than pre-flighting with
+  # `tar tzf | grep -q`. That pre-flight looks obvious and is wrong twice
+  # over: grep -q exits at its first match, tar then dies of SIGPIPE, and the
+  # `set -o pipefail` every build-<tag>.sh runs under turns that into a
+  # failure on a perfectly good tarball. It also decompresses the whole
+  # archive an extra time -- for the pre-0.11b jumbo tarballs that is several
+  # GB of pointless work before the real extraction even starts.
+  local rc=0
+  tar xzf "${tarball}" -C "${install_dir}/lib" \
+      --strip-components=2 'aotriton/lib/aotriton.images' || rc=$?
+
   # Fail on a tarball that does not contain what this whole step exists for,
   # rather than "succeeding" and leaving a subject that cannot measure
   # anything. The runner loads images by dladdr, relative to the library, so a
   # missing directory would surface much later as a kernel-not-found at
   # measurement time.
-  if ! tar tzf "${tarball}" | grep -q 'aotriton/lib/aotriton\.images/'; then
-    echo "[release_asset] ERROR: ${tarball} contains no aotriton/lib/aotriton.images/." >&2
+  if [ "${rc}" -ne 0 ] || [ ! -d "${install_dir}/lib/aotriton.images" ]; then
+    echo "[release_asset] ERROR: ${tarball} yielded no lib/aotriton.images/." >&2
     echo "[release_asset]        Contents begin:" >&2
-    tar tzf "${tarball}" | head -10 | sed 's/^/[release_asset]          /' >&2
+    { tar tzf "${tarball}" | head -10 | sed 's/^/[release_asset]          /'; } >&2 || true
     return 1
   fi
-
-  mkdir -p "${install_dir}/lib"
-  tar xzf "${tarball}" -C "${install_dir}/lib" \
-      --strip-components=2 'aotriton/lib/aotriton.images'
   echo "[release_asset] installed ${install_dir}/lib/aotriton.images" >&2
 }
