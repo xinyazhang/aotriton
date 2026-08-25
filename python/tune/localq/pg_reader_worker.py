@@ -23,7 +23,7 @@ from psycopg.rows import dict_row
 
 from .protocol import send_message, recv_message
 from ..utils import get_db_connection_params, configure_logging_with_flush
-from ..pq.queue import TaskQueue, TuningLevelMismatch
+from ..pq.queue import TaskQueue, TaskSubclassMismatch
 from ..pq.connection import ReconnectableConn
 from ..pq.extra_uts import get_extra_uts
 
@@ -37,11 +37,10 @@ logger = logging.getLogger(__name__)
 # The workload a node serves determines both, so it is the only thing callers
 # pass.
 #
-# `tuning_mode` is fetch_tasks' parameter name for the SECOND element, and the
-# name is misleading: it is not a module filter, it is matched literally
-# against the denormalized task_queue.subclass column (`AND subclass = %s`).
-# So the value is not free-form, it must be one the schema permits for that
-# class. schema.sql enforces the vocabulary:
+# The second element is matched literally against the denormalized
+# task_queue.subclass column (`AND subclass = %s`), so it is not free-form:
+# it must be a value the schema permits for that class. schema.sql enforces
+# the vocabulary:
 #
 #     CHECK ((class = 'tune_kernel'  AND subclass IN ('kernel', 'op')) OR
 #            (class = 'perf_measure' AND subclass = ''))
@@ -51,6 +50,11 @@ logger = logging.getLogger(__name__)
 # never match, so the worker claims nothing and does so silently -- no error,
 # no warning, just an idle reader. An earlier revision of this table did
 # exactly that on the theory that subclass was inert for perfmon.
+#
+# This mapping is where the tuning-domain vocabulary stops. `workload` is a
+# node-kind concept the .tune/ scripts own; below this line only the generic
+# queue terms class/subclass travel, because the queue also carries
+# perf_measure work that has no "tuning mode" at all.
 _WORKLOAD_TASK_SELECTOR: dict[str, tuple[str, str]] = {
     'kernel':  ('tune_kernel', 'kernel'),
     'op':      ('tune_kernel', 'op'),
@@ -75,7 +79,7 @@ class PGReaderWorker:
     """
 
     def __init__(self, worker_id: str, arch: str, broker_socket: str, conn_params: dict,
-                 tuning_mode: str = 'kernel', klass: str = 'tune_kernel'):
+                 klass: str = 'tune_kernel', subklass: str = 'kernel'):
         """
         Initialize PG reader worker.
 
@@ -84,7 +88,7 @@ class PGReaderWorker:
             arch: GPU architecture to fetch tasks for
             broker_socket: Path to broker Unix socket
             conn_params: PostgreSQL connection parameters
-            tuning_mode: 'kernel' or 'op' — controls module filter in fetch_tasks
+            subklass: task_queue.subclass value to claim; see fetch_tasks
             klass: which DAG to fetch for, e.g. 'tune_kernel' | 'perf_measure'
                 (perfmon rev2 R01/R02). Defaults to 'tune_kernel', the only
                 DAG that exists today. Named `klass`, not `class`, because
@@ -94,7 +98,7 @@ class PGReaderWorker:
         self.arch = arch
         self.broker_socket = broker_socket
         self.conn_params = conn_params
-        self.tuning_mode = tuning_mode
+        self.subklass = subklass
         self.klass = klass
         self.sock = None
         self.db_conn = None
@@ -114,7 +118,7 @@ class PGReaderWorker:
         self._connect_to_database()
 
         logger.info(f"PG Reader {self.worker_id} started for arch={self.arch} class={self.klass} "
-                    f"tuning_mode={self.tuning_mode} (PID={os.getpid()})")
+                    f"subclass={self.subklass!r} (PID={os.getpid()})")
         self.running = True
 
         while self.running:
@@ -269,8 +273,8 @@ class PGReaderWorker:
         """
         try:
             task_queue = TaskQueue(self.db_conn)
-            tasks = task_queue.fetch_tasks(self.arch, batch_size=1, tuning_mode=self.tuning_mode,
-                                           klass=self.klass)
+            tasks = task_queue.fetch_tasks(self.arch, batch_size=1,
+                                           klass=self.klass, subklass=self.subklass)
 
             if tasks:
                 task = tasks[0]
@@ -306,8 +310,8 @@ class PGReaderWorker:
                 logger.debug(f"PG Reader {self.worker_id} no tasks available")
                 return None
 
-        except TuningLevelMismatch:
-            # Raised by fetch_tasks() when its tuning_level filter is broken.
+        except TaskSubclassMismatch:
+            # Raised by fetch_tasks() when its class/subclass filter is broken.
             # Not a transient database error -- let it kill the worker rather
             # than retry against a queue that is handing out the wrong level.
             raise
@@ -328,7 +332,7 @@ def main():
     parser.add_argument('--broker_socket', type=str,
                        default=os.environ.get('AOTRITON_TUNER_BROKER_SOCKET', '/tmp/aotriton-broker.sock'),
                        help='Path to broker Unix socket')
-    # One flag, not three. `tuning_mode` (kernel|op) and `class`
+    # One flag, not two. The task class and subclass
     # (tune_kernel|perf_measure) are not independent -- the workload this node
     # serves fixes both, so asking a caller for all three lets it state a
     # combination that cannot exist (say --workload perfmon with
@@ -338,11 +342,11 @@ def main():
                        choices=list(_WORKLOAD_TASK_SELECTOR),
                        help='What this node serves. Selects the task class and, '
                             'for the tuning classes, the module filter: '
-                            + ', '.join(f'{w} -> class={k}, tuning_mode={t}'
-                                        for w, (k, t) in _WORKLOAD_TASK_SELECTOR.items()))
+                            + ', '.join(f'{w} -> class={k}, subclass={s!r}'
+                                        for w, (k, s) in _WORKLOAD_TASK_SELECTOR.items()))
     args = parser.parse_args()
 
-    klass, tuning_mode = _WORKLOAD_TASK_SELECTOR[args.workload]
+    klass, subklass = _WORKLOAD_TASK_SELECTOR[args.workload]
 
     # Get database connection parameters
     from pathlib import Path
@@ -354,8 +358,8 @@ def main():
         arch=args.arch,
         broker_socket=args.broker_socket,
         conn_params=conn_params,
-        tuning_mode=tuning_mode,
         klass=klass,
+        subklass=subklass,
     )
 
     # Setup signal handlers for graceful shutdown

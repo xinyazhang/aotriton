@@ -69,13 +69,14 @@ def entry_filter(entry, *, arch=None, klass=None, tuning_level=None, module=None
     return ' AND '.join(clauses), params
 
 
-class TuningLevelMismatch(RuntimeError):
-    """fetch_tasks() claimed a task belonging to the other tuning level.
+class TaskSubclassMismatch(RuntimeError):
+    """fetch_tasks() claimed a task of a class/subclass it did not ask for.
 
     Only reachable if the UPDATE's `subclass` predicate is broken, since
     PostgreSQL would otherwise not return the row. Systemic rather than
-    transient: the filter is the sole thing keeping a worker off tasks its
-    pyaotriton build cannot execute, so every later claim is suspect too.
+    transient: the filter is the sole thing keeping a worker off tasks it
+    cannot execute -- for a tuning worker, tasks its pyaotriton build does
+    not implement -- so every later claim is suspect too.
     """
 
 
@@ -121,8 +122,8 @@ class TaskQueue:
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}"
         self.node_hostname = socket.gethostname()
 
-    def fetch_tasks(self, arch: str, batch_size: int = 10, *, tuning_mode: str,
-                    klass: str = 'tune_kernel') -> list[Task]:
+    def fetch_tasks(self, arch: str, batch_size: int = 10, *, klass: str,
+                    subklass: str) -> list[Task]:
         """
         Fetch pending tasks for a specific architecture.
 
@@ -134,19 +135,31 @@ class TaskQueue:
         Args:
             arch: GPU architecture (e.g., 'gfx942', 'gfx90a')
             batch_size: Number of tasks to fetch
-            tuning_mode: 'kernel' or 'op' (REQUIRED, keyword-only, no default --
-                a kernel worker must never claim an op task and vice versa,
-                see modular-tune.md F16). Filters on the denormalized
-                task_queue.subclass column, not a `module` string pattern.
-            klass: which DAG to fetch for, e.g. 'tune_kernel' | 'perf_measure'
-                (keyword-only, defaults to 'tune_kernel' -- the only DAG that
-                exists today). Filters on task_queue.class and selects the
-                (arch, class) leaf partition.
+            klass: which DAG to fetch for: 'tune_kernel' | 'perf_measure'.
+                Filters on task_queue.class and selects the (arch, class)
+                leaf partition.
+            subklass: the task_queue.subclass value to claim. Matched
+                literally, so it must be one schema.sql's CHECK permits for
+                this class: 'kernel' | 'op' for tune_kernel, '' for
+                perf_measure. Pairing a class with a subclass the CHECK
+                forbids yields a predicate that can never match, and the
+                worker then idles silently.
+
+                Both are REQUIRED and keyword-only, with no default: a
+                worker must never claim a task of a class or subclass it
+                cannot execute (see modular-tune.md F16 for the tuning case),
+                so a caller that forgets one fails at the call site rather
+                than silently defaulting.
+
+                These are deliberately GENERIC queue terms. `tuning_mode` is
+                a tuning-domain name and belongs to tuning-specific code --
+                the scripts under .tune/ and the tuning DAG -- not to the
+                task queue, which also carries perf_measure work.
 
         Returns:
             List of claimed Task objects
 
-        TODO: targeted message delivery. `arch` + `klass` + `tuning_mode` is
+        TODO: targeted message delivery. `arch` + `klass` + `subklass` is
         the whole routing vocabulary today, so any worker of the right arch,
         class, and level can claim any pending task. It cannot express a
         per-task requirement on what the *host* has provisioned -- which is
@@ -156,7 +169,7 @@ class TaskQueue:
         Intended shape: a `tags` column on task_queue (see schema.sql) and a
         tag set per worker, with `AND <task tags are satisfied by worker
         tags>` added to the claim UPDATE below, plus the same post-claim
-        assertion this method already makes for `tuning_mode` -- claiming a
+        assertion this method already makes for `subklass` -- claiming a
         task whose tags do not match is a bug, not a warning.
         """
         partition_table = f"shards.task_queue_{arch}_{klass}"
@@ -181,7 +194,7 @@ class TaskQueue:
                 RETURNING id, arch, module, class AS klass, subclass, task_config, status, priority,
                           worker_id, node_hostname, created_at, started_at,
                           completed_at, error, retry_count
-            """, (self.worker_id, self.node_hostname, klass, tuning_mode, batch_size))
+            """, (self.worker_id, self.node_hostname, klass, subklass, batch_size))
 
             try:
                 rows = cur.fetchall()
@@ -198,7 +211,7 @@ class TaskQueue:
             # in 'running' -- then fail. The batch is released entirely, not
             # just the offending rows: this raises out of the worker, so
             # correctly-claimed tasks would be stranded too.
-            wrong = [t for t in tasks if t.klass != klass or t.subclass != tuning_mode]
+            wrong = [t for t in tasks if t.klass != klass or t.subclass != subklass]
             if wrong:
                 cur.execute(f"""
                     UPDATE {partition_table}
@@ -206,8 +219,8 @@ class TaskQueue:
                            node_hostname = NULL, started_at = NULL
                      WHERE id = ANY(%s)
                 """, ([t.id for t in tasks],))
-                raise TuningLevelMismatch(
-                    f"fetch_tasks({arch!r}, klass={klass!r}, tuning_mode={tuning_mode!r}) "
+                raise TaskSubclassMismatch(
+                    f"fetch_tasks({arch!r}, klass={klass!r}, subklass={subklass!r}) "
                     f"claimed task_ids={[t.id for t in wrong]} with (class, subclass)="
                     f"{sorted({(t.klass, t.subclass) for t in wrong})}; the class/subclass "
                     f"filter is not doing its job. Released "

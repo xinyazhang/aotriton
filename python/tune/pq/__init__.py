@@ -15,8 +15,8 @@ from .results import save_tuning_result, get_task_results
 
 # NOTE: `Worker` (a PostgreSQL-polling worker loop) used to be exported here
 # from `.worker`, but it was dead code: `Worker.start()`/`run_once()` called
-# `fetch_tasks(self.arch, self.batch_size)` with no `tuning_mode` (which
-# `fetch_tasks` now requires, keyword-only, per modular-tune.md F16) and
+# `fetch_tasks(self.arch, self.batch_size)` with no `klass`/`subklass`
+# (which `fetch_tasks` now requires, keyword-only, per modular-tune.md F16) and
 # `mark_failed(task.id, task.arch, error_msg)` positionally against a
 # keyword-only signature -- both would already raise `TypeError` if ever
 # executed, and nothing in this repo constructs `Worker` (see
