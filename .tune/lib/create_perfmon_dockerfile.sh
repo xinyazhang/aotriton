@@ -163,8 +163,14 @@ FROM ${PERFMON_IMAGE_BASE}
 # Base image has no ROCm and no compiler. git/cmake/ninja are for building the
 # perfmon runner and the AOTriton shim; ca-certificates is needed before pip
 # can reach an https index at all.
+#
+# pkg-config and liblzma-dev are for the AOTriton shim builds, not for perfmon
+# itself: every release tag from 0.9.2b through 0.13b has
+# \`pkg_search_module(LZMA REQUIRED liblzma)\` in its top-level CMakeLists.txt,
+# so without them each subject build dies at configure time.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
       ca-certificates curl git cmake ninja-build build-essential \\
+      pkg-config liblzma-dev \\
       ${PY_APT} \\
  && rm -rf /var/lib/apt/lists/*
 

@@ -63,25 +63,30 @@
 # --- Disclosed design decisions / gaps (none dictated by T13's spec text
 #     word-for-word; each is a first-cut choice or a found spec problem) ---
 #
-# 1. Step 2 ("Shim-only AOTriton build ... read .ci/build-shim.sh and reuse
-#    it") is implemented by SOURCING that tag's own .ci/common-build.sh and
-#    calling its `common_build` function directly with build-shim.sh's own
-#    flags, PLUS `-DAOTRITON_NO_PYTHON=ON` (a real, pre-existing CMake
-#    option -- CMakeLists.txt:113 -- not invented here). build-shim.sh's own
-#    CLI takes only `<target arch>` and cannot express the extra flag or a
-#    per-subject install prefix, so its fixed single-invocation script
-#    itself cannot be called as a subprocess; sourcing the function it
-#    itself calls is the closest thing to "reuse it, don't write a new cmake
-#    invocation" without duplicating cmake's actual argument list by hand.
-#    `AOTRITON_NAME_SUFFIX_OVERRIDE=pmon`, `AOTRITON_BUILD_PATH`, and
-#    `AOTRITON_INSTALL_PATH` are all pre-existing env-var hooks
-#    `common-build.sh` itself already defines (read in full: lines 9-13,
-#    24-27) -- not new surface added by this script.
+# 1. Step 2 (the shim-only AOTriton build) is delegated to a PER-TAG script,
+#    perfmon/scripts/build-<tag>.sh, rather than driven from here.
 #
-# 2. Sourced from the SUBJECT'S OWN tag's worktree (`${SRC_DIR}/.ci/...`),
-#    never this repo's own .ci/ -- an old tag's common-build.sh/CMakeLists
-#    may differ from this branch's, and the shim build must reflect that
-#    tag's own build system, not this branch's.
+#    An earlier version sourced ${SRC_DIR}/.ci/common-build.sh and called
+#    its `common_build` function, on the assumption that every tag ships
+#    that file with a compatible interface. That assumption is false, and
+#    not marginally so: 0.9.2b and 0.10b have NO .ci/ directory whatsoever,
+#    0.11b has common-build.sh but no build-shim.sh, and the signatures of
+#    the ones that do exist drift between releases. A single call site
+#    cannot track that, and every attempt to make it do so would encode the
+#    newest tag's interface and silently break the older ones.
+#
+#    So each tag owns its build script, free to reuse that tag's own .ci/
+#    helpers where they fit and to invoke cmake directly where they do not.
+#    The contract between them is deliberately narrow:
+#        build-<tag>.sh <src_dir> <install_dir> <arch>
+#    with success meaning <install_dir>/include/aotriton/ and
+#    lib/libaotriton*_v2.so exist -- both verified here afterwards, since a
+#    per-tag script returning 0 without producing them is exactly the
+#    failure this indirection could otherwise hide.
+#
+# 2. Those scripts read the SUBJECT'S OWN tag's source (`${SRC_DIR}`), never
+#    this repo's -- an old tag's build system may differ from this branch's,
+#    and the shim build must reflect that tag's, not ours.
 #
 # 3. libperfmon_flash + bin/runner (step 4), by contrast, is ALWAYS
 #    configured from THIS repo's own `modules/flash/perfmon/runner/` and
@@ -308,26 +313,41 @@ build_one_subject() {
     fi
   fi
 
-  # --- Step 2: shim-only AOTriton build (T13 spec item 2) -------------------
-  # Sourced from THIS tag's own .ci/, not this repo's -- see disclosure #2.
-  export AOTRITON_NAME_SUFFIX_OVERRIDE=pmon
-  export AOTRITON_BUILD_PATH="${SUBJECT_DIR}/build-aotriton"
-  export AOTRITON_INSTALL_PATH="${AOTRITON_ROOT}"
+  # --- Step 2: shim-only AOTriton build -------------------------------------
+  # Delegated to a PER-TAG script, perfmon/scripts/build-<tag>.sh.
+  #
+  # The previous version sourced ${SRC_DIR}/.ci/common-build.sh and called
+  # common_build(), which assumed every tag ships that file with HEAD's
+  # interface. It does not: 0.9.2b and 0.10b have no .ci/ directory at all
+  # ("No such file or directory"), 0.11b has common-build.sh but no
+  # build-shim.sh, and the signatures drift across the ones that do exist. One
+  # caller cannot track that; each tag gets its own script, free to reuse that
+  # tag's own .ci/ helpers where they fit and to invoke cmake directly where
+  # they do not.
+  #
+  # Contract, identical for every tag:
+  #     build-<tag>.sh <src_dir> <install_dir> <arch>
+  # producing <install_dir>/include/aotriton/ and lib/libaotriton*_v2.so.
+  TAG_BUILD="${SCRIPT_DIR}/scripts/build-${TAG}.sh"
+  if [ ! -x "${TAG_BUILD}" ]; then
+    echo "[build_subject] ERROR: no build script for tag '${TAG}'." \
+         "Expected ${TAG_BUILD}. Each tag needs its own, because the .ci/" \
+         "build interface is not stable across releases -- see the scripts" \
+         "that do exist in $(dirname "${TAG_BUILD}")." >&2
+    exit 1
+  fi
 
-  echo "[build_subject] sourcing ${SRC_DIR}/.ci/common-build.sh" >&2
-  # shellcheck source=/dev/null
-  . "${SRC_DIR}/.ci/common-build.sh"
-
-  # Exactly build-shim.sh's own flags (disclosure #1) plus -DAOTRITON_NO_PYTHON=ON.
-  common_build "${ARCH}" "shim" \
-    -DAOTRITON_NOIMAGE_MODE=ON \
-    -DAOTRITON_GPU_BUILD_TIMEOUT=0 \
-    -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" \
-    -DAOTRITON_NO_PYTHON=ON
+  echo "[build_subject] ${TAG_BUILD} ${SRC_DIR} ${AOTRITON_ROOT} ${ARCH}" >&2
+  "${TAG_BUILD}" "${SRC_DIR}" "${AOTRITON_ROOT}" "${ARCH}"
 
   if [ ! -d "${AOTRITON_ROOT}/include/aotriton" ]; then
-    echo "[build_subject] ERROR: shim build finished but ${AOTRITON_ROOT}/include/aotriton is missing." >&2
+    echo "[build_subject] ERROR: ${TAG_BUILD} returned success but" \
+         "${AOTRITON_ROOT}/include/aotriton is missing." >&2
+    exit 1
+  fi
+  if ! compgen -G "${AOTRITON_ROOT}/lib/libaotriton*_v2.so" >/dev/null; then
+    echo "[build_subject] ERROR: ${TAG_BUILD} returned success but no" \
+         "${AOTRITON_ROOT}/lib/libaotriton*_v2.so was installed." >&2
     exit 1
   fi
 
