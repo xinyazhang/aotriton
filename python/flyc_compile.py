@@ -643,7 +643,28 @@ def do_compile(args):
         'arch': args.target,
         'num_warps': num_warps,
         'warp_size': warp_size,
-        'shared': meta['shared'],
+        # ZERO, and not the ELF's group_segment_fixed_size -- which is recorded
+        # beside it as `static_lds`, for diagnostics only.
+        #
+        # `shared` is what aotriton.aks2 puts in the AKS2 directory entry, which
+        # TritonKernel::invoke passes as hipModuleLaunchKernel's
+        # `sharedMemBytes`. That parameter is DYNAMIC shared memory: HIP adds it
+        # to whatever the code object already declares statically. The two DSLs
+        # sit on opposite sides of that split --
+        #
+        #     Triton   .group_segment_fixed_size = 0, LDS requested dynamically
+        #     FlyDSL   .group_segment_fixed_size = N, LDS baked into the object
+        #
+        # -- so the value that is right for Triton double-counts for flyc. Above
+        # 32 KB that exceeds gfx1201's 64 KB per-workgroup limit and the dispatch
+        # fails with HSA_STATUS_ERROR_INVALID_ALLOCATION naming the kernel; below
+        # it, it silently halves occupancy. It surfaced as every BLOCK_DMODEL=192
+        # backward case faulting (44416 bytes, so 88832 requested) while 160
+        # (23424 -> 46848) ran fine -- and the forward has carried the same bug
+        # unnoticed, because its largest tiles (256 and 512, at 35072 and 51456)
+        # are not in the Level-0 head-dim set.
+        'shared': 0,
+        'static_lds': meta['shared'],
         'signature': args.signature,
         'hints': args.hints,
         'sidecar': sidecar,

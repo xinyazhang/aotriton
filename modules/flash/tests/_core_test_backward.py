@@ -94,6 +94,19 @@ elif BWD_IMPL == 2:
     NPOT_HEADDIMS = [48, 80, 96, 160, 192]
     M8_HEADDIMS = [8, 24, 40, 56, 72, 88, 96, 120, 152, 184]
     DTYPES = [torch.float16, torch.bfloat16]
+elif BWD_IMPL == 3:
+    # flyc. Full head-dim coverage, same as the split path: both FlyDSL backward
+    # tile ladders (fmha_tuning_bwd_{dkdv,dq}_gfx1201._BLOCK_DMODEL_LADDER) cover
+    # every value of the operator's BLOCK_DMODEL axis, so an off-ladder test head
+    # dim rounds up to a compiled tile and rides the PADDED_HEAD axis exactly as
+    # it does for Triton.
+    #
+    # DTYPES is deliberately NOT set here. The fp32 exclusion is the FORWARD
+    # backend's (see above) -- pinning the backward to flyc while leaving the
+    # forward on Triton is a legitimate mixed run, and fp32 is fine for it.
+    POT_HEADDIMS = [16, 32, 64, 128, 256, 512]
+    NPOT_HEADDIMS = [48, 80, 96, 160, 192, 224]
+    M8_HEADDIMS = [8, 24, 40, 56, 72, 88, 96, 120, 152, 184, 216, 248, 408]
 else:
     assert False, f'Unsupported BWD_IMPL {BWD_IMPL}'
 # Prime head dimensions must be disabled
@@ -190,6 +203,8 @@ Note: for now we cannot really test both fused and split kernel at the same
 #TODO: Let BWDOP determine the real backward op at runtime
 
 def _get_BWDOP_id():
+    if BWD_IMPL == 3:
+        return 'Flyc'
     if BWD_IMPL == 2:
         return 'AITERASM'
     if BWD_IMPL == 1:
@@ -366,7 +381,11 @@ def core_test_op_bwd(request, args, device : int | None = None):
             exit_pytest()
         raise e
 
-@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32])
+# DTYPES, not a third hardcoded copy of the list: this runs the forward, so the
+# flyc fp32 exclusion applies to it exactly as it does to every other forward
+# here. It was spelled out literally and so kept asking for an fp32 kernel that
+# was never built.
+@pytest.mark.parametrize('dtype', DTYPES)
 def test_logsumexp_scaling(dtype):
     REF_VALUE = 2.79018449783325195
     device = 'cuda'
