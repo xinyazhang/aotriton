@@ -243,7 +243,9 @@ case "${ARCH%%:*}" in
       ;;
 esac
 ASSET="aotriton-0.13b-images-amd-${IMAGES_GROUP}.tar.gz"
-IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
+# Under BUILD_DIR, never under INSTALL_DIR: the download is scratch, and
+# everything below the subject dir is rsynced to the GPU workers.
+IMAGES_DL_DIR="${BUILD_DIR}/images-download"
 
 TARBALL_NAME="$(fetch_release_asset "0.13b" "${ASSET}" "${IMAGES_DL_DIR}")"
 install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"

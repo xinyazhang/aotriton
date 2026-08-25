@@ -240,7 +240,9 @@ ninja -C "${BUILD_DIR}" install
 # are GPU code objects rather than ROCm-linked binaries.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/release_asset.sh"
 ASSET="aotriton-0.9.2b-manylinux_2_28_x86_64-rocm7.0-shared.tar.gz"
-IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
+# Under BUILD_DIR, never under INSTALL_DIR: the download is scratch, and
+# everything below the subject dir is rsynced to the GPU workers.
+IMAGES_DL_DIR="${BUILD_DIR}/images-download"
 
 TARBALL_NAME="$(fetch_release_asset "0.9.2b" "${ASSET}" "${IMAGES_DL_DIR}")"
 install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"

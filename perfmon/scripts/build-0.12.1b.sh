@@ -143,11 +143,16 @@ SRC_DIR="$(cd "${SRC_DIR}" && pwd)"
 mkdir -p "${INSTALL_DIR}"
 INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
 
-# Out-of-source build tree, sibling to (never inside) both src_dir and
+# Out-of-source build tree, under TMPDIR rather than anywhere near src_dir or
 # install_dir -- nothing in this tag's shim-build path requires an in-source
 # build; build-shim.sh's own in-source placement is an artifact of its
 # hardcoded relative paths, not a real requirement (see header comment).
-BUILD_DIR="${INSTALL_DIR}.build-0.12.1b-${ARCH}"
+#
+# It used to be "${INSTALL_DIR}.build-...", which is a sibling of <install_dir>
+# but still INSIDE the subject directory that sync_workdir.sh --workload
+# perfmon rsyncs to every GPU worker. A build tree is not a product and has no
+# business being shipped; keep it out of that subtree entirely.
+BUILD_DIR="${AOTRITON_BUILD_PATH:-${TMPDIR:-/tmp}/aotriton-0.12.1b-shim-${ARCH}}"
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -242,7 +247,9 @@ case "${ARCH%%:*}" in
 esac
 
 ASSET="aotriton-0.12.1b-images-amd-${IMAGES_GROUP}.tar.gz"
-IMAGES_DL_DIR="${BUILD_DIR:-${INSTALL_DIR}.build}/images-download"
+# Under BUILD_DIR, never under INSTALL_DIR: the download is scratch, and
+# everything below the subject dir is rsynced to the GPU workers.
+IMAGES_DL_DIR="${BUILD_DIR}/images-download"
 
 TARBALL_NAME="$(fetch_release_asset "0.12.1b" "${ASSET}" "${IMAGES_DL_DIR}")"
 install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"

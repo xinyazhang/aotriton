@@ -151,16 +151,26 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-# Defaults for the two knobs below. ORIGIN follows .ci/releasesuite-git-head.sh's
-# --origin convention; SRC_PREFIX defaults somewhere throwaway so the script is
-# usable standalone, with the caller pointing it at the workdir's scratch/.
+# Defaults for the three knobs below. ORIGIN follows
+# .ci/releasesuite-git-head.sh's --origin convention; SRC_PREFIX and
+# BUILD_PREFIX default somewhere throwaway so the script is usable standalone,
+# with the caller pointing them at the workdir's scratch/.
+#
+# BUILD_PREFIX is deliberately NOT under <install_prefix>. Everything beneath
+# the subject dir is a build PRODUCT that sync_workdir.sh --workload perfmon
+# rsyncs to the GPU workers (with --delete); a cmake build tree there would be
+# shipped to every worker for nothing and would make the subject dir no longer
+# describe just the subject. The per-tag AOTriton shim builds already keep
+# their trees out of the way this way; this is the runner build catching up.
 ORIGIN="https://github.com/ROCm/aotriton.git"
 SRC_PREFIX="${TMPDIR:-/tmp}/perfmon-src/"
+BUILD_PREFIX="${TMPDIR:-/tmp}/perfmon-build/"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --origin)     ORIGIN="$2"; shift 2 ;;
-    --src_prefix) SRC_PREFIX="$2"; shift 2 ;;
+    --origin)       ORIGIN="$2"; shift 2 ;;
+    --src_prefix)   SRC_PREFIX="$2"; shift 2 ;;
+    --build_prefix) BUILD_PREFIX="$2"; shift 2 ;;
     --) shift; break ;;
     -*) echo "Error: unrecognized option: $1" >&2; exit 1 ;;
     *) break ;;
@@ -180,6 +190,11 @@ if [ "$#" -lt 3 ]; then
   echo '  --src_prefix:     where shallow clones go; each tag lands in' >&2
   echo '                    <src_prefix><tag>/. Trailing slash included.' >&2
   echo "                    (default: ${SRC_PREFIX})" >&2
+  echo '  --build_prefix:   where cmake build trees go; each subject builds in' >&2
+  echo '                    <build_prefix><arch>/<tag>/. Never under' >&2
+  echo '                    <install_prefix>: that subtree is rsynced to the' >&2
+  echo '                    GPU workers and should hold products only.' >&2
+  echo "                    (default: ${BUILD_PREFIX})" >&2
   exit 1
 fi
 
@@ -364,7 +379,8 @@ build_one_subject() {
 
   # --- Step 4: libperfmon_flash@<subject> + bin/runner (T13 spec item 4) ---
 
-  FLASH_BUILD_DIR="${SUBJECT_DIR}/build-flash"
+  FLASH_BUILD_DIR="${BUILD_PREFIX}${ARCH}/${TAG}/flash"
+  mkdir -p "${FLASH_BUILD_DIR}"
   echo "[build_subject] configuring modules/flash/perfmon/runner against" \
        "AOTRITON_ROOT=${AOTRITON_ROOT} PERFMON_CORE_ROOT=${PERFMON_CORE_ROOT}" >&2
   cmake -S "${REPO_ROOT}/modules/flash/perfmon/runner" -B "${FLASH_BUILD_DIR}" \

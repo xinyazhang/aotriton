@@ -18,9 +18,10 @@
 # sync_workdir.sh --workload perfmon knows how to ship. build_subject.sh is
 # handed that path as a plain install prefix; it has no notion of a workdir.
 #
-# Release sources are shallow-cloned from upstream into scratch/perfmon/src/,
-# which sync_workdir excludes -- so a source tree per tag never rides along to
-# the GPU workers.
+# Release sources are shallow-cloned from upstream into scratch/perfmon/src/
+# and cmake build trees go to scratch/perfmon/build/, both of which
+# sync_workdir excludes -- so neither a source tree nor a build tree per tag
+# ever rides along to the GPU workers. installed/ holds products only.
 #
 # All tags for one arch go in a single invocation: build_subject.sh validates
 # the shared, ROCm-scoped libperfmon_core once for the batch instead of once
@@ -167,6 +168,7 @@ jobid=$(tsp docker run --rm \
   bash /wkdir/aotriton.src/perfmon/build_subject.sh \
        --origin "$PERFMON_ORIGIN" \
        --src_prefix /wkdir/scratch/perfmon/src/ \
+       --build_prefix /wkdir/scratch/perfmon/build/ \
        "$ARCH" /wkdir/installed/perfmon/ "${TAGS[@]}")
 echo "Job ID: $jobid"
 if [ "$(tsp -s "$jobid")" = "queued" ]; then
@@ -181,5 +183,7 @@ else
     "tsp docker run --rm --network=host --user \$(id -u):\$(id -g)"\
 " --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir $PERFMON_IMAGE"\
 " bash /wkdir/aotriton.src/perfmon/build_subject.sh --origin $PERFMON_ORIGIN"\
-" --src_prefix /wkdir/scratch/perfmon/src/ $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
+" --src_prefix /wkdir/scratch/perfmon/src/"\
+" --build_prefix /wkdir/scratch/perfmon/build/"\
+" $ARCH /wkdir/installed/perfmon/ ${TAGS[*]}"
 fi
