@@ -107,6 +107,14 @@ class MetroShell:
     """A parsed @ati.metro_kernel backend: its MetroSpec + the backend enum-name. The
     sub-kernel NAMES (plan Call strings) are the relocation the linker binds.
 
+    `name` is the DECLARED backend name (`@ati.backend(i, metro_fwd, 'triton')` ->
+    'triton'), which becomes the MetroKernel's NAME and hence its `kMetro_*` enum
+    member. It is NOT this shell's registry key: the declared name is per-OPERATOR
+    and two operators may reasonably use the same one (op_attn_fwd and op_attn_bwd
+    both have a backend called 'flyc'), while `compiled.metros` is per-FAMILY.
+    `visit_metro` keys on the metro def's own name instead; see `_metro_key` in
+    linker.py for how a cite target's `<op>.<backend>` pair maps back to it.
+
     `precedence` is the optional @ati.hints.union_precedence order (highest priority
     first) used when sub-kernel bindings collide — for a whole-metro @ati.cite gap
     donor and the operator params-struct union. When absent it is the call order."""
@@ -162,7 +170,7 @@ class CompiledFamily:
     def __init__(self, family):
         self.family = family
         self.kernels = {}      # def-name -> KernelShell
-        self.metros = {}       # backend enum-name -> MetroShell
+        self.metros = {}       # metro def-name -> MetroShell (see MetroShell.name)
         self.affines = {}      # affine NAME -> AffineDecl
         self.flycs = {}        # flyc NAME -> FlycDecl, reached as an @ati.backend
         self.operators = {}    # op-name -> OperatorShell
@@ -241,10 +249,19 @@ class FamilyCompiler:
             # which asserts a triton KernelDecl, so a metro with a flyc step
             # failed on the assert rather than anywhere informative.
             self.record(sub_def, f'metro {b.name!r} sub-kernel')
-        if b.name not in self.compiled.metros:
-            self.compiled.metros[b.name] = MetroShell(b.name, plan, sub_names,
-                                                      precedence=plan.precedence)
-        return (b.index, 'metro', b.name, b.name)
+        # Keyed by the metro DEF's name, not the declared backend name: the
+        # registry is per-family while a declared name is per-operator, so two
+        # operators each declaring a backend called 'flyc' would otherwise
+        # collide -- and collide SILENTLY, because the `not in` guard below
+        # would keep the first registration and hand the second operator the
+        # first one's metro. Returned as the ref's `key` so _backend_objs
+        # resolves the right shell; `b.name` stays the ref's `name`, which is
+        # what becomes the MetroKernel's NAME and its kMetro_* enum member.
+        key = plan.name
+        if key not in self.compiled.metros:
+            self.compiled.metros[key] = MetroShell(b.name, plan, sub_names,
+                                                   precedence=plan.precedence)
+        return (b.index, 'metro', key, b.name)
 
     def visit_kernel(self, b):
         return (b.index, 'kernel', self.record_kernel(b.obj), b.name)
