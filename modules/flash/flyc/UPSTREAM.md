@@ -20,15 +20,24 @@ git -C <flydsl checkout> branch --show-current
 rewrites" below are reapplied)
 
 ```
-flash_attn_func_gfx1201_aiw.py
-fmha_abi_gfx1201.py
-fmha_common_gfx1201.py
-fmha_tuning_gfx1201.py
-philox.py
+flash_attn_func_gfx1201_aiw.py      forward
+fmha_tuning_gfx1201.py              forward tuning policy
+fmha_bwd_dkdv_gfx1201_kernel.py     backward dK/dV
+fmha_tuning_bwd_dkdv_gfx1201.py     backward dK/dV tuning policy
+fmha_bwd_dq_gfx1201_kernel.py       backward dQ/dB
+fmha_tuning_bwd_dq_gfx1201.py       backward dQ/dB tuning policy
+fmha_abi_gfx1201.py                 shared host ABI
+fmha_common_gfx1201.py              shared device helpers
+philox.py                           shared PRNG
 ```
 
 Copied straight from `kernels/attention/parity/<basename>` to
 `modules/flash/flyc/<basename>` with no renaming.
+
+The four tuning modules import nothing but `dataclasses`, which is what lets the
+ATI descriptions call `resolve_knobs` at GENERATE time without pulling in flydsl.
+Keep it that way on re-sync: a flydsl import appearing in one of them breaks the
+code generator, not just the build.
 
 **Not vendored, and must never be**: `kernels/common/*` (`buffer_ops.py`,
 `mem_ops.py`, `kernels_common.py`, `layout_utils.py`, `utils.py`,
@@ -40,10 +49,10 @@ needs to change — not any file in this directory.
 
 Also not vendored: `gfx1201_standalone.py` (existed only to put the FlyDSL repo
 root on `sys.path`; replaced by the interim described below),
-`dropout_mask_gfx1201.py`, the three bwd kernels
-(`fmha_bwd_{dkdv,dq,fuse}_gfx1201_{kernel,interface}.py`),
-`flash_attn_func_gfx1201_interface.py` (torch-only), `tooling/`, and every
-`test_*.py`.
+`dropout_mask_gfx1201.py`, the FUSED backward
+(`fmha_bwd_fuse_gfx1201_kernel.py` + `fmha_tuning_bwd_fuse_gfx1201.py`), every
+`*_interface.py` (torch-only — they are the JIT entry points, and AOTriton's C++
+shim is what replaces them), `tooling/`, and every `test_*.py`.
 
 ## Task 0 interim — how `kernels.common` resolves today
 
@@ -85,6 +94,17 @@ table's right column changes.
 | `flash_attn_func_gfx1201_aiw.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
 | `fmha_common_gfx1201.py` | `from gfx1201_standalone import buffer_ops, kernels_common, wmma_ops` | `from kernels.common import buffer_ops, kernels_common`<br>`import flyc_polyfill as wmma_ops` | `from flydsl.kernels.common import buffer_ops, kernels_common`<br>`from flydsl.kernels.common.mma import wmma_ops` |
 | `fmha_common_gfx1201.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+| `fmha_bwd_dkdv_gfx1201_kernel.py` | `from gfx1201_standalone import buffer_ops` | `from kernels.common import buffer_ops` | `from flydsl.kernels.common import buffer_ops` |
+| `fmha_bwd_dkdv_gfx1201_kernel.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+| `fmha_bwd_dq_gfx1201_kernel.py` | `from gfx1201_standalone import buffer_ops` | `from kernels.common import buffer_ops` | `from flydsl.kernels.common import buffer_ops` |
+| `fmha_bwd_dq_gfx1201_kernel.py` | `from gfx1201_standalone import kernels_common as common_kernels` | `from kernels.common import kernels_common as common_kernels` | `from flydsl.kernels.common import kernels_common as common_kernels` |
+| `fmha_bwd_dq_gfx1201_kernel.py` | `from gfx1201_standalone import utils as common_utils` | `import flyc_polyfill as common_utils` | `from flydsl.kernels.common import utils as common_utils` |
+
+The two backward kernels take `smax` (dK/dV) and `smax`/`smin` (dQ) from
+`common_utils` — both already in `flyc_polyfill.py` for the forward, so the
+backward needed no new polyfill entry. `buffer_ops.get_element_ptr` and
+`kernels_common.dtype_to_elem_type` are both present in `v0.3.1` and so are NOT
+rewritten, same rule as the forward's.
 
 `wmma_ops` moved from `flash_attn_func_gfx1201_aiw.py` to `fmha_common_gfx1201.py` in the
 `93d8d497` re-sync (upstream's "the shared prologue moves to fmha_common"); the set of
@@ -244,11 +264,40 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
 
 ## Re-sync procedure
 
-1. `cp <flydsl checkout>/kernels/attention/parity/{flash_attn_func_gfx1201_aiw,fmha_abi_gfx1201,fmha_common_gfx1201,fmha_tuning_gfx1201,philox}.py modules/flash/flyc/`
-2. Reapply the four import rewrites (1a) and the two torch-laziness edits (1b)
-   above.
-3. Re-run Gate 1 and Gate 3 from `PLAN-PHASE1.md`.
-4. Update the commit hash at the top of this file.
+1. Copy every file in the "Vendored files" list from
+   `<flydsl checkout>/kernels/attention/parity/` into `modules/flash/flyc/`.
+2. Reapply the import rewrites (1a) and the torch-laziness edits (1b) above.
+   `diff` each file against its upstream original afterwards: the diff must be
+   EXACTLY those tables and nothing else.
+3. **Check the kernarg order**, which is the expensive failure mode. The
+   descriptions in `modules/flash/aot/flyc_*.py` declare it and are
+   order-sensitive; a reorder upstream needs them re-ordered here. The cheap
+   check is to link the family and dump the launch-argument vector:
+
+   ```python
+   from aotriton.codegen.linker import Linker
+   k, o, a, f = Linker('modules').link_all_families()
+   fl = [x for x in f if x.NAME == 'flyc_bwd_dkdv'][0]
+   for la in fl.iter_launch_arguments():
+       print(la.kind, la.aname, la.expr)
+   ```
+
+   An undeclared kernel parameter asserts; a *misdeclared* one does not, so read
+   the names against the `@flyc.kernel` def.
+4. **Check `block_n` for dK/dV.** `modules/flash/aot/flyc_bwd_dkdv.py` mirrors
+   the builder's `BLOCK_N = ROWS_PER_WAVE * NUM_TEAMS` derivation, because it is
+   not a `resolve_knobs` output and the grid needs it. If that expression moves
+   upstream, the mirror is wrong and the symptom is a wrong grid, not a build
+   failure.
+5. Re-run Gate 1 and Gate 3 from `PLAN-PHASE1.md`.
+6. Update the commit hash at the top of this file.
+
+**A re-sync needs a CLEAN build to test.** Editing a file in this directory does
+not invalidate any `.hsaco`: `v3src/CMakeLists.txt`'s `add_custom_command` for
+each kernel image lists only `DEPENDS aotriton_venv_flydsl` (and
+`aotriton_venv_triton` for Triton), never the source. An incremental build after
+a re-sync therefore regenerates the C++ shim against the new ABI and keeps the
+old code objects, which is a silent wrong-kernarg launch rather than an error.
 
 ## Open FlyDSL issues, verified against upstream
 
