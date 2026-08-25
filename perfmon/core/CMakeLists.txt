@@ -115,20 +115,49 @@ endif()
 # exists to prevent: someone adding `${AOTRITON_ROOT}/include` to THIS
 # target's include path the way T12's adapter_v3.cc CMakeLists.txt
 # legitimately does for the family library, one level up.
+# Tests what an include path CONTAINS, not what it is called. The original
+# version matched the substring "aotriton" against the path text, which says
+# nothing about whether AOTriton headers are reachable: it passed for an
+# install prefix named /opt/perf/include that holds aotriton/flash.h, and
+# failed for this very directory once the repo was checked out as
+# `aotriton.src` -- perfmon/core's own source dir then read
+# /wkdir/aotriton.src/perfmon/core and tripped the guard, which is how the
+# build node first hit this.
+#
+# Two checks, matching the two ways AOTriton headers actually arrive:
+#   1. an install prefix's include dir, recognised by aotriton/config.h;
+#   2. this repo's own include/ or v3src/, by resolved path.
 function(perfmon_assert_no_aotriton_includes target)
   get_target_property(_incs ${target} INCLUDE_DIRECTORIES)
   if(NOT _incs)
     return()
   endif()
+
+  get_filename_component(_repo_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." REALPATH)
+  set(_forbidden_roots "${_repo_root}/include" "${_repo_root}/v3src")
+
   foreach(_inc IN LISTS _incs)
-    string(TOLOWER "${_inc}" _inc_lower)
-    if(_inc_lower MATCHES "aotriton")
+    get_filename_component(_inc_real "${_inc}" REALPATH)
+
+    # (1) Any directory holding AOTriton's own public headers.
+    if(EXISTS "${_inc_real}/aotriton/config.h" OR
+       EXISTS "${_inc_real}/aotriton/flash.h")
       message(FATAL_ERROR
-        "[perfmon_core] '${target}' has an AOTriton-looking include path on "
-        "its compile line: ${_inc}. libperfmon_core must stay AOTriton-"
-        "neutral (rev0 D4) -- that property is what makes timing comparable "
-        "across subjects.")
+        "[perfmon_core] '${target}' can see AOTriton headers via ${_inc} "
+        "(it contains aotriton/). libperfmon_core must stay AOTriton-neutral "
+        "(rev0 D4) -- that property is what makes timing comparable across "
+        "subjects.")
     endif()
+
+    # (2) This repo's own AOTriton sources, which carry no aotriton/ subdir.
+    foreach(_root IN LISTS _forbidden_roots)
+      if(_inc_real STREQUAL "${_root}" OR _inc_real MATCHES "^${_root}/")
+        message(FATAL_ERROR
+          "[perfmon_core] '${target}' includes ${_inc}, which is inside "
+          "AOTriton's own ${_root}. libperfmon_core must stay "
+          "AOTriton-neutral (rev0 D4).")
+      endif()
+    endforeach()
   endforeach()
 endfunction()
 
