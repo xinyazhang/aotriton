@@ -44,6 +44,40 @@
 // atomic counter, the prepare() stream gap, and the documented
 // simplifications). Not restated here; see that file.
 //
+// --- KNOWN GAP, DEFERRED: the AITER ASM backend at this tag ---------------
+// The backend counts this file reports come from backend_count_forceable(),
+// which encodes modules/flash/tune/level_op.py's HEAD-era table (attn_fwd
+// 2/1, attn_bwd 3/2). That table is very likely WRONG at this tag, in both
+// directions, and neither has been checked on hardware:
+//
+//   attn_bwd backend 2 (kSlimAffine_AiterFmhaV3Bwd). At 0.11b/0.11.2b --
+//     and ONLY at those two tags -- `aiter_bwd` is a SEPARATE exported
+//     entry point in include/aotriton/flash.h, alongside `attn_bwd`. It is
+//     absent at 0.10b (no AITER at all) and absent again from 0.12.1b
+//     onward, where it was folded into attn_bwd's own backend dispatch.
+//     That strongly suggests AITER is not in this tag's OpAttnBwdContext
+//     backend enum, i.e. driving it through `attn_bwd` with
+//     force_backend_index = 2 -- which is what launch() below does -- does
+//     not reach it. Supporting it here means calling
+//     `flash::aiter_bwd(params, kVersion, stream, &options)` for index 2
+//     instead. Note aiter_bwd.cc at this tag opens with
+//     `if (!in.DQ_ACC) return hipErrorInvalidMemcpyDirection;`, so the
+//     cookie/acquire pair set up in build_bwd() is a prerequisite either
+//     way.
+//
+//   attn_fwd backend 1 (kSlimAffine_AiterFmhaV3Fwd). This tag's flash.h
+//     carries `aiter_fwd` COMMENTED OUT under "NOTE: DEFERRED TO NEXT
+//     RELEASE", so the forward AITER backend does not exist here at all.
+//     Reporting 2 forward backends on gfx942/gfx950 is therefore probably
+//     one too many.
+//
+// Until both are resolved, treat this tag's backend axis as unverified:
+// index 2 of attn_bwd may error out or silently measure a Triton backend,
+// and index 1 of attn_fwd likewise. The fix is small (a per-tag backend
+// count plus an aiter_bwd call for index 2) but it needs the tag's real
+// backend enum to confirm, which means checking on hardware -- deliberately
+// deferred rather than guessed at.
+//
 // NEVER RUN ON HARDWARE. Written against 0.11.2b's headers read in full;
 // the only adapter validated on a GPU is head/adapter.cc (T14).
 

@@ -74,6 +74,13 @@ bool current_gpu_is_942_or_950();
 // 2/1, attn_bwd 3/2). Only meaningful for tags whose attn_options can
 // actually force a backend index -- 0.9.2b and 0.10b cannot, and their
 // adapters report 1 instead of calling this.
+//
+// CAVEAT: this table is HEAD's. It is known to be unverified at the 0.11
+// line, where the AITER ASM backends are reached differently (or, for the
+// forward one, do not exist yet) -- see the "KNOWN GAP, DEFERRED" block in
+// 0.11.2b/adapter.cc. A tag that needs different counts should not extend
+// this function with tag conditionals; it should report its own, the way
+// 0.9.2b and 0.10b already do.
 int backend_count_forceable(int32_t iface, bool is_942_950);
 
 struct Shape4 {
