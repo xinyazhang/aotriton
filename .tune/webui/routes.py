@@ -760,41 +760,35 @@ def stream_output(action_id):
 
 @bp.route('/api/actions/<action_id>/output', methods=['GET'])
 def get_action_output(action_id):
-    """Get action output as HTML for polling (incremental)"""
+    """Get new action output as plain text, resuming from a sequence cursor.
+
+    The cursor is a monotonic per-line sequence number assigned by the tracker,
+    never an index into a list.  Indices into a merged stdout+stderr list are
+    unusable as a cursor because a newly captured stdout line shifts every
+    stderr line already delivered, which replays old text and drops new text.
+    """
     try:
         tracker = current_app.tracker_registry.get(action_id)
         if not tracker:
             return '(tracker not found)', 404
 
-        # Get offset from query parameter
-        offset = int(request.args.get('offset', 0))
+        try:
+            cursor = int(request.args.get('offset', 0))
+        except (TypeError, ValueError):
+            cursor = 0
 
-        output = tracker.get_output()
+        lines, chunk_start, next_cursor, dropped = tracker.read_output(cursor)
 
-        # Combine stdout and stderr with line numbers to maintain order
-        all_lines = []
-        for i, line in enumerate(output['stdout']):
-            all_lines.append((i, 'stdout', line))
-        for i, line in enumerate(output['stderr']):
-            all_lines.append((i, 'stderr', line))
+        if dropped:
+            lines = [f'[... {dropped} earlier line(s) dropped from the output buffer ...]'] + lines
 
-        # Get only new lines starting from offset
-        new_lines = all_lines[offset:]
-
-        # If no new lines
-        if not new_lines:
-            if offset == 0 and output['status'] in ['completed', 'failed']:
-                return '(no output)\n'
-            return ''  # No new content
-
-        # Build plain text for new lines only
-        lines_text = []
-        for idx, line_type, line in new_lines:
-            lines_text.append(line)
-
-        # Return new lines with updated offset in response header
-        response = '\n'.join(lines_text) + '\n'
-        return response, 200, {'X-Output-Offset': str(len(all_lines))}
+        body = ''.join(line + '\n' for line in lines)
+        headers = {
+            'X-Output-From': str(chunk_start),
+            'X-Output-Offset': str(next_cursor),
+            'Cache-Control': 'no-store',
+        }
+        return body, 200, headers
 
     except Exception as e:
         import traceback
