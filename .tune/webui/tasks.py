@@ -989,8 +989,10 @@ def set_perfmon_rocm(workdir, rocm: str):
 # AOTriton tags perfmon measures by default -- perfmon-rev0.md §4's table,
 # minus HEAD: HEAD has no published kernel images, so it would need a full
 # AOTriton build rather than the shim build build_subject.sh performs.
-# One row per minor line; patch releases within a line share an adapter.
-PERFMON_DEFAULT_TAGS = ['0.9.2b', '0.10b', '0.11b', '0.11.2b', '0.12.1b', '0.13b']
+# One row per minor line; patch releases within a line share an adapter, so
+# only the newest patch of each line is a default -- 0.11.2b stands in for the
+# 0.11 line, and 0.11b is not measured separately.
+PERFMON_DEFAULT_TAGS = ['0.9.2b', '0.10b', '0.11.2b', '0.12.1b', '0.13b']
 
 # A git tag, conservatively: no whitespace or shell metacharacters, since it is
 # passed to `git worktree add` and interpolated into a subject id.
