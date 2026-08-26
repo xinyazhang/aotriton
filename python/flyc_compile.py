@@ -328,6 +328,61 @@ def synthesise_args(jf):
     return [_operand_for(p) for p in _launcher_signature(jf).parameters.values()]
 
 
+# Natural (unpacked, no interleaving/padding) byte size of each annotation
+# `_operand_for` knows how to synthesise a value for. `Stream` is deliberately
+# absent: it selects the host-side HIP stream a launch goes on, never a
+# kernarg -- see `_expected_kernarg_size`'s docstring.
+_KERNARG_TYPE_SIZE = {
+    'Pointer': 8,
+    'Int32': 4,
+    'Int64': 8,
+    'Float32': 4,
+}
+
+
+def _expected_kernarg_size(jf) -> int:
+    """The kernarg segment size this launcher's *declared* signature predicts,
+    to compare against `.kernarg_segment_size` read back from the compiled
+    ELF (item H): a real per-functional launch builds its
+    `std::vector<void*>` positionally off the same declared parameter list
+    (`ir/flyc/kdesc.py`'s `iter_launch_arguments`, generator side) and hands
+    it to `hipModuleLaunchKernel` unchecked, so a silent drift between "what
+    the shim packs" and "what the compiled kernel actually expects" -- e.g. a
+    stale `@ati.tensor`/`@ati.scalar` stack, a kernarg reorder that outran the
+    generator's `real_param_order` re-sync, or a parameter the shim forgot --
+    would corrupt every argument after the first mismatch rather than fail
+    loudly. Catching it here, at ahead-of-time compile time against the real
+    ELF, is strictly earlier and cheaper than catching it at a GPU launch.
+
+    The formula is one flat sum of natural per-parameter sizes
+    (`_KERNARG_TYPE_SIZE`), with the trailing `Stream` parameter (the host
+    stream selector, never part of the kernel's own ABI) excluded --
+    empirically validated against two independent real compiles of
+    `flyc_attn_fwd` for gfx1201 (opposite BLOCK_DMODEL/CAUSAL_TYPE/dropout/
+    PADDED_HEAD choices): both produced a real `.kernarg_segment_size` of
+    exactly 296 bytes, matching `14*8 (Pointer) + 12*4 (Int32) + 16*8 (Int64)
+    + 2*4 (Float32) = 296` computed from `flash_attn_func_aiw_kernel`'s
+    45-parameter `_launcher_signature`, with no alignment padding needed --
+    the real ELF groups parameters by kind (pointers together, scalars
+    together) to avoid it, and a flat sum is exact either way. Any annotation
+    `_KERNARG_TYPE_SIZE` does not know about is an unhandled case, not a
+    silent 0 -- raise the same way `_operand_for` does.
+    """
+    total = 0
+    for p in _launcher_signature(jf).parameters.values():
+        name = getattr(p.annotation, '__name__', str(p.annotation))
+        if name == 'Stream':
+            continue
+        if name not in _KERNARG_TYPE_SIZE:
+            raise NotImplementedError(
+                f"_expected_kernarg_size: no known kernarg size for parameter "
+                f"{p.name!r}: fx.{name}. Add it to _KERNARG_TYPE_SIZE once its "
+                f"real size is known (see _operand_for for the same kind of gap)."
+            )
+        total += _KERNARG_TYPE_SIZE[name]
+    return total
+
+
 class _AmbiguousObject(Exception):
     """Raised by `_find_unique` when a closure/container walk finds zero or
     several instances of the wanted class instead of exactly one."""
@@ -513,6 +568,7 @@ _RE_MACHINE = re.compile(r'Machine:\s*(\S+)')
 _RE_FLAGS = re.compile(r'Flags:\s*(0x[0-9a-fA-F]+),\s*(\S+)')
 _RE_KERNEL_NAME = re.compile(r'^\s*\.name:\s*(\S+)', re.MULTILINE)
 _RE_GROUP_SEGMENT = re.compile(r'^\s*\.group_segment_fixed_size:\s*(\d+)', re.MULTILINE)
+_RE_KERNARG_SEGMENT = re.compile(r'^\s*\.kernarg_segment_size:\s*(\d+)', re.MULTILINE)
 
 
 def _readelf_report(readelf: Path, hsaco_path: Path) -> str:
@@ -524,23 +580,27 @@ def _readelf_report(readelf: Path, hsaco_path: Path) -> str:
 
 
 def _elf_metadata(report: str) -> dict:
-    """Machine/flags/kernel-symbol/LDS facts read back from the ELF itself.
+    """Machine/flags/kernel-symbol/LDS/kernarg facts read back from the ELF
+    itself.
 
     `--notes`' AMDGPU Metadata (a note the compiler embeds, not something this
-    driver invents) already carries the kernel's public name and its LDS
-    (`group_segment_fixed_size`) in one place, so no hand-rolled ELF/symtab
-    parsing is needed for either.
+    driver invents) already carries the kernel's public name, its LDS
+    (`group_segment_fixed_size`) and its kernarg segment size
+    (`kernarg_segment_size`) in one place, so no hand-rolled ELF/symtab
+    parsing is needed for any of them.
     """
     machine = _RE_MACHINE.search(report)
     flags = _RE_FLAGS.search(report)
     kernel_name = _RE_KERNEL_NAME.search(report)
     shared = _RE_GROUP_SEGMENT.search(report)
+    kernarg_size = _RE_KERNARG_SEGMENT.search(report)
     return dict(
         machine=machine.group(1) if machine else None,
         flags_hex=flags.group(1) if flags else None,
         flags_arch=flags.group(2) if flags else None,
         kernel_name=kernel_name.group(1) if kernel_name else None,
         shared=int(shared.group(1)) if shared else None,
+        kernarg_size=int(kernarg_size.group(1)) if kernarg_size else None,
     )
 
 
@@ -561,7 +621,7 @@ def _expected_gpu_symbol(node) -> str:
     return node.name
 
 
-def _verify_elf(meta: dict, target: str, report: str, node=None):
+def _verify_elf(meta: dict, target: str, report: str, node=None, expected_kernarg_size=None):
     if meta['machine'] != 'EM_AMDGPU':
         raise RuntimeError(f"--verify: expected Machine EM_AMDGPU, got {meta['machine']!r}. Full report:\n{report}")
     if meta['flags_arch'] != target:
@@ -584,6 +644,26 @@ def _verify_elf(meta: dict, target: str, report: str, node=None):
                 f"did not take effect (e.g. `kf` was the wrong KernelFunction, "
                 f"see kernel_function_of), or FlyDSL's `_emit_kernel` stopped "
                 f"honouring an explicit `_name` verbatim.\n\nFull report:\n{report}"
+            )
+    if expected_kernarg_size is not None:
+        if meta['kernarg_size'] != expected_kernarg_size:
+            raise RuntimeError(
+                f"--verify: this hsaco's real .kernarg_segment_size is "
+                f"{meta['kernarg_size']!r} bytes, but the launcher's declared "
+                f"signature (`_launcher_signature`, excluding the trailing "
+                f"`Stream` parameter) predicts {expected_kernarg_size} bytes "
+                f"(see _expected_kernarg_size).\n\n"
+                f"The generated shim builds its `std::vector<void*>` "
+                f"positionally off that same declared parameter list "
+                f"(ir/flyc/kdesc.py's iter_launch_arguments) and hands it to "
+                f"hipModuleLaunchKernel unchecked, so a mismatch here means "
+                f"every launch of this kernel would corrupt its arguments at "
+                f"runtime rather than fail loudly. Likely causes: a stale "
+                f"`@ati.tensor`/`@ati.scalar` stack on the description side, a "
+                f"kernarg reorder in the vendored FlyDSL kernel that outran "
+                f"`real_param_order`'s re-sync, or a parameter "
+                f"`_KERNARG_TYPE_SIZE`/`_operand_for` do not yet know how to "
+                f"size.\n\nFull report:\n{report}"
             )
 
 
@@ -660,7 +740,9 @@ def do_compile(args):
     report = _readelf_report(readelf, out_path.with_suffix('.hsaco'))
     meta = _elf_metadata(report)
     if args.verify:
-        _verify_elf(meta, args.target, report, node)
+        expected_kernarg_size = _expected_kernarg_size(jf)
+        _verify_elf(meta, args.target, report, node,
+                    expected_kernarg_size=expected_kernarg_size)
 
     # aotriton.aks2's loader computes the AKS2 directory entry's block_threads
     # as `j['num_warps'] * j['warp_size']` -- the same key shape python/compile.py
