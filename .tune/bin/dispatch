@@ -17,17 +17,20 @@ AOTRITON_ROOT="$(cd "$TUNE_ROOT/.." && pwd)"
 
 print_help_and_exit() {
   echo "Error: Missing arguments" >&2
-  echo "Usage: $0 <module> <workdir> [module-options]" >&2
-  echo "       For more details, create a workdir and call $0 <module> <workdir> -h" >&2
+  echo "Usage: $0 <workdir> <module> <workload> [module-options]" >&2
+  echo "       For more details, create a workdir and call $0 <workdir> <module> <workload> -h" >&2
   exit 1
 }
 
-# Get module and workdir from first two arguments
-if [ "$#" -lt 2 ]; then
+# Get workdir, module and workload from first three arguments
+if [ "$#" -lt 3 ]; then
   print_help_and_exit
 fi
 
-WORKDIR="$2"
+WORKDIR="$1"
+MODULE="$2"
+WORKLOAD="$3"
+shift 3
 
 # Validate workdir
 if [ ! -d "$WORKDIR" ]; then
@@ -89,8 +92,12 @@ if [ -f "$WORKDIR/config.rc" ]; then
   export POSTGRES_USER POSTGRES_PASSWORD CELERY_SERVICE_HOST POSTGRES_PORT
 fi
 
-# Execute the actual dispatch module with the venv python. `cd` first so
-# aotriton.tune.registry's modules_dir default (AOTRITON_MODULES_DIR env var,
-# else <cwd>/modules) resolves to $AOTRITON_ROOT/modules.
+# Execute the actual dispatch module with the venv python. `--module` is
+# resolved to a full path here ($AOTRITON_ROOT/modules/$MODULE) and passed
+# explicitly, so dispatch_tasks.py never has to guess a modules_dir -- the
+# `cd` below is no longer needed for module resolution; it just keeps
+# relative paths in "$@" (module-options) anchored at the repo root, as
+# before.
 cd "$AOTRITON_ROOT"
-exec "$VENV_PYTHON" -m aotriton.tune.dispatch_tasks "$@"
+exec "$VENV_PYTHON" -m aotriton.tune.dispatch_tasks \
+  --workdir "$WORKDIR" --module "$AOTRITON_ROOT/modules/$MODULE" --workload "$WORKLOAD" -- "$@"

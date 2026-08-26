@@ -60,19 +60,6 @@ def get_db_connection_params():
         'password': postgres_password,
     }
 
-def load_module(module_name: str):
-    """Load tuning module and return the module class instance."""
-    from .registry import load_tune_module
-    try:
-        mod = load_tune_module(module_name)
-    except ImportError as e:
-        sys.exit(f"Error: Failed to import module '{module_name}': {e}")
-    # Module __init__.py should export TuneDesc as the main class
-    if not hasattr(mod, 'TuneDesc'):
-        sys.exit(f"Error: Module '{module_name}' has no class 'TuneDesc'")
-    module_class = getattr(mod, 'TuneDesc')
-    return module_class()
-
 def get_parameter_choices(module_instance):
     """
     Get parameter choices from module.
@@ -136,7 +123,7 @@ def get_registered_archs(workdir: Path) -> list[str]:
     finally:
         conn.close()
 
-def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, verbose: bool = False):
+def get_completed_tasks(module_name: str, module_instance, subklass: str, verbose: bool = False):
     """
     Query PostgreSQL for completed tasks from task_queue.
 
@@ -146,10 +133,14 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
     Args:
         module_name: Name of the tuning module (e.g., 'flash')
         module_instance: Module instance with ENTRY_CLASS defining field structure
-        tuning_mode: 'kernel' or 'op' -- filters on the denormalized
+        subklass: 'kernel' or 'op' -- filters on the denormalized
             task_queue.subclass column so kernel-level and op-level
             completed tasks (which may share the same module name and entry
-            fields) are never conflated.
+            fields) are never conflated. D09: this is `args.workload`
+            (formerly the removed tuning-mode flag -- see
+            `build_base_parser()`); named `subklass` here, not that old
+            flag's name, since it is really `TaskQueue.completed_task_
+            configs`'s `subklass` parameter passed straight through.
         verbose: Print debug info
 
     Raises exception if connection fails - caller should handle errors.
@@ -177,7 +168,7 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
     try:
         task_queue = TaskQueue(conn)
         task_configs = task_queue.completed_task_configs(
-            module_name, klass='tune_kernel', subklass=tuning_mode)
+            module_name, klass='tune_kernel', subklass=subklass)
 
         completed_configs = {make_hashable_key(entry_field_names, tc)
                               for tc in task_configs}
@@ -221,7 +212,11 @@ class TuneEntrySource:
         task_config = {
             "arch": arch,
             "module": self.module_name,
-            "tuning_level": self.args.tuning_mode,
+            # D09: the old tuning-mode flag is gone; `--workload` (Phase 1)
+            # already takes exactly the values 'kernel'/'op' for a tuning
+            # workload, identical to WORKLOAD_TASK_SELECTOR's subclass for
+            # those two.
+            "tuning_level": self.args.workload,
             "entry": asdict(entry),
         }
         # Add max_hsaco if specified
@@ -256,8 +251,10 @@ def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
     completed_configs = set()
     if args.skip_completed:
         print("Querying PostgreSQL for completed tasks...")
+        # D09: the old tuning-mode flag is gone; --workload ('kernel'/'op')
+        # already IS the subclass value for a tuning workload.
         completed_configs = get_completed_tasks(module_name, module_instance,
-                                                  tuning_mode=args.tuning_mode,
+                                                  subklass=args.workload,
                                                   verbose=args.verbose)
         if args.dry_run:
             print(f"{len(completed_configs)=}")
@@ -278,28 +275,20 @@ def str_to_bool(s):
     else:
         raise argparse.ArgumentTypeError(f"Boolean value must be 0 or 1, got '{s}'")
 
-def get_available_modules():
-    """
-    Return a dict mapping each registered tuning module name (see
-    .registry._MODULE_TO_FAMILY) to an instantiated TuneDesc object. The
-    module list is now a static registry (F8), not a directory glob rooted
-    here -- 'flash'/'flash_op' moved to modules/flash/tune/, outside this
-    package, so a glob rooted at this file can no longer discover them.
-    """
-    from .registry import available_module_names, load_tune_module
-    modules = {}
-    for name in available_module_names():
-        mod = load_tune_module(name)
-        if hasattr(mod, 'TuneDesc'):
-            modules[name] = mod.TuneDesc()
-    return modules
-
 def add_common_arguments(parser):
-    """Add common arguments (workdir, arch, etc.) to a parser."""
-    parser.add_argument('workdir', type=Path,
-                        help='Project working directory')
-    parser.add_argument('--tuning_mode', type=str, default='kernel', choices=['kernel', 'op'],
-                        help='Tuning level to dispatch tasks for: kernel (default) or op')
+    """Add common arguments (arch, max_hsaco, etc.) to a parser.
+
+    D09: exactly two removals from the pre-D09 version --
+      * `workdir` (was a positional here) is now `--workdir` on dispatch's
+        own Phase-1 parser (`build_base_parser()`);
+      * the old tuning-mode flag is now `--workload` on that same Phase-1
+        parser.
+    Nothing else changes. `--max_hsaco` stays here even though it means
+    nothing for a `perfmon` workload -- splitting common vs. tuning-only vs.
+    perfmon-only flags is real work, deliberately deferred
+    (dispatch-perfmon.md §13); leaving the wart visible is intentional, not
+    an oversight.
+    """
     parser.add_argument('--arch', type=str, nargs='+',
                         help='Target architecture(s). If not specified, uses all registered workers.')
     parser.add_argument('--max_hsaco', type=int, metavar='N',
@@ -313,26 +302,34 @@ def add_common_arguments(parser):
     parser.add_argument('-y', '--yes', action='store_true',
                         help='Skip confirmation prompt and proceed with dispatch')
 
-def add_module_subparser(subparsers, module_name, module_instance):
-    """
-    Add a subparser for a specific tuning module with its parameter choices.
+def build_module_parser(module_name, module_instance):
+    """Phase 2 (D09): the module's own parser, for everything after `--`.
 
-    Args:
-        subparsers: The subparsers object from ArgumentParser.add_subparsers()
-        module_name: Name of the tuning module (e.g., 'flash')
-        module_instance: Already-instantiated TuneDesc object for this module
+    A standalone `ArgumentParser`, not a subparser -- Phase 1 no longer
+    instantiates every registered module up front to build one subparser
+    each (that eager-instantiation helper is deleted by this task); only
+    the ONE module named by `--module`/`--workload` is ever loaded, so
+    there is nothing left to attach subparsers to.
 
-    Returns:
-        The created subparser
+    The per-field dynamic-choice loop below is the old `add_module_
+    subparser()`'s loop, unchanged in behavior -- only its host changed.
+    It only runs when `module_instance` exposes `get_entry_choices()`
+    (`TuningDescription` does; `PerfDescription` does not -- perfmon's
+    entry space is a curated prime/coverage set, not a per-field cross
+    product, and giving it its own dispatch flags --preset/--entry_set/
+    --max_seqlen is D10's job, not this one's). For a perfmon module this
+    parser is just `add_common_arguments()`'s flags.
     """
-    module_parser = subparsers.add_parser(
-        module_name,
-        help=f'{module_name.capitalize()} tuning module',
-        usage=f'%(prog)s <workdir> [options...]',
+    module_parser = argparse.ArgumentParser(
+        prog=f'dispatch_tasks --module .../{module_name}',
+        usage='%(prog)s -- [options...]',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     add_common_arguments(module_parser)
+
+    if not hasattr(module_instance, 'get_entry_choices'):
+        return module_parser
 
     all_choices = get_parameter_choices(module_instance)
 
@@ -375,43 +372,128 @@ def add_module_subparser(subparsers, module_name, module_instance):
 
     return module_parser
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Dispatch tuning tasks to PostgreSQL queue (Tuner v3.5)',
+def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split `argv` on the first literal `--`, positionally.
+
+    Deliberately not `parse_known_args`: that would let an unrecognized
+    flag typed BEFORE `--` silently fall through and get attributed to the
+    module parser instead of erroring where the actual mistake is
+    (dispatch-perfmon-exec.md D09)."""
+    if '--' in argv:
+        i = argv.index('--')
+        return argv[:i], argv[i + 1:]
+    return argv, []
+
+def build_base_parser():
+    """Phase 1 (D09): dispatch's own options -- `--workdir`, `--module`,
+    `--workload`. Strict: anything before `--` that this parser does not
+    recognize is an error here, never silently passed through."""
+    from .pq.queue import WORKLOAD_TASK_SELECTOR
+
+    base = argparse.ArgumentParser(
+        prog='dispatch_tasks',
+        description='Dispatch tasks to PostgreSQL queue (Tuner v3.5)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
+Two-phase CLI: options BEFORE `--` are dispatch_tasks's own
+(--workdir/--module/--workload, all required); options AFTER `--` belong to
+the module named by --module (its own per-field choices for a kernel/op
+workload; --arch/--max_hsaco/--skip_completed/--verbose/--dry_run/--yes for
+any workload). `--help` (before `--`) prints this; `-- --help` prints the
+module's own options.
+
 Examples:
-  # Dispatch all flash tasks for gfx942
-  %(prog)s flash /path/to/workdir --arch gfx942
+  # Dispatch all flash kernel-level tasks for gfx942
+  %(prog)s --workdir /path/to/workdir --module modules/flash --workload kernel \\
+      -- --arch gfx942
 
   # Dispatch only float16 tasks with specific sequence lengths
-  %(prog)s flash /path/to/workdir --arch gfx942 --dtype float16 --seqlen_q 128 256 --seqlen_k 128 256
+  %(prog)s --workdir /path/to/workdir --module modules/flash --workload kernel \\
+      -- --arch gfx942 --dtype float16 --seqlen_q 128 256 --seqlen_k 128 256
 
   # Dispatch to multiple architectures
-  %(prog)s flash /path/to/workdir --arch gfx942 gfx90a
+  %(prog)s --workdir /path/to/workdir --module modules/flash --workload kernel \\
+      -- --arch gfx942 gfx90a
 
   # Limit number of hsaco kernels to tune per entry
-  %(prog)s flash /path/to/workdir --max_hsaco 5 --dtype float16
+  %(prog)s --workdir /path/to/workdir --module modules/flash --workload kernel \\
+      -- --max_hsaco 5 --dtype float16
 
   # Skip tasks that have already completed (queries PostgreSQL)
-  %(prog)s flash /path/to/workdir --skip_completed --arch gfx942
+  %(prog)s --workdir /path/to/workdir --module modules/flash --workload kernel \\
+      -- --skip_completed --arch gfx942
 ''')
+    base.add_argument('--workdir', type=Path, required=True,
+                       help='Project working directory')
+    base.add_argument('--module', type=Path, required=True,
+                       help='PATH to the module directory, e.g. modules/flash '
+                            '(a directory containing a tune/ or perfmon/ subdirectory)')
+    base.add_argument('--workload', required=True, choices=list(WORKLOAD_TASK_SELECTOR),
+                       help="'kernel'/'op' dispatch the tune_kernel DAG; "
+                            "'perfmon' dispatches the perf_measure DAG")
+    return base
 
-    # Create subparsers for each module BEFORE parsing
-    # Module comes first as a positional argument
-    subparsers = parser.add_subparsers(dest='module', required=True,
-                                       help='Tuning module')
+def resolve_module(base: argparse.ArgumentParser, args):
+    """Resolve `--module`/`--workload` to `(family, module_instance)` --
+    from a PATH, never a name looked up in a registry (dispatch-perfmon.md
+    §4): the path-driven `load_family_tune`/`load_family_perfmon` loaders,
+    NOT the name-and-registry-driven alias `registry.py` also exports for
+    the static `_FAMILIES` list -- a path is its own identity and needs no
+    pre-registration there."""
+    from .registry import load_family_tune, load_family_perfmon
 
-    available_modules = get_available_modules()
-    for module_name, module_instance in available_modules.items():
-        add_module_subparser(subparsers, module_name, module_instance)
+    module_path = args.module.resolve()
+    if not (module_path / 'tune').is_dir() and not (module_path / 'perfmon').is_dir():
+        base.error(f"{module_path} is not a module directory "
+                   f"(no tune/ or perfmon/ under it)")
 
-    # Parse all arguments
-    args = parser.parse_args()
+    family = module_path.name          # e.g. 'flash'
+    modules_dir = module_path.parent   # e.g. .../modules
+
+    if args.workload == 'perfmon':
+        mod = load_family_perfmon(family, modules_dir=modules_dir)
+        attr = 'PerfDesc'
+    else:
+        mod = load_family_tune(family, modules_dir=modules_dir)
+        attr = 'TuneDesc'
+
+    if not hasattr(mod, attr):
+        base.error(f"Module '{family}' has no class '{attr}'")
+    return family, getattr(mod, attr)()
+
+def parse_cli(argv: list[str]):
+    """The full two-phase parse (D09), factored out of `main()` so it can
+    be exercised without a live database -- everything after this point in
+    `main()` needs PostgreSQL (config.rc, workers.db, the dispatch itself),
+    but the parse does not.
+
+    Returns `(args, family, module_instance)`. `args` carries the Phase-1
+    fields (`workdir`/`module`/`workload`) and the Phase-2 fields
+    (`arch`/`max_hsaco`/... and, for a tuning module, its per-field entry
+    filters) merged onto one `argparse.Namespace`, exactly as `dispatch_
+    tasks()`/`generate_filtered_entries()` expect (unchanged from before
+    D09 in this respect).
+    """
+    head, tail = _split_argv(argv)
+
+    base = build_base_parser()
+    args = base.parse_args(head)
+
+    family, module_instance = resolve_module(base, args)
+
+    module_parser = build_module_parser(family, module_instance)
+    mod_args = module_parser.parse_args(tail)
+    for key, value in vars(mod_args).items():
+        setattr(args, key, value)
+
+    return args, family, module_instance
+
+def main():
+    args, family, module_instance = parse_cli(sys.argv[1:])
 
     # Validate workdir
     if not args.workdir.is_dir():
-        parser.error(f"Working directory does not exist: {args.workdir}")
+        sys.exit(f"Error: Working directory does not exist: {args.workdir}")
 
     # Load config (required for task dispatch)
     load_config(args.workdir)
@@ -420,11 +502,19 @@ Examples:
     if args.arch is None:
         args.arch = get_registered_archs(args.workdir)
         if not args.arch:
-            parser.error(f"No workers registered in {args.workdir}/workers.db")
+            sys.exit(f"Error: No workers registered in {args.workdir}/workers.db")
         print(f"No --arch specified, using all registered: {', '.join(args.arch)}")
 
+    if args.workload == 'perfmon':
+        # D10 (PerfEntrySource) wires up perf_measure dispatch; this task
+        # (D09) only had to get --workload perfmon parsing, resolving to
+        # the right module, and mapping to the right class/subclass --
+        # not actually dispatching it yet.
+        sys.exit("Error: --workload perfmon dispatch is not implemented yet "
+                  "(dispatch-perfmon-exec.md D10 adds it)")
+
     # Dispatch tasks
-    dispatch_tasks(args.workdir, args.module, available_modules[args.module], args)
+    dispatch_tasks(args.workdir, family, module_instance, args)
 
 if __name__ == '__main__':
     main()
