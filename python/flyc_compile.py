@@ -36,6 +36,7 @@ from multiprocessing import Process, Queue
 from pathlib import Path
 
 from . import flyc_bootstrap
+from .gpu_targets import AOTRITON_ARCH_WARPSIZE
 from .template_instantiation.ir.choices import ChoiceView, ChoiceVarAbsent
 from .utils import parse_pon
 
@@ -626,10 +627,11 @@ def do_compile(args):
     # as `j['num_warps'] * j['warp_size']` -- the same key shape python/compile.py
     # (the Triton driver) writes. flyc has no num_warps of its own (FlyDSL's grid
     # model has no warp count knob), but block_size (the @flyc.kernel's declared
-    # known_block_size, i.e. total threads per block) and warp_size==32 (fixed,
-    # RDNA/CDNA wavefront size) determine it exactly: num_warps * warp_size ==
+    # known_block_size, i.e. total threads per block) and warp_size (the
+    # target arch's wavefront size -- 32 on RDNA, 64 on CDNA, per
+    # AOTRITON_ARCH_WARPSIZE) determine it exactly: num_warps * warp_size ==
     # block_size by construction, so this is a derivation, not a guess.
-    warp_size = 32
+    warp_size = AOTRITON_ARCH_WARPSIZE[args.target]
     assert block_size % warp_size == 0, (
         f'block_size={block_size} is not a multiple of warp_size={warp_size}; '
         f'cannot derive num_warps for the aks2 sidecar (aotriton.aks2 needs '
