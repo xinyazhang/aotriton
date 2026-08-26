@@ -44,9 +44,21 @@ class PerfDescription(ABC):
     accuracy checking, no impl resolution -- backend selection is handled by
     the existing `ImplSelector`/op-level machinery, reused unchanged, D3)."""
 
-    #: The family's entry dataclass (reused from the family's `tune` block,
-    #: never redefined here -- e.g. flash's `FlashInputMetadata`).
+    #: The family's QUEUED entry dataclass (reused from the family's `tune`
+    #: block, never redefined here) -- what task_config['entry'] holds and
+    #: what prime_entries()/coverage_entries() yield, e.g. flash's
+    #: `FlashEntry`. Deliberately narrower than INPUT_METADATA: fields the
+    #: GPU worker resolves (N_HEADS, BATCH, ...) are not dispatch-time
+    #: choices, so they are not part of this class.
     ENTRY_CLASS: type
+
+    #: What the GPU worker RESOLVES a queued `ENTRY_CLASS` instance to
+    #: (D05's `resolve_entry()`), e.g. flash's `FlashInputMetadata`. Carries
+    #: every `ENTRY_CLASS` field plus the ones only the worker can pick
+    #: (N_HEADS, BATCH, storage_flip, ...), since those depend on the
+    #: worker's own VRAM. `shape_pon()`/`functional_pon()` take an instance
+    #: of THIS class, not of `ENTRY_CLASS` -- see their docstrings.
+    INPUT_METADATA: type
 
     @abstractmethod
     def prime_entries(self, arch: str, max_seqlen: int) -> Iterator:
@@ -76,14 +88,22 @@ class PerfDescription(ABC):
         (rev0 §7): `iface`, `dtype`, `causal`, `dropout_p`, `bias_type`,
         `gqa`, `varlen`, `storage_flip`. Hashed to a filename by `store.py`
         (T26); two entries differing only in shape must render identical
-        `functional_pon` text."""
+        `functional_pon` text.
+
+        Takes the RESOLVED metadata (an `INPUT_METADATA` instance), not a
+        queued `ENTRY_CLASS` entry. `N_HEADS`/`BATCH`/`storage_flip` are
+        chosen on the GPU worker (D05), so this is a report-time call."""
 
     @abstractmethod
     def shape_pon(self, entry) -> str:
         """The SHAPE half of `entry`'s PON, rendered with `render_pon`
         (rev0 §7): `hdim`, `seqlen_q`, `seqlen_k`, `BATCH`, `N_HEADS`.
         Assigned a small integer id, stable within one `docs/perf/<tag>/`
-        directory, by `store.py` (T26)."""
+        directory, by `store.py` (T26).
+
+        Takes the RESOLVED metadata (an `INPUT_METADATA` instance), not a
+        queued `ENTRY_CLASS` entry. `N_HEADS`/`BATCH` are chosen on the GPU
+        worker (D05), so this is a report-time call."""
 
     @abstractmethod
     def tflops(self, entry, iface: str, seconds: float) -> float:

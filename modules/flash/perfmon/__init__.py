@@ -35,7 +35,8 @@ def _n_heads_for_tflops(entry) -> int:
 
 
 class PerfDesc(PerfDescription):
-    ENTRY_CLASS = _entry.FlashInputMetadata
+    ENTRY_CLASS    = _entry.FlashEntry
+    INPUT_METADATA = _entry.FlashInputMetadata
 
     #: Bare op-level interface names perfmon measures end-to-end (D3) --
     #: matches `modules/flash/tune/level_op.py:list_impls`.
@@ -51,6 +52,8 @@ class PerfDesc(PerfDescription):
         return list(self.IFACES)
 
     def functional_pon(self, entry, iface: str) -> str:
+        """Takes the RESOLVED metadata, not a queued entry. N_HEADS/BATCH are
+        chosen on the GPU worker (D05), so this is a report-time call."""
         d = {
             'iface': iface,
             'dtype': entry.dtype,
@@ -68,6 +71,8 @@ class PerfDesc(PerfDescription):
         return render_pon(d)
 
     def shape_pon(self, entry) -> str:
+        """Takes the RESOLVED metadata, not a queued entry. N_HEADS/BATCH are
+        chosen on the GPU worker (D05), so this is a report-time call."""
         d = {
             'hdim': entry.hdim,
             'seqlen_q': entry.seqlen_q,
