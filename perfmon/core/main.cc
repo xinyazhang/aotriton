@@ -249,9 +249,19 @@ struct Runner {
 
   std::string platform(const std::vector<std::string>& /*args*/) {
     perfmon::pmon_thermal t = perfmon::thermal_snapshot();
+    // VRAM of THIS process's GPU. The launcher masks the process to one
+    // device (HIP_VISIBLE_DEVICES), so index 0 is unambiguously ours -- which
+    // is why this is reported here rather than derived host-side, where the
+    // HIP-id/DRM-id mapping is a known hazard.
+    hipDeviceProp_t prop{};
+    double vram_gb = 0.0;
+    if (hipGetDeviceProperties(&prop, 0) == hipSuccess) {
+      vram_gb = static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0);
+    }
     std::ostringstream oss;
     oss << "{\"pmon_abi_version\":" << PMON_ABI_VERSION
         << ",\"subject_id\":\"" << json_escape(subject_id) << "\""
+        << ",\"vram_total_gb\":" << vram_gb
         << ",\"thermal\":" << json_thermal(t)
         << "}";
     return oss.str();

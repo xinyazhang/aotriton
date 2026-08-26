@@ -381,6 +381,7 @@ class ExaidPerfmonWorker(ExaidWorker):
         super().__init__(module_name, gpu_id)
         self._profile = None          # the preset the live process serves
         self._pending_profile = None  # what the next launch should serve
+        self._vram_total_gb = None    # cached from platform(), see _assert_identity
 
     def _spawn_argv(self):
         if self._pending_profile is None:
@@ -430,6 +431,19 @@ class ExaidPerfmonWorker(ExaidWorker):
                 f"subject_id={subject_id!r}; the resolved binary is not the "
                 f"subject that was asked for")
         logger.info(f"perfmon runner identity confirmed: subject_id={subject_id}")
+        # D05a: the runner is the only process guaranteed to have the GPU
+        # (masked to exactly one device via HIP_VISIBLE_DEVICES), so it is
+        # the source of VRAM for D05's resolve_entry(). platform() already
+        # runs once per process here; cache its answer rather than asking
+        # again per measurement.
+        self._vram_total_gb = info.get('vram_total_gb')
+
+    @property
+    def vram_total_gb(self) -> float | None:
+        """This worker's GPU's total VRAM in GiB, from the runner's own
+        `platform` self-report (D05a). None until a profile has been
+        established (`use_profile()` -> `_assert_identity()`)."""
+        return self._vram_total_gb
 
     def platform(self) -> dict:
         self.proxy.write('platform')
