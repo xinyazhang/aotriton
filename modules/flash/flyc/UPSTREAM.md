@@ -1,11 +1,29 @@
 # Provenance and re-sync instructions
 
+Two architectures are vendored from the same upstream directory, at **two
+different commits on two different branches**. They are tracked separately
+throughout this file, because they re-sync independently: a gfx950 re-sync must
+not silently move gfx1201's files, and vice versa. The three files they *share*
+(`fmha_abi_gfx1201.py`, `fmha_common_gfx1201.py`, `philox.py`) are gfx1201's
+by provenance, and pulling them forward for gfx950 moves both arches at once.
+
 ## Source
+
+### gfx1201
 
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
 commit: caee9257  (was 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
+path:   kernels/attention/parity/
+```
+
+### gfx950
+
+```
+repo:   git@github.com:xinyazhang/FlyDSL.git
+branch: xinyazhang/sdpa-gfx950-feature-bwd
+commit: 70b2dbc5
 path:   kernels/attention/parity/
 ```
 
@@ -19,6 +37,8 @@ git -C <flydsl checkout> branch --show-current
 ## Vendored files (verbatim at the commit above, before the rewrites in "Import
 rewrites" below are reapplied)
 
+### gfx1201 — nine files
+
 ```
 flash_attn_func_gfx1201_aiw.py      forward
 fmha_tuning_gfx1201.py              forward tuning policy
@@ -26,10 +46,37 @@ fmha_bwd_dkdv_gfx1201_kernel.py     backward dK/dV
 fmha_tuning_bwd_dkdv_gfx1201.py     backward dK/dV tuning policy
 fmha_bwd_dq_gfx1201_kernel.py       backward dQ/dB
 fmha_tuning_bwd_dq_gfx1201.py       backward dQ/dB tuning policy
-fmha_abi_gfx1201.py                 shared host ABI
-fmha_common_gfx1201.py              shared device helpers
-philox.py                           shared PRNG
+fmha_abi_gfx1201.py                 shared host ABI       ) also imported
+fmha_common_gfx1201.py              shared device helpers ) verbatim by
+philox.py                           shared PRNG           ) every gfx950 file
 ```
+
+### gfx950 — twelve files
+
+```
+flash_attn_func_gfx950.py           forward                     (ONE edit -- see 1c)
+fmha_tuning_gfx950.py               forward tuning policy
+fmha_bwd_dkdv_gfx950.py             backward dK/dV
+fmha_bwd_dkdv_m16_gfx950.py         backward dK/dV, MFMA16 body
+fmha_tuning_bwd_dkdv_gfx950.py      backward dK/dV tuning policy
+fmha_bwd_dq_gfx950.py               backward dQ/dB
+fmha_bwd_dq_m16_gfx950.py           backward dQ/dB, MFMA16 body
+fmha_tuning_bwd_dq_gfx950.py        backward dQ/dB tuning policy
+fmha_traits_gfx950.py               ParityDualwaveTraits + make_traits
+fmha_dualwave_gfx950.py             dual-wave device helpers
+fmha_wide_gfx950.py                 wide-tile device helpers
+fmha_mfma16_gfx950.py               MFMA16 addressing constants
+```
+
+**Eleven of the twelve are byte-identical to upstream and must stay that way**
+(`diff` each against `git show <commit>:kernels/attention/parity/<basename>` and
+expect empty). The twelfth, `flash_attn_func_gfx950.py`, carries the single
+deletion recorded in "Vendored edits (1c)" below. There are **zero** import
+rewrites for gfx950 — see "Import rewrites (1a)" for why, and what it cost.
+
+**Not vendored for gfx950:** `gfx950_standalone.py` (we author our own — see
+below), `kernels/attention/flash_attn_utils.py` (polyfilled — see below), every
+`*_interface.py`, every `test_*.py`, `tooling/`, and every `.md`/`.pdf`.
 
 Copied straight from `kernels/attention/parity/<basename>` to
 `modules/flash/flyc/<basename>` with no renaming.
@@ -76,7 +123,79 @@ Two FlyDSL pins, deliberately independent:
 That is the fork this vendoring strategy exists to avoid. If the interim
 `sys.path` mechanism is broken, fix `flyc_bootstrap.py`, not this directory.
 
-## Import rewrites (1a)
+gfx950 takes exactly four names from that tree —
+`buffer_ops.buffer_load`, `.buffer_store`, `.create_buffer_resource` and
+`.get_element_ptr`. All four are present at `v0.3.0`, at `upstream/main` and on
+the gfx950 branch, so gfx950 needs **no** new `flyc_polyfill` entry for
+`kernels/common` and the rule above is unchanged. (The `v0.3.1` tag itself could
+not be resolved in the checkout used to verify this and there was no network to
+fetch it; `v0.3.0` is the nearest tag that could be read.)
+
+### The gfx950 kernel-root pin is stricter than gfx1201's
+
+gfx950 needs one more module out of that same source tree:
+`kernels/attention/flash_attn_utils.py`, which supplies `DualwaveSwpTraits`
+(see the polyfill section). Two consequences, both retired by the same event:
+
+* **The pinned tag is not sufficient for a *correct* gfx950 build.** The gfx950
+  branch carries a ~122-line delta in `flash_attn_utils.py` — the DS transpose
+  reads moved off inline asm onto ROCDL ops, because `SIInsertWaitcnts` cannot
+  see through asm and the result was non-deterministic NaN above head_dim 128.
+  Until that lands upstream and `third_party/flydsl-kernel.txt` is bumped, a
+  gfx950 build must set `-DAOTRITON_FLYDSL_KERNEL_ROOT=<live FlyDSL checkout>`,
+  which the CMake cache variable is documented for.
+* **That moves gfx1201 too.** Both arches read one kernel root, and every gfx950
+  file imports `fmha_common_gfx1201`. Re-run the gfx1201 Level-0 pass right
+  after pointing the root at a live checkout, *before* touching anything gfx950
+  — otherwise a gfx1201 regression looks like a gfx950 one.
+
+**Retiring condition for both:** the `flash_attn_utils.py` delta merges upstream
+and `third_party/flydsl-kernel.txt` is bumped to a tag containing it. Then
+`AOTRITON_FLYDSL_KERNEL_ROOT` goes back to the shallow clone for both arches.
+
+## Vendored edits (1c) — gfx950 only, exactly one
+
+gfx1201 has none of these; its coupling is all in table 1a. gfx950 inverts that:
+zero import rewrites, one deletion.
+
+| file | what is deleted | why | retire when |
+|---|---|---|---|
+| `flash_attn_func_gfx950.py` | the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 38 lines at `70b2dbc5`: 888–925) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
+
+Both blocks go, not just the first: leaving the call site would be a `NameError`
+at trace time if SPLITK were ever enabled, which is a worse failure than the
+honest one.
+
+**Re-derive the line numbers from the AST on every re-sync; do not trust the
+ones above.** The deletion is verified by:
+
+```bash
+python3 -c "
+import ast; t=ast.parse(open('modules/flash/flyc/flash_attn_func_gfx950.py').read())
+ks=[n.name for n in ast.walk(t) if isinstance(n,ast.FunctionDef)
+    and any(getattr(d.func if isinstance(d,ast.Call) else d,'attr',None)=='kernel'
+            for d in n.decorator_list)]
+assert ks==['flash_attn_func_gfx950_kernel'], ks"
+grep -n 'COMBINE_\|splitk_combine' modules/flash/flyc/flash_attn_func_gfx950.py   # expect nothing
+diff <(git -C <flydsl checkout> show <commit>:kernels/attention/parity/flash_attn_func_gfx950.py) \
+     modules/flash/flyc/flash_attn_func_gfx950.py                                 # expect ONLY the two blocks
+```
+
+This costs the zero-vendored-edit property the `gfx950_standalone.py` design
+otherwise achieves, and that is a deliberate trade: in exchange the file has one
+`@flyc.kernel` and neither uniqueness assertion can fire at all.
+
+## Import rewrites (1a) — gfx1201 only; gfx950 has **none**
+
+**gfx950 contributes zero rows to this table, by construction.** Rather than
+rewrite the eight `from gfx950_standalone import ...` lines the way gfx1201's
+four `gfx1201_standalone` lines are rewritten below, we supply our own
+`gfx950_standalone.py` — see "Authored files" — so every vendored gfx950 file
+keeps its imports verbatim and a re-sync diff for those files is empty. That is
+a strictly better outcome than gfx1201 got; if gfx1201 is ever re-vendored,
+copy the pattern rather than this table.
+
+The rest of this section is gfx1201's.
 
 Four lines, two files, replacing the four `gfx1201_standalone` imports that
 the deleted shim used to serve — the ones a bare `parity/` checkout is not
@@ -143,7 +262,13 @@ within the two edited files: every flat sibling import already present
 `from philox import dropout_threshold`) — the flat, bare-directory layout is
 what those already assume, same contract as `modules/flash/kernel/`.
 
-## Torch-lazy rewrites (1b)
+## Torch-lazy rewrites (1b) — gfx1201 only; gfx950 needs none
+
+No vendored gfx950 file imports torch. The only mention is the *string*
+`"torch.bfloat16"` in a host-side dtype check inside `fmha_bwd_dkdv_gfx950._args`,
+which the AOT driver never calls. Check this on re-sync — a new module-scope
+`import torch` would break the build venv, which must never have torch
+(`CMakeLists.txt:142`) — but expect it to stay empty.
 
 `fmha_abi_gfx1201.py` has two module-scope torch imports. The build venv must
 never have torch (`CMakeLists.txt:142`), so both become function-local. Every
@@ -192,6 +317,103 @@ prefers `flydsl.kernels.common`'s own definition when it has the symbol, and
 only falls back to its local copy — so as each function lands upstream, the
 polyfill silently stops shadowing it, and the module can be trimmed
 function-by-function without touching any other file.
+
+### The seventh entry: `DualwaveSwpTraits` (gfx950), and why its row is different
+
+| class | ports from | notes |
+|---|---|---|
+| `DualwaveSwpTraits` | `kernels/attention/flash_attn_utils.py` @ `70b2dbc5`, lines 1476–1582 | **verbatim, 107 lines**, `@dataclass(frozen=True)`, no bases, 78 annotated scalar fields, one `cache_tag` property with zero flydsl references. sha256 `6750ff4e…` |
+
+**Retiring condition — not the usual one.** The other six wait on an upstream
+merge. This class is *already* upstream, and byte-identical on `upstream/main`
+and the gfx950 branch alike. It is copied because of **where** it lives:
+`kernels/attention/flash_attn_utils.py`, whose module scope does
+`import flydsl.compiler as flyc`. The generator reaches this class —
+`fmha_traits_gfx950.ParityDualwaveTraits` subclasses it, and
+`fmha_tuning_*_gfx950.resolve()`'s last step `_checked_against_traits`
+*constructs* one to validate a configuration before discarding it — and the
+generator must never import flydsl, or `.ci/build-shim.sh` stops being cheap.
+
+So the row retires **when `fmha_traits_gfx950` no longer needs a flydsl-bearing
+module for its base class** — i.e. when `DualwaveSwpTraits` moves to a module
+that imports no flydsl, or when the generator no longer constructs traits.
+
+**Why the copy is safe.** Do not weaken these; they are the justification, not
+decoration:
+
+* All 78 fields are passed **by name** at every construction — only `RETURN_LSE`
+  and `XCD_SWIZZLE` carry defaults and `make_traits` passes both explicitly — so
+  an upstream add/remove/rename is a loud `TypeError`, never a wrong number. The
+  one silent channel a polyfill normally has (a changed default nobody passes)
+  is empty here.
+* The copy never reaches the compiler. At build time `flyc_bootstrap.setup()`
+  has run, `gfx950_standalone` binds `dualwave` to the real module, and the copy
+  is used *only* by the generator, whose sole output is the knob dict.
+* **The claim is checked, not asserted.** At build time both definitions exist,
+  so `gfx950_standalone` calls
+  `flyc_polyfill.assert_dualwave_swp_traits_equivalent()`, which compares
+  `dataclasses.fields()` — names, types and order. For a 78-field dataclass that
+  check is *total*, not a sample. Defaults are deliberately excluded (see above:
+  they cannot reach a kernel, so checking them would turn a harmless upstream
+  edit into a failed build).
+
+**The check is called from `gfx950_standalone`, not from `flyc_polyfill`'s own
+module scope, and that placement is load-bearing.** The gfx1201 kernels alias
+`flyc_polyfill` *wholesale* as `common_utils` and `wmma_ops`, so a module-scope
+`try: from kernels.attention.flash_attn_utils import DualwaveSwpTraits` there
+would import a gfx950 module into every gfx1201 build and run the comparison
+against whatever the kernel-root pin happens to hold. That is not hypothetical:
+the class is **105 lines at `v0.3.0`** against 107 at the merge-base,
+`upstream/main` and the gfx950 branch — so that spelling could fail a gfx1201
+build over a class gfx1201 never touches.
+
+**`flyc_polyfill.py` must import with no flydsl installed.** The generator
+reaches it through `gfx950_standalone`'s fallback, so every `flydsl` import in
+it is function-local and the two `ir.Type` annotations are quoted — an
+annotation on a `def` is evaluated when the `def` executes. This is the same
+laziness section 1b applies to torch, for the same reason. A new module-scope
+`import flydsl…` there breaks the code generator, not just the build.
+
+## Authored files (not vendored, exempt from the rewrite tables)
+
+| file | status | what it is |
+|---|---|---|
+| `flyc_polyfill.py` | authored | the seven fallbacks above |
+| `gfx950_standalone.py` | authored | our implementation of upstream `gfx950_standalone.py`'s *interface* |
+
+Upstream's `gfx950_standalone.py` is a compatibility layer between `parity/`
+(not part of the flydsl package) and its parent (which is), and it does that
+with `sys.path` surgery relative to `Path(__file__).parents[3]`. Under
+`modules/flash/flyc/` that resolves to the **AOTriton repository root**, so
+vendoring it verbatim would put the wrong directory on `sys.path`. There is
+nothing to fix in it: it is correct where it lives and wrong where we would put
+it. Its *interface*, though, is two names — measured across all eight importers
+among the vendored files:
+
+```
+fmha_traits_gfx950.py        from gfx950_standalone import dualwave
+flash_attn_func_gfx950.py    from gfx950_standalone import dualwave
+fmha_wide_gfx950.py          from gfx950_standalone import dualwave
+fmha_dualwave_gfx950.py      from gfx950_standalone import buffer_ops, dualwave
+fmha_bwd_dkdv_gfx950.py      from gfx950_standalone import buffer_ops, dualwave
+fmha_bwd_dkdv_m16_gfx950.py  from gfx950_standalone import buffer_ops, dualwave
+fmha_bwd_dq_gfx950.py        from gfx950_standalone import buffer_ops, dualwave
+fmha_bwd_dq_m16_gfx950.py    from gfx950_standalone import buffer_ops, dualwave
+```
+
+`kernels_common`, `layout_utils`, `mem_ops` and `utils` are re-exported upstream
+but **taken by nothing**, so ours does not re-export them. Add one only when a
+vendored file imports it. Ours does **no** `sys.path` surgery —
+`flyc_bootstrap.py` already owns that, and doing it a second time from a
+different anchor is how the two would drift.
+
+`dualwave` resolves per environment: the real `kernels.attention.flash_attn_utils`
+at build time, `flyc_polyfill` in the generator. `buffer_ops` resolves **lazily**
+(PEP 562 module `__getattr__`) and deliberately so: it is device-side only, and
+every file that imports it also imports flydsl at module scope, so none is
+reachable from the generator. Importing it eagerly would break the generator over
+a name the generator never uses; deferring it keeps `kernels.common`'s own
+`ImportError` and traceback intact at the point of use.
 
 ## FakeTensor contract additions
 
@@ -264,11 +486,34 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
 
 ## Re-sync procedure
 
-1. Copy every file in the "Vendored files" list from
-   `<flydsl checkout>/kernels/attention/parity/` into `modules/flash/flyc/`.
-2. Reapply the import rewrites (1a) and the torch-laziness edits (1b) above.
-   `diff` each file against its upstream original afterwards: the diff must be
-   EXACTLY those tables and nothing else.
+**Re-sync one arch at a time.** The two lists come from different branches; the
+three shared `*_gfx1201` files belong to gfx1201's list, and pulling them
+forward moves both arches at once.
+
+1. Copy every file in the "Vendored files" list for the arch you are syncing
+   from `<flydsl checkout>/kernels/attention/parity/` into `modules/flash/flyc/`.
+2. Reapply the edits recorded for that arch, then `diff` each file against its
+   upstream original: the diff must be EXACTLY the recorded tables and nothing
+   else.
+   * **gfx1201** — the import rewrites (1a) and the torch-laziness edits (1b).
+   * **gfx950** — nothing for eleven of the twelve files (`diff` must be
+     **empty**, prove it, do not assume it), and only block 1 + block 2 of the
+     combine-kernel deletion (1c) for `flash_attn_func_gfx950.py`. Re-derive
+     those two blocks from the AST; the line numbers in 1c are for `70b2dbc5`.
+2b. **Re-run Gate B** (both halves) — it is cheap, pure Python, needs no GPU and
+   no cmake, and it is what catches a new flydsl import sneaking into the
+   generate-time chain:
+   * *generator side*, from `modules/flash/flyc/`, with a `sys.meta_path`
+     finder that raises `ImportError` for any `flydsl.*` or `kernels.*`:
+     `import fmha_tuning_gfx950, fmha_tuning_bwd_dkdv_gfx950,
+     fmha_tuning_bwd_dq_gfx950` must succeed, and at `head_dim=128`
+     `resolve()` must give `fwd block_m=256`, `dkdv block_kv=64`,
+     `dq block_m=64`, `GRID_AXIS_ORDER=0` for all three;
+   * *build side*, with flydsl available and `AOTRITON_FLYDSL_KERNEL_ROOT` set:
+     `import flash_attn_func_gfx950, fmha_bwd_dkdv_gfx950, fmha_bwd_dq_gfx950`
+     must succeed, which is also where the `DualwaveSwpTraits` equivalence
+     check runs. A symbol missing from `kernels/common` goes into
+     `flyc_polyfill.py` — **never** into a copy of `kernels/common/*`.
 3. **Check the kernarg order**, which is the expensive failure mode. The
    descriptions in `modules/flash/aot/flyc_*.py` declare it and are
    order-sensitive; a reorder upstream needs them re-ordered here. The cheap
@@ -288,9 +533,11 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
    the builder's `BLOCK_N = ROWS_PER_WAVE * NUM_TEAMS` derivation, because it is
    not a `resolve_knobs` output and the grid needs it. If that expression moves
    upstream, the mirror is wrong and the symptom is a wrong grid, not a build
-   failure.
+   failure. **gfx950 has no such mirror** and must not grow one: `block_m`
+   (fwd, dQ), `block_kv` (dK/dV) and `GRID_AXIS_ORDER` are all flat resolved
+   knob fields there.
 5. Re-run Gate 1 and Gate 3 from `PLAN-PHASE1.md`.
-6. Update the commit hash at the top of this file.
+6. Update the commit hash at the top of this file — **for the arch you synced**.
 
 **A re-sync will not be picked up by an incremental build.** Editing a kernel
 source invalidates no `.hsaco` and no `.aks2`: `v3src/CMakeLists.txt`'s
