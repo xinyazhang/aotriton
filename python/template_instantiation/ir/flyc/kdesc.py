@@ -335,24 +335,83 @@ class KernelDescription(Interface):
                     f'{name!r} (not bound by any @ati.tensor/@ati.scalar and not '
                     f'a resolved stride argument)')
 
+    def context_helper_for_functional(self, aname):
+        """Item I sub-step (c): the context-helper member-function name that
+        should stand in for functional axis `aname` in godel_number(), or
+        None for the default `args.<aname>` read (see Interface's base
+        default). A functional axis MARKER is helper-wired the same way any
+        other argument is -- a local `@ati.scalar(aname, options=...,
+        wires_to=ati.context_helper(...))` -- even though (unlike a real
+        kernel argument) `aname` here never appears in `real_param_order`, so
+        `iter_launch_arguments` never yields it as a launch argument. It only
+        needs to be *findable by axis name*, which is exactly what
+        `self.scalars` + `arg_names` already gives for free.
+
+        Deliberately `s.type_ is None` (the MARKER shape, item I's
+        BLOCK_DMODEL/PADDED_HEAD), not just any context_helper-wired scalar:
+        the pre-existing explicit-type helpers (`flyc_num_seqlens` on
+        `num_seqlens`, `flyc_varlen_bits`, `flyc_idropout_p`,
+        `flyc_dropout_scale`) also match a functional axis's `aname` by
+        argument name, but their helper computes a TRANSFORMED value for the
+        launch argument (e.g. `flyc_num_seqlens`'s `nseq_idx = num_seqlens !=
+        0 ? num_seqlens : batch_size`), not a stand-in for that axis's own
+        pinned choice -- redirecting godel_number() to read it would compare
+        the transformed value against the axis's untransformed choice list
+        and get the wrong digit. Caught by generating flyc_bwd_dq for gfx950:
+        `num_seqlens` (an explicit-type helper, `type_='i32'`) was being
+        matched here before this restriction, and sub-step (d)'s independent
+        recompute assertion (codegen/flyc.py) then found zero functionals
+        that were both 'not disabled' and had a `num_seqlens` choice equal to
+        one of `flyc_num_seqlens()`'s actual (unrelated) return values."""
+        for s in self.scalars:
+            if s.type_ is not None:
+                continue
+            if aname in s.arg_names and isinstance(s.wires_to, ContextHelper):
+                return s.wires_to.name
+        return None
+
     def iter_context_helpers(self):
         """Yield (helper_name, c_type) once per distinct `ati.context_helper`
         referenced by this kernel's @ati.scalar specs, in first-seen order.
         Drives both the context struct's declares/scratch-members (flyc.h) and
-        the pp_args preamble that populates them (PLAN-PHASE2.md Task 5)."""
+        the (item I) evaluation block in lookup_optimal() that populates them
+        (PLAN-PHASE2.md Task 5).
+
+        Two shapes of context_helper scalar exist:
+          * an explicit-type real kernel argument (`@ati.scalar('varlen_bits',
+            'i32', wires_to=...)`) -- `s.type_` names the elemental type, and
+            `_CONTEXT_HELPER_CTYPE` maps it to a C type string;
+          * a functional-axis MARKER (item I: `@ati.scalar('BLOCK_DMODEL',
+            options=[...], wires_to=...)`) that is never a real kernel
+            argument at all (see context_helper_for_functional) -- `options=`
+            and an explicit type are mutually exclusive
+            (decorators/scalar.py), so `s.type_` is always None here. The
+            elemental type instead comes from the AXIS's own TypedChoice
+            (`axis_of_arg(s.arg_name).repr_typed_choice.itype` already IS a
+            full C type string, e.g. 'bool' for PADDED_HEAD's
+            `options=[False, True]` -- constexpr.bool_t.itype -- or 'int16_t'
+            for BLOCK_DMODEL's `options=[16, 32, ...]` -- GuessInt's
+            constexpr.int16_t.itype), so this path reads it straight off the
+            axis rather than adding a second, parallel elemental-type-string
+            table that would need a 'bool' entry for exactly one caller.
+        """
         seen = {}
         for s in self.scalars:
             if not isinstance(s.wires_to, ContextHelper):
                 continue
             name = s.wires_to.name
-            assert s.type_ is not None, (
-                f'flyc kernel {self.NAME!r}: context_helper scalar {s.arg_name!r} '
-                f'has no explicit elemental type (dtype ChoiceVar not supported '
-                f'for context helpers)')
-            assert s.type_ in _CONTEXT_HELPER_CTYPE, (
-                f'flyc kernel {self.NAME!r}: context_helper scalar {s.arg_name!r} '
-                f'has unrecognised elemental type {s.type_!r}')
-            ctype = _CONTEXT_HELPER_CTYPE[s.type_]
+            if s.type_ is not None:
+                assert s.type_ in _CONTEXT_HELPER_CTYPE, (
+                    f'flyc kernel {self.NAME!r}: context_helper scalar {s.arg_name!r} '
+                    f'has unrecognised elemental type {s.type_!r}')
+                ctype = _CONTEXT_HELPER_CTYPE[s.type_]
+            else:
+                axis = self.axis_of_arg(s.arg_name)
+                assert axis is not None, (
+                    f'flyc kernel {self.NAME!r}: context_helper scalar {s.arg_name!r} '
+                    f'has no explicit elemental type and is not a known functional '
+                    f'axis either (dtype ChoiceVar not supported for context helpers)')
+                ctype = axis.repr_typed_choice.itype
             if name in seen:
                 assert seen[name] == ctype, (
                     f'flyc kernel {self.NAME!r}: context_helper {name!r} is '

@@ -187,13 +187,32 @@ class InterfaceGenerator(ABC):
         body = io.StringIO()
         iface = self._iface
         for tp in iface.list_functional_params():   # tp: TemplateParam
-            self.codegen_godel_number_calculation(tp, body)
+            # item I: a functional axis wired to a context helper
+            # (BLOCK_DMODEL/PADDED_HEAD on the flyc descriptions) reads its
+            # digit from the once-per-lookup_optimal scratch cache instead of
+            # straight off `params` -- see ir/interface.py's
+            # context_helper_for_functional (default None: a safe no-op for
+            # every Interface without helper-wired axes, in particular the
+            # Triton kernel, which has no context-helper mechanism at all).
+            helper_name = iface.context_helper_for_functional(tp.repr_name)
+            if helper_name is None:
+                self.codegen_godel_number_calculation(tp, body)
+            else:
+                self.codegen_godel_number_calculation(
+                    tp, body, anamespace='scratch_params.', aname_override=helper_name)
         return body.getvalue()
 
-    def codegen_godel_number_calculation(self, tp: 'TemplateParam', fout, *, anamespace='args.'):
+    def codegen_godel_number_calculation(self, tp: 'TemplateParam', fout, *,
+                                          anamespace='args.', aname_override=None):
         if tp.radix <= 1:
             return
-        aname = tp.repr_name
+        # The scratch member is named after the context helper
+        # (ati.context_helper('flyc_block_dmodel')), not after the functional
+        # axis (BLOCK_DMODEL) it stands in for -- see
+        # codegen_context_helper_scratch_members's `scratch_params.<name>`
+        # naming (codegen/flyc.py). `aname_override` follows suit; the plain
+        # `args.` path is unaffected (aname stays the axis's own repr_name).
+        aname = aname_override if aname_override is not None else tp.repr_name
         INDENT = 4 * ' '
         print(INDENT + '{', file=fout)
         print(2 * INDENT + 'int64_t number = -1;', file=fout)
