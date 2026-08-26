@@ -42,7 +42,7 @@ class TaskDispatcher:
                    - arch: GPU architecture (str)
                    - module: Module name (str)
                    - class: which DAG this task starts, e.g. 'tune_kernel' (str)
-                   - tuning_level: 'kernel' | 'op' (str)
+                   - subclass: 'kernel' | 'op' | '' (str)
                    - task_config: Task configuration (dict)
                    - priority: Optional priority (int, default: 5)
             batch_size: Number of tasks per INSERT statement
@@ -65,7 +65,7 @@ class TaskDispatcher:
                         'arch': task['arch'],
                         'module': task['module'],
                         'class': task['class'],
-                        'subclass': task['tuning_level'],
+                        'subclass': task['subclass'],
                         'task_config': Jsonb(task['task_config']),
                         'priority': task.get('priority', 5)
                     })
@@ -97,7 +97,7 @@ class TaskDispatcher:
             VALUES (%(arch)s, %(module)s, %(class)s, %(subclass)s, %(task_config)s, %(priority)s)
         """, batch)
 
-    def dispatch_single(self, arch: str, module: str, tuning_level: str, task_config: dict,
+    def dispatch_single(self, arch: str, module: str, subclass: str, task_config: dict,
                          priority: int = 5, *, klass: str) -> int:
         """
         Dispatch a single task.
@@ -105,7 +105,7 @@ class TaskDispatcher:
         Args:
             arch: GPU architecture
             module: Module name
-            tuning_level: 'kernel' | 'op'
+            subclass: 'kernel' | 'op' | ''
             task_config: Task configuration
             priority: Task priority (higher = more urgent)
             klass: which DAG this task starts, e.g. 'tune_kernel'. Named
@@ -122,7 +122,7 @@ class TaskDispatcher:
                     INSERT INTO task_queue (arch, module, class, subclass, task_config, priority)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
-                """, (arch, module, klass, tuning_level, Jsonb(task_config), priority))
+                """, (arch, module, klass, subclass, Jsonb(task_config), priority))
 
                 task_id = cur.fetchone()[0]
                 conn.commit()

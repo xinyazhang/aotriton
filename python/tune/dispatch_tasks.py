@@ -287,7 +287,7 @@ def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
             'arch': task_config['arch'],
             'module': task_config['module'],
             'class': 'tune_kernel',
-            'tuning_level': task_config['tuning_level'],
+            'subclass': task_config['tuning_level'],
             'task_config': task_config,
             'priority': 5  # Default priority
         })
