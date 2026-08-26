@@ -23,43 +23,13 @@ from psycopg.rows import dict_row
 
 from .protocol import send_message, recv_message
 from ..utils import get_db_connection_params, configure_logging_with_flush
-from ..pq.queue import TaskQueue, TaskSubclassMismatch
+from ..pq.queue import TaskQueue, TaskSubclassMismatch, WORKLOAD_TASK_SELECTOR
 from ..pq.connection import ReconnectableConn
 from ..pq.extra_uts import get_extra_uts
 
 configure_logging_with_flush()
 
 logger = logging.getLogger(__name__)
-
-
-# workload -> (task_queue.class, task_queue.subclass) for fetch_tasks().
-#
-# The workload a node serves determines both, so it is the only thing callers
-# pass.
-#
-# The second element is matched literally against the denormalized
-# task_queue.subclass column (`AND subclass = %s`), so it is not free-form:
-# it must be a value the schema permits for that class. schema.sql enforces
-# the vocabulary:
-#
-#     CHECK ((class = 'tune_kernel'  AND subclass IN ('kernel', 'op')) OR
-#            (class = 'perf_measure' AND subclass = ''))
-#
-# which is why perfmon maps to the EMPTY string and not to 'kernel'. Pairing
-# perf_measure with 'kernel' produces a predicate the CHECK guarantees can
-# never match, so the worker claims nothing and does so silently -- no error,
-# no warning, just an idle reader. An earlier revision of this table did
-# exactly that on the theory that subclass was inert for perfmon.
-#
-# This mapping is where the tuning-domain vocabulary stops. `workload` is a
-# node-kind concept the .tune/ scripts own; below this line only the generic
-# queue terms class/subclass travel, because the queue also carries
-# perf_measure work that has no "tuning mode" at all.
-_WORKLOAD_TASK_SELECTOR: dict[str, tuple[str, str]] = {
-    'kernel':  ('tune_kernel', 'kernel'),
-    'op':      ('tune_kernel', 'op'),
-    'perfmon': ('perf_measure', ''),
-}
 
 
 class PGReaderWorker:
@@ -339,14 +309,14 @@ def main():
     # --class tune_kernel) and makes worker_service.sh derive downstream what
     # it already knows upstream.
     parser.add_argument('--workload', type=str, default='kernel',
-                       choices=list(_WORKLOAD_TASK_SELECTOR),
+                       choices=list(WORKLOAD_TASK_SELECTOR),
                        help='What this node serves. Selects the task class and, '
                             'for the tuning classes, the module filter: '
                             + ', '.join(f'{w} -> class={k}, subclass={s!r}'
-                                        for w, (k, s) in _WORKLOAD_TASK_SELECTOR.items()))
+                                        for w, (k, s) in WORKLOAD_TASK_SELECTOR.items()))
     args = parser.parse_args()
 
-    klass, subklass = _WORKLOAD_TASK_SELECTOR[args.workload]
+    klass, subklass = WORKLOAD_TASK_SELECTOR[args.workload]
 
     # Get database connection parameters
     from pathlib import Path
