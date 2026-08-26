@@ -7,6 +7,7 @@
 #include <aotriton/config.h>
 #include <aotriton/_internal/triton_kernel.h>
 #include <aotriton/_internal/pon.h>
+#include <aotriton/_internal/log.h>
 #include <aotriton/dtypes.h>
 #include <aotriton/runtime.h>
 #include <aotriton/util.h>
@@ -53,7 +54,31 @@ struct [[context_class_name]] {
     // populated once in lookup_optimal(), after the image is chosen and before
     // any launch, so grid_calculator() never parses on the launch path.
     Pon perf_;
-    Pon perf() const { return perf_; }
+    // item I: context helpers are evaluated earlier in lookup_optimal(), on
+    // the documented (and expiring) assumption that they never need perf() --
+    // see the context-helper-evaluate block in lookup_optimal() (flyc.cc)'s
+    // call site. That failure is otherwise
+    // silent (a default-constructed Pon, fallback quietly taken), so make the
+    // first violation loud instead: a helper that reads perf() before
+    // lookup_optimal() has set it gets a log line, not just a wrong answer.
+    bool perf_populated_ = false;
+    Pon perf() const {
+        if (!perf_populated_) {
+            AOTRITON_LOG(LOG_WARNING,
+                         "[[shim_kernel_name]] perf() read before perf_ is populated -- "
+                         "a context helper must not depend on perf() (see lookup_optimal())");
+        }
+        return perf_;
+    }
+
+    // The Gpu lookup_optimal(Gpu gpu) was called with (item I). Context
+    // helpers take no arguments by design -- see context_helper_declares
+    // below -- so this is how one that needs the arch reaches it: call
+    // get_archmod_number(current_gpu) itself. Not an arch_number/mod_number
+    // pair, so a helper is free to ask either question rather than being
+    // boxed into godel_number()'s. Set once, at the top of lookup_optimal(),
+    // before any helper can run.
+    Gpu current_gpu = GPU_ARCH_UNKNOWN;
 
     // Context helpers: host-side computations a plain operand rename cannot
     // express (`ati.context_helper(...)` on an @ati.scalar/@ati.tensor). The

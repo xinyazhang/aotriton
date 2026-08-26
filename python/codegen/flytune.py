@@ -177,10 +177,18 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         pattern") is the one this reverted, no-fold implementation actually
         produces. See the Phase A execution report for the full writeup.
 
-        Context helpers (if any) are populated by a preamble right before the
-        return statement -- their return value has no other stable home for
-        pp_args's `const context&` signature to take the address of (see
-        ir/flyc/kdesc.py's iter_context_helpers / iter_launch_arguments)."""
+        Context helpers (if any) are populated once, in `lookup_optimal()`,
+        BEFORE pp_args ever runs (item I, PLAN-PHASE2.md Task 5 option (b);
+        see codegen/flyc.py's codegen_context_helper_evaluate). pp_args here
+        only READS `context.scratch_params.<name>` -- via
+        iter_launch_arguments's 'context_helper' LaunchArg kind -- it does not
+        populate it. This used to be pp_args's job (a preamble right before
+        the return statement, evaluated once per deduplicated pp_args
+        registration rather than once per description), which double-counted
+        nothing today only because there is exactly one pp_args registration
+        per description in Phase 2 -- but was the wrong home regardless:
+        `iter_context_helpers` is per-description, and pp_args is
+        per-functional and deduplicated, not per-description."""
         kdesc = self._f.meta_object
         pp_registry = self._parent_repo.get_signatured_function_registry('pp_function')
         largs = list(kdesc.iter_launch_arguments(self._f.arch))
@@ -189,15 +197,6 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         if hit:
             return findex
         stmt = []
-        for name, ctype in kdesc.iter_context_helpers():
-            # The helper is a member function of the context (hand-implemented
-            # in modules/<family>/csrc/<kernel>.cc, PLAN-PHASE2.md Task 6, out of
-            # scope for Tasks 1-5): the generator only declares
-            # `<ctype> <name>() const;` on the context (flyc.h's
-            # context_helper_declares slot). Calling it through `context.` here
-            # keeps pp_args a free function while still reading the context's
-            # own params/tensors.
-            stmt.append(f'context.scratch_params.{name} = context.{name}();')
         ret_lines = [larg.expr + f', // {larg.aname}' for larg in largs]
         pfx = '  return { '
         join = '\n' + ' ' * len(pfx)

@@ -48,6 +48,10 @@ hipError_t
     // lookup_optimal() as well.
     if (!launch_condition)
       return hipSuccess;
+    // item I: capture the Gpu before anything below (including a context
+    // helper) can ask for it. See flyc.h's current_gpu for why this is a
+    // member and not a parameter threaded through godel_number()/helpers.
+    current_gpu = gpu;
 #if AOTRITON_BUILD_FOR_TUNING && [[shared_iface]]
     if (call_options) {
         auto& kctl = *call_options->kernel_fine_control[KERNEL_SLOT_INDEX];
@@ -71,6 +75,31 @@ hipError_t
         }
     }
 #endif
+
+    // item I / PLAN-PHASE2.md Task 5, option (b): evaluate every context
+    // helper exactly once, here, and cache the results in scratch_params --
+    // godel_number() (right below) and pp_args (in launch(), later) both
+    // read scratch_params afterwards, so nothing is computed twice and there
+    // is exactly one place a helper's return value is produced.
+    //
+    // This rests on an assumption we are CHOOSING, not a property we found:
+    // every context helper is a pure function of `params` and `current_gpu`
+    // alone, and helpers are mutually independent. It holds for every helper
+    // that exists today (PLAN-PHASE2.md Task 5/6), but nothing enforces it on
+    // a future one, and this is a scope decision with an expiry, not a law --
+    // revisit it (a topological sort over declared dependencies, or lazy
+    // memoised accessors) the day a helper genuinely needs perf() or another
+    // helper's result. Until then, breaking either half of the assumption
+    // fails SILENTLY:
+    //   * a helper reading perf() below gets a default-constructed Pon (perf_
+    //     is not populated until after kernel selection, further down this
+    //     function) -- get_int/get_bool quietly take their fallback;
+    //   * a helper reading another helper's scratch member gets that
+    //     member's zero-initialised value, not the other helper's actual
+    //     result.
+    // Neither raises, which is exactly why this must be written down here
+    // and not discovered by debugging a wrong answer.
+    [[context_helper_evaluate]]
 
     auto [arch_number, mod_number] = get_archmod_number(gpu);
     if (arch_number < 0) {
@@ -106,6 +135,7 @@ hipError_t
     // once before launch and already touches the selected kernel -- so
     // grid_calculator() never parses on the launch path.
     perf_ = Pon(kernel_on_device->psel());
+    perf_populated_ = true;
 
 #if AOTRITON_BUILD_FOR_TUNING && [[shared_iface]]
     if (call_options) {
