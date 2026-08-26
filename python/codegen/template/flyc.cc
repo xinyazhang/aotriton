@@ -246,6 +246,11 @@ const char [[shim_kernel_name]]_packed_string[] =
 [[kernel_table_entries]]
 };
 
+// item I: the compiled head-dim ladder(s) -- see flyc.h's declares. GENERATED
+// from the same surviving-functional set that fills autotune_table above, so
+// it cannot silently drift from what this kernel actually compiles.
+[[compiled_rung_table_defs]]
+
 }
 
 // vim: set fileencoding=utf-8
