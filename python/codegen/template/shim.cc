@@ -45,6 +45,13 @@ hipError_t
     // lookup_optimal() as well.
     if (!launch_condition)
       return hipSuccess;
+    // item I: mirrors flyc.h's current_gpu (see there for the rationale).
+    // Nothing on this path reads it yet -- the Triton shim has no
+    // context-helper mechanism (item I's Triton half is out of scope this
+    // pass) -- but setting it here keeps the two templates from silently
+    // diverging on whether `gpu` was captured, so a future helper here is a
+    // later addition rather than a template rewrite.
+    current_gpu = gpu;
 #if AOTRITON_BUILD_FOR_TUNING && [[shared_iface]]
     if (call_options) {
         auto& kctl = *call_options->kernel_fine_control[KERNEL_SLOT_INDEX];
