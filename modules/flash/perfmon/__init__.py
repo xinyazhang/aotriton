@@ -25,6 +25,13 @@ from . import entry as _entry
 from . import tflops as _tflops
 
 
+#: Largest seqlen each arch can hold. Absent -> no limit.
+#: Populated from measurement, not guesswork -- an arch missing here is
+#: unconstrained, which is the safe direction (it fails loudly at run time
+#: rather than silently skipping coverage).
+_MAX_SEQLEN_BY_ARCH: dict[str, int] = {}
+
+
 def _n_heads_for_tflops(entry) -> int:
     """FLOPs scale with the number of QUERY heads; for GQA (`N_HEADS` a
     `(num_q_heads, num_kv_heads)` tuple) that is element 0 -- the same
@@ -41,6 +48,28 @@ class PerfDesc(PerfDescription):
     #: Bare op-level interface names perfmon measures end-to-end (D3) --
     #: matches `modules/flash/tune/level_op.py:list_impls`.
     IFACES = ('attn_fwd', 'attn_bwd')
+
+    #: Optional per-run ceiling, set by the caller (e.g. dispatch's
+    #: --max_seqlen), combined with _MAX_SEQLEN_BY_ARCH in
+    #: validate_hw_feature(). None (the default) means no caller-supplied
+    #: limit.
+    max_seqlen: int | None = None
+
+    def validate_hw_feature(self, arch: str, entry) -> tuple[bool, str]:
+        """Enforce the per-GPU sequence-length ceiling (rev0 §6: 16k is too
+        large for some GPUs). The effective ceiling is the smaller of
+        _MAX_SEQLEN_BY_ARCH[arch] (measured, currently empty -- see that
+        table's docstring) and self.max_seqlen (an optional caller-supplied
+        limit); either or both may be absent, in which case there is no
+        ceiling from that source."""
+        limits = [v for v in (self.max_seqlen, _MAX_SEQLEN_BY_ARCH.get(arch))
+                  if v is not None]
+        if not limits:
+            return True, ''
+        limit = min(limits)
+        if entry.seqlen_q > limit or entry.seqlen_k > limit:
+            return False, f"seqlen > {limit} exceeds this arch's ceiling"
+        return True, ''
 
     def prime_entries(self, arch: str, max_seqlen: int):
         yield from _entry.prime_entries(max_seqlen)

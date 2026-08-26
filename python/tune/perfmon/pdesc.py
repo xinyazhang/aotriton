@@ -60,6 +60,16 @@ class PerfDescription(ABC):
     #: of THIS class, not of `ENTRY_CLASS` -- see their docstrings.
     INPUT_METADATA: type
 
+    def validate_hw_feature(self, arch: str, entry) -> tuple[bool, str]:
+        """(supported, reason). Called per (arch, entry); False skips the
+        entry. `reason` is printed once per (arch, reason), never per entry.
+
+        Same contract as `aotriton.tune.tdesc.TuningDescription.
+        validate_hw_feature` (tdesc.py:180). Default: everything is
+        supported. Subclasses override to reject hardware-unsupported
+        configurations (e.g. a per-arch sequence-length ceiling)."""
+        return True, ''
+
     @abstractmethod
     def prime_entries(self, arch: str, max_seqlen: int) -> Iterator:
         """Yield `ENTRY_CLASS` instances for the "prime" set (rev0 §6.1):
