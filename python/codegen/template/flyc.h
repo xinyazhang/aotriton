@@ -122,6 +122,18 @@ struct [[context_class_name]] {
     typedef int (*AutoTuneTableEntry)([[context_class_name]]& context, int mod_number);
     static AutoTuneTableEntry autotune_table[][ kMaxGodelNumber ];
 
+    // item I: the compiled head-dim ladder(s), arch-indexed exactly like
+    // autotune_table above (same arch_number ordering). GENERATED from the
+    // same surviving-functional set that fills autotune_table -- not
+    // hand-maintained -- so it cannot silently drift from what was actually
+    // compiled (PLAN-PHASE2.md Task 5/6 sub-step (d)). Two parallel arrays,
+    // not a struct, so no new type name has to be family-unique: one entry
+    // per helper-wired, non-bool functional axis (today: BLOCK_DMODEL only;
+    // PADDED_HEAD is derived from the rounding decision in the hand-written
+    // helper below, not itself table-driven). Empty when this kernel wires
+    // no such axis to a context helper.
+    [[compiled_rung_table_declares]]
+
     // Mutable scratch storage for context-helper results (PLAN-PHASE2.md Task 5,
     // option (b)): assigned once by pp_args (a free function taking `const
     // [[context_class_name]]&`, hence `mutable` -- pp_args is not a member and

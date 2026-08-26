@@ -67,6 +67,7 @@ class FlycShimGenerator(InterfaceGenerator):
             'func_fields'           : codegen_struct_cfields(kdesc.func_cfields, nalign=4),
             'context_helper_declares'        : self.codegen_context_helper_declares(),
             'context_helper_scratch_members' : self.codegen_context_helper_scratch_members(),
+            'compiled_rung_table_declares'   : self.codegen_compiled_rung_table_declares(),
             'declare_compiled_in_features'  : self.codegen_declare_compiled_in_features(),
             'kernel_table_entry_declares'   : self.codegen_tune_table_entry_declares(functionals),
             'number_of_functionals' : kdesc.godel_number,
@@ -90,6 +91,8 @@ class FlycShimGenerator(InterfaceGenerator):
             'param_class_name'    : kdesc.param_class_name,
             'context_class_name'  : kdesc.context_class_name,
             'godel_number_body'   : self.codegen_godel_number_body(),
+            'context_helper_evaluate' : self.codegen_context_helper_evaluate(),
+            'compiled_rung_table_defs' : self.codegen_compiled_rung_table_defs(functionals),
             'pp_func_num'         : pp_func_num,
             'list_of_pp_args_function_defs'  : list_of_pp_args_function_defs,
             'list_of_pp_args_function_decls' : list_of_pp_args_function_decls,
@@ -141,9 +144,122 @@ const std::vector<{infotype}>& {meta_class}::get_{tp.repr_name}_choices()
             def_list.append(def_code)
         return '\n'.join(def_list)
 
+    def _rung_table_params(self):
+        """Functional axes with an item-I compiled-rung table (sub-step (d)):
+        helper-wired (`context_helper_for_functional` answers) and not a
+        plain bool. PADDED_HEAD is itself boolean and is derived from the
+        rounding decision made against BLOCK_DMODEL's table
+        (modules/flash/csrc/<kernel>.cc's hand-written helper), not
+        table-driven on its own -- excluded here even once wired, so it gets
+        no (degenerate, {false,true}) table of its own."""
+        kdesc = self._iface
+        params = []
+        for tp in kdesc.list_functional_params():
+            helper_name = kdesc.context_helper_for_functional(tp.repr_name)
+            if helper_name is None:
+                continue
+            if tp.repr_typed_choice.itype == 'bool':
+                continue
+            params.append(tp)
+        return params
+
+    def codegen_compiled_rung_table_declares(self):
+        params = self._rung_table_params()
+        if not params:
+            return '// no compiled-rung table for this kernel'
+        lines = []
+        for tp in params:
+            lname = tp.repr_name.lower()
+            ctype = tp.repr_typed_choice.itype
+            lines.append(f'static const {ctype}* const compiled_{lname}[];')
+            lines.append(f'static const int compiled_{lname}_count[];')
+        return '\n    '.join(lines)
+
+    def codegen_compiled_rung_table_defs(self, functionals):
+        """Item I sub-step (d): GENERATE the per-arch compiled rung table(s),
+        one per axis `_rung_table_params` finds, from the same `functionals`
+        list that fills autotune_table -- not from a second, hand-maintained
+        ladder -- so the table cannot silently drift from what this kernel
+        actually compiles.
+
+        Gate I property 2 ("the generated rung table equals the set of
+        values whose functionals were not disabled") is asserted here, not
+        just claimed: `expected` is recomputed independently, via a fresh
+        `gen_functionals` pass filtered by `is_functional_disabled` directly,
+        bypassing the `functionals` argument entirely. If some future change
+        filtered `functionals` by anything other than that predicate before
+        it reached this generator, this assertion -- not a code reviewer --
+        would be the one to notice."""
+        kdesc = self._iface
+        params = self._rung_table_params()
+        if not params:
+            return ''
+        context_class_name = kdesc.context_class_name
+        blocks = []
+        for tp in params:
+            axis = tp.axis
+            lname = tp.repr_name.lower()
+            ctype = tp.repr_typed_choice.itype
+            row_defs = []
+            row_names = []
+            counts = []
+            for arch_number, target_arch in enumerate(self._target_arch_keys):
+                surviving = sorted({
+                    f.resolved[axis.repr_arg].triton_compile_signature
+                    for f in functionals if f.arch == target_arch})
+                expected = sorted({
+                    f.resolved[axis.repr_arg].triton_compile_signature
+                    for f in kdesc.gen_functionals({target_arch: self._target_arch[target_arch]})
+                    if not kdesc.is_functional_disabled(f)})
+                assert surviving == expected, (
+                    f'flyc kernel {kdesc.NAME!r}: compiled-rung table for '
+                    f'{tp.repr_name!r} on {target_arch!r} ({surviving}) does not '
+                    f'match the independently recomputed not-disabled set '
+                    f'({expected}) -- functionals passed to write_shim_source '
+                    f'diverged from is_functional_disabled')
+                assert surviving, (
+                    f'flyc kernel {kdesc.NAME!r}: no surviving {tp.repr_name!r} '
+                    f'value on {target_arch!r} -- every functional is disabled '
+                    f'(this kernel cannot round anything to a compiled rung there)')
+                row_name = f'{context_class_name}_compiled_{lname}_{arch_number}'
+                row_names.append(row_name)
+                literal = ', '.join(str(v) for v in surviving)
+                row_defs.append(f'static constexpr {ctype} {row_name}[] = {{ {literal} }};')
+                counts.append(str(len(surviving)))
+            ptr_array = (f'const {ctype}* const {context_class_name}::compiled_{lname}[] = '
+                         f'{{ {", ".join(row_names)} }};')
+            count_array = (f'const int {context_class_name}::compiled_{lname}_count[] = '
+                           f'{{ {", ".join(counts)} }};')
+            blocks.append('\n'.join(row_defs + [ptr_array, count_array]))
+        return '\n\n'.join(blocks)
+
     def codegen_context_helper_declares(self):
         kdesc = self._iface
         lines = [f'{ctype} {name}() const;' for name, ctype in kdesc.iter_context_helpers()]
+        return '\n    '.join(lines)
+
+    def codegen_context_helper_evaluate(self):
+        """Fills `[[context_helper_evaluate]]` in `lookup_optimal()` (item I,
+        PLAN-PHASE2.md Task 5 option (b)): evaluate every context helper exactly
+        once, here, instead of in the pp_args preamble
+        (codegen/flytune.py:codegen_deduplicated_pp_args_function_index used to
+        do this; that loop is removed now that this is its one call site).
+
+        `iter_context_helpers` is per-description, and `lookup_optimal` is a
+        per-description method (unlike pp_args, which is per-functional and
+        deduplicated) -- so this is the natural home: one evaluation, not one
+        per surviving functional sharing a pp_args registration.
+
+        Unlike the pp_args line this replaces (`context.scratch_params.<name> =
+        context.<name>();`, a FREE function reading `const Context& context`),
+        this slot is spliced directly into the member function
+        `[[context_class_name]]::lookup_optimal`, so there is no `context`
+        local -- `this` is implicit and the members are named directly."""
+        kdesc = self._iface
+        lines = [f'scratch_params.{name} = {name}();'
+                 for name, ctype in kdesc.iter_context_helpers()]
+        if not lines:
+            return '// no context helpers'
         return '\n    '.join(lines)
 
     def codegen_context_helper_scratch_members(self):
