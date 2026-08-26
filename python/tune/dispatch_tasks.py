@@ -153,9 +153,16 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
         verbose: Print debug info
 
     Raises exception if connection fails - caller should handle errors.
+
+    D08: the SELECT itself now lives in pq/ (TaskQueue.completed_task_configs)
+    -- CLAUDE.md forbids raw SQL outside pq/, and the query used to hardcode
+    class='tune_kernel', which this function is the only caller of, so
+    it is passed explicitly here rather than assumed by the query.
     """
     import psycopg
     from psycopg.rows import dict_row
+    from .pq.queue import TaskQueue
+    from .dispatch.driver import make_hashable_key
 
     # Get PostgreSQL connection parameters
     conn_params = get_db_connection_params()
@@ -164,42 +171,21 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
     entry_class = module_instance.ENTRY_CLASS
     entry_field_names = tuple(f.name for f in fields(entry_class))
 
-    # Convert task_config to hashable tuple: (arch, field1_val, field2_val, ...)
-    def make_hashable(task_config):
-        arch = task_config['arch']
-        entry_dict = task_config['entry']
-        field_values = tuple(entry_dict[fname] for fname in entry_field_names)
-        return (arch,) + field_values
-
     # Connect to PostgreSQL - let exceptions propagate
     conn = psycopg.connect(**conn_params, row_factory=dict_row)
 
     try:
-        with conn.cursor() as cur:
-            # Query task_queue for completed tasks for this module
-            cur.execute("""
-                SELECT task_config
-                FROM task_queue
-                WHERE status = 'completed'
-                  AND module = %s
-                  AND class = 'tune_kernel'
-                  AND subclass = %s
-            """, (module_name, tuning_mode))
+        task_queue = TaskQueue(conn)
+        task_configs = task_queue.completed_task_configs(
+            module_name, klass='tune_kernel', subklass=tuning_mode)
 
-            # Extract task_config from each row and convert to hashable tuple
-            def extract_config(row):
-                task_config = row['task_config']
-                # task_config is already a dict from JSONB
-                if isinstance(task_config, dict):
-                    return make_hashable(task_config)
-                return None
+        completed_configs = {make_hashable_key(entry_field_names, tc)
+                              for tc in task_configs}
 
-            completed_configs = set(filter(None, map(extract_config, cur.fetchall())))
+        if verbose:
+            print(f"Found {len(completed_configs)} completed tasks for module '{module_name}'")
 
-            if verbose:
-                print(f"Found {len(completed_configs)} completed tasks for module '{module_name}'")
-
-            return completed_configs
+        return completed_configs
 
     finally:
         conn.close()

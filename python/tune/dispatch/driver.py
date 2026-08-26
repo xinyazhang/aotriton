@@ -77,16 +77,31 @@ class EntrySource(Protocol):
         ...
 
 
-def _make_hashable(entry_field_names: tuple[str, ...], task_config: dict):
-    """`(arch,) + entry field values` -- the dedup key shared by both
-    workloads (dispatch-perfmon.md §5.4). Derived from whichever
+def make_hashable_key(entry_field_names: tuple[str, ...], task_config: dict):
+    """`(arch,) + entry field values + (preset,)` -- the dedup key shared by
+    both workloads (dispatch-perfmon.md §5.4, D08). Derived from whichever
     `ENTRY_CLASS` the source declares, so this one function works for both
     `FlashEntry` (tuning) and `FlashEntry` (perfmon, D03) alike -- they
-    happen to share a name today, but nothing here assumes that."""
+    happen to share a name today, but nothing here assumes that.
+
+    `task_config.get('preset')` is always appended, even though tuning's
+    task_config never has a `'preset'` key: `.get()` then reliably returns
+    `None` on both sides of the comparison (this function computes the key
+    for both freshly-generated task_configs here and for completed ones
+    fetched by `TaskQueue.completed_task_configs`), so it is a no-op for
+    tuning and, for perfmon, folds the preset into the entry's identity for
+    free -- 'free' because `preset` lives inside `task_config`, not as a
+    separate parameter this function would otherwise need.
+
+    Public (no leading underscore): `dispatch_tasks.py`'s
+    `get_completed_tasks` must hash completed rows with the exact same
+    scheme this module uses for freshly-generated ones, or `--skip_completed`
+    would silently stop deduplicating; importing this one definition is how
+    that is guaranteed rather than merely hoped for."""
     arch = task_config['arch']
     entry_dict = task_config['entry']
     field_values = tuple(entry_dict[fname] for fname in entry_field_names)
-    return (arch,) + field_values
+    return (arch,) + field_values + (task_config.get('preset'),)
 
 
 def dispatch(*, source: EntrySource, arch_list: list[str], conn_params: dict,
@@ -132,7 +147,7 @@ def dispatch(*, source: EntrySource, arch_list: list[str], conn_params: dict,
                 task_config = source.task_config(batch, arch, entry)
 
                 if args.skip_completed:
-                    config_key = _make_hashable(entry_field_names, task_config)
+                    config_key = make_hashable_key(entry_field_names, task_config)
                     if config_key in completed:
                         skipped_count += 1
                         if args.verbose:

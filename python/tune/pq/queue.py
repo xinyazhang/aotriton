@@ -521,6 +521,37 @@ class TaskQueue:
                 f'WHERE id = ANY(%s) ORDER BY arch, id', (task_ids,))
             return cur.fetchall()
 
+    def completed_task_configs(self, module: str, *, klass: str,
+                               subklass: str) -> list[dict]:
+        """task_config of every completed row for one (module, class,
+        subclass).
+
+        Moved here from dispatch_tasks.py's old `get_completed_tasks`
+        (dispatch-perfmon-exec.md D08): that function inlined this exact
+        SELECT outside pq/ (a CLAUDE.md violation) and hardcoded
+        `class = 'tune_kernel'`, so a perfmon re-dispatch's --skip_completed
+        would have compared against tuning rows (or matched nothing, since
+        perfmon's subclass is `''`, never `'kernel'`/`'op'`). This method
+        takes both `klass` and `subklass` explicitly instead.
+
+        Returns bare `task_config` dicts (already decoded from JSONB); the
+        caller (dispatch_tasks.py) still owns turning each into a hashable
+        dedup key -- that hashing is workload-specific (which fields make an
+        entry's identity, whether `preset` should join the key), not a
+        schema concern.
+        """
+        with self.conn.cursor(row_factory=dict_row) as cur:
+            cur.execute("""
+                SELECT task_config
+                FROM task_queue
+                WHERE status = 'completed'
+                  AND module = %s
+                  AND class = %s
+                  AND subclass = %s
+            """, (module, klass, subklass))
+            return [row['task_config'] for row in cur.fetchall()
+                    if isinstance(row['task_config'], dict)]
+
     def get_progress(self, klass: str, subklass: str, *,
                      recent_window: str = '5 minutes',
                      stale_seconds: int = 7200) -> dict:
