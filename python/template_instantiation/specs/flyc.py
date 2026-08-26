@@ -10,10 +10,11 @@ a triton kernel — NOT routed through describe(): describe() validates that spe
 claim every parameter of a known (AST-parsed) signature exactly once, and a flyc
 description has no such signature (the hsaco kernarg ABI is declared by the
 @ati.tensor/@ati.scalar stack itself, not introspected from a def). Collected
-passively instead, like AffineDecl: the disable predicate, the cite(s), the module
-path, the placeholder function, the registered hints dataclass, and the
-tensor/scalar specs as an inert list — nothing here is built or validated.
-`aotriton.flyc_compile` (Phase 1's only consumer) reads `source_path` and `hints()`.
+passively instead, like AffineDecl: the disable predicate, the cite(s), the
+vendored flyc directory, the placeholder function, the registered hints
+dataclass, and the tensor/scalar specs as an inert list — nothing here is
+built or validated. `aotriton.flyc_compile` (Phase 1's only consumer) reads
+`source_path` and `hints()`.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from .node import BuildableDecl, derived_decl_fields
 from .bundle import partition
-from ..ast_params import find_one_function, has_decorator_attr, collect_params
+from ..ast_params import find_one_function, collect_params
 
 if TYPE_CHECKING:
     from ..decorators.disable import DisableSpec
@@ -46,10 +47,15 @@ class FlycDecl(BuildableDecl):
       hints_cls       the @ati.flyc.hints dataclass (tune)
       fn              the deferred builder the FlyDSL compiler calls (build)
 
-    Everything else -- the kernarg ABI specs, cites, disable, params, and the
-    vendored kernel file as `source_path` -- is the shared vocabulary. This
-    record used to carry that path a SECOND time as `module_path`, one fact
-    under two names with nothing keeping them equal.
+    Everything else -- the kernarg ABI specs, cites, disable, params -- is the
+    shared vocabulary. `source_path` is ALSO shared by name, but for a
+    `FlycDecl` it means something narrower than for a Triton `KernelDecl`
+    since item D: the vendored flyc DIRECTORY (e.g.
+    `modules/flash/flyc/`), not a specific kernel file -- the description no
+    longer names one until its builder resolves `arch` (see
+    decorators/flyc.py). This record used to also carry that path a SECOND
+    time as `module_path`, one fact under two names with nothing keeping them
+    equal.
 
     `cites` is plural (inherited): stacking several `@ati.cite` is a deliberate
     pattern, "citation mode (b)". `disable` stays singular, enforced by
@@ -68,23 +74,67 @@ class FlycDecl(BuildableDecl):
         return self.hints_cls()
 
 
-def _flyc_kernel_stub(module_path, name):
-    """AST-parse `module_path` (the vendored kernel file) for the unique
-    `@flyc.kernel`-decorated function and wrap it as a `KernelStub` -- the same
+def _flyc_kernel_stub(module_path, kernel_name):
+    """AST-parse `module_path` (the vendored kernel file) for the function
+    named EXACTLY `kernel_name` and wrap it as a `KernelStub` -- the same
     non-importing stand-in `@ati.source` builds for a Triton kernel
-    (decorators/source.py). Unlike a Triton kernel (looked up by NAME,
-    top-level only), the flyc kernel def is looked up by DECORATOR and may sit
-    in a nested scope, so this walks every scope (`walk=True`) and requires the
-    match to be unique."""
+    (decorators/source.py).
+
+    Selected by NAME, not by "the unique `@flyc.kernel`-decorated function in
+    this file" (item G part 2): an explicit name is what the description
+    itself declares (`build.flyc_kernel_name`, set by the builder once `arch`
+    is known -- see decorators/flyc.py), and matching it exactly is robust to
+    a vendored file someday holding more than one `@flyc.kernel` def, which a
+    uniqueness assumption is not. The flyc kernel def may still sit in a
+    nested scope (unlike a top-level-only Triton kernel), so this walks every
+    scope (`walk=True`)."""
     from ..decorators.source import KernelStub
 
     path = Path(module_path)
     tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
-    what = f'flyc kernel {name!r}: {path}'
-    fn = find_one_function(tree, lambda n: has_decorator_attr(n, 'kernel'),
+    what = f'flyc kernel {kernel_name!r}: {path}'
+    fn = find_one_function(tree, lambda n: n.name == kernel_name,
                            walk=True, what=what)
     params = collect_params(fn, what=what)
     return KernelStub(fn.name, params, str(path))
+
+
+def _synth_param_order(tensors, scalars):
+    """A stable declaration-order parameter list, used ONLY to seed
+    `build_kernel`'s axis-anchor computation (`builder/kernel.py`'s
+    `_build_axes`, which needs SOME `{name: index}` map covering every
+    declared `@ati.tensor`/`@ati.scalar` `arg_name` or it raises `KeyError`).
+
+    Deliberately NOT the real, AST-parsed flyc kernel signature (that used to
+    be `decl.params`'s job, via an eager `_flyc_kernel_stub` call right here).
+    Post item D, the real per-arch kernel file/def name lives on the `build`
+    closure the description's builder function returns, which cannot be
+    called this early: link time (`codegen/linker.py:_build_flycs`, where
+    `build_kernel` runs) has no `Functional` yet, and every flyc builder seen
+    so far reads real `choices` values before setting
+    `build.flyc_source`/`build.flyc_kernel_name` -- so resolving the real
+    stub is only possible once a concrete functional exists, i.e. at
+    generate time (`codegen/flytune.py`'s `_gen_signatures`, per functional).
+    That is where `ir/flyc/kdesc.py`'s `iter_launch_arguments` gets ITS real,
+    per-arch parameter order from -- this function's output never reaches
+    codegen (`BuiltKernel.arguments`/`.axes` are both dead weight for flyc,
+    see kdesc.py's `iter_launch_arguments` and `_axes_overrides`).
+
+    Sound as an anchor order because every flyc description already keeps its
+    `@ati.tensor`/`@ati.scalar` stack in the real kernel's argument order by
+    convention (see flyc_attn_fwd.py's "the kernarg ABI, in
+    flash_attn_func_aiw_kernel order" comment): `_build_axes` only needs a
+    stable RELATIVE order to sort axes it never emits, not the literal
+    AST-derived names or the stride parameters this list omits."""
+    from ..introspect import ParamSpec
+
+    seen = []
+    for spec in (*tensors, *scalars):
+        for name in spec.arg_names:
+            if name not in seen:
+                seen.append(name)
+    return [ParamSpec(name=n, is_constexpr=False, annotation=ParamSpec.EMPTY)
+            for n in seen]
 
 
 def partition_flyc(specs):
@@ -109,7 +159,14 @@ def partition_flyc(specs):
 
 def collect_flyc_decl(placeholder, specs):
     """Partition an @ati.flyc stack into a passive FlycDecl (no build, no
-    describe() validation)."""
+    describe() validation).
+
+    Does NOT resolve a real kernel stub anymore (item D): `FlycKernelSpec`
+    carries no path, so there is no vendored file to AST-parse yet -- only
+    the description's builder function, once called with a concrete `arch`,
+    knows which file/def to use (`build.flyc_source`/`build.flyc_kernel_name`).
+    That resolution happens later, per arch, in `codegen/flytune.py`; see
+    `_synth_param_order` for why `params` does not need it either."""
     from ..decorators.flyc import FlycKernelSpec, FlycHintsSpec
 
     b = partition_flyc(specs)
@@ -128,19 +185,24 @@ def collect_flyc_decl(placeholder, specs):
     b.unrecognized = remaining
     b.reject_remaining('@ati.flyc')
     assert marker is not None, '@ati.start flyc path without an @ati.flyc.kernel marker'
-    # The DESCRIPTION module's own file (e.g. modules/flash/aot/flyc_attn_fwd.py),
-    # NOT marker.module_path (the vendored kernel file under modules/flash/flyc/).
+    # The DESCRIPTION module's own file (e.g. modules/flash/aot/flyc_attn_fwd.py).
     # This is what codegen/root.py's Fly.compile DESC column feeds to
     # `aotriton.flyc_compile <desc_path> --kernel_name ...` (Task 5c).
     desc_path = Path(inspect.getfile(placeholder)).resolve()
-    from ..introspect import kernel_params
-    stub = _flyc_kernel_stub(marker.module_path, placeholder.__name__)
+    # The vendored flyc directory, a fixed sibling of the description
+    # family's own package (modules/flash/aot/flyc_attn_fwd.py's parent's
+    # parent, plus 'flyc') -- the same directory `@ati.flyc.kernel(path)`
+    # used to resolve `path` against, before item D removed the path.
+    vendored_dir = desc_path.parent.parent / 'flyc'
+    fields = derived_decl_fields(None, b.disable, name=placeholder.__name__)
+    fields['source_path'] = str(vendored_dir)
     # `name` passed explicitly: the flyc DESCRIPTION's identity, not the
-    # AST-located @flyc.kernel def's name in the vendored file.
+    # (no longer eagerly known) AST-located @flyc.kernel def's name in the
+    # vendored file.
     return FlycDecl(desc_path=desc_path,
                     hints_cls=hints_cls, fn=placeholder,
-                    params=kernel_params(stub), tensors=b.tensors,
+                    params=_synth_param_order(b.tensors, b.scalars),
+                    tensors=b.tensors,
                     scalars=b.scalars, overrides=b.overrides,
                     dtype_vars=b.dtype_vars, cites=b.cites,
-                    **derived_decl_fields(stub, b.disable,
-                                          name=placeholder.__name__))
+                    **fields)

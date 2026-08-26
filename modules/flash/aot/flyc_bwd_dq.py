@@ -87,8 +87,8 @@ def _flyc_bwd_dq_disabled(f):
 @ati.scalar('hdim_vo',    'i32',  wires_to='hdim_vo')
 @ati.scalar('sm_scale',   'fp32', wires_to='sm_scale')
 @ati.flyc.hints(FlycBwdHints)
-@ati.flyc.kernel('../flyc/fmha_bwd_dq_gfx1201_kernel.py')
-def flyc_bwd_dq(choices, hints):
+@ati.flyc.kernel()
+def flyc_bwd_dq(arch, choices, hints):
     """Build one dQ/dB hsaco for the functional described by `choices`.
 
     Build-time only (`aotriton.flyc_compile`); the generator calls this for its
@@ -125,6 +125,13 @@ def flyc_bwd_dq(choices, hints):
         so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
         from fmha_bwd_dq_gfx1201_kernel import build_bwd_dq_module_primary
         return build_bwd_dq_module_primary(meta, knobs)
+
+    # Two plain strings (item D): the vendored file, relative to
+    # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
+    # Read by codegen/flytune.py and flyc_compile.py off the `build` closure
+    # WITHOUT ever calling it.
+    build.flyc_source = 'fmha_bwd_dq_gfx1201_kernel.py'
+    build.flyc_kernel_name = 'bwd_dq_kernel'
 
     # `block_m` is already a knob here, so the sidecar needs nothing added --
     # unlike flyc_bwd_dkdv.py, which has to re-derive its grid's block_n.

@@ -282,8 +282,8 @@ def _flyc_fwd_disabled(f):
 # so they are not perf fields on the context. They have to reach it some other way —
 # the JSON sidecar folded into the compiled-in metadata is the obvious candidate.
 @ati.flyc.hints(FlycFwdHints)
-@ati.flyc.kernel('../flyc/flash_attn_func_gfx1201_aiw.py')
-def flyc_attn_fwd(choices, hints):
+@ati.flyc.kernel()
+def flyc_attn_fwd(arch, choices, hints):
     """Build one hsaco for the functional described by `choices`, optimized
     for `hints`.
 
@@ -324,7 +324,8 @@ def flyc_attn_fwd(choices, hints):
     GENERATOR-side, where the linked IR exists; this function runs DRIVER-side,
     where only `--signature` text exists. `choices` is not a `Functional` and
     must not grow into one -- if a build body ever needs arch, it arrives as an
-    explicit third parameter from `--target`, not smuggled into `choices`.
+    explicit FIRST parameter (from `f.arch` / `--target`), not smuggled into
+    `choices`.
 
     Today `resolve_knobs` reads no field of `hints` — FlyDSL's tuner is currently
     seqlen-independent, so the count stays at one per functional and every field sits
@@ -376,5 +377,15 @@ def flyc_attn_fwd(choices, hints):
         so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
         from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
         return build_flash_attn_func_aiw_module_primary(meta, knobs)
+
+    # Two plain strings (item D): the vendored file, relative to
+    # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
+    # Set here (arch is gfx1201-only today, but this is where a future arch
+    # branch would pick a different pair) rather than at decoration time,
+    # because only the builder -- not `@ati.flyc.kernel()` -- ever resolves a
+    # concrete `arch`. Read by codegen/flytune.py and flyc_compile.py off the
+    # `build` closure WITHOUT ever calling it.
+    build.flyc_source = 'flash_attn_func_gfx1201_aiw.py'
+    build.flyc_kernel_name = 'flash_attn_func_aiw_kernel'
 
     return build, asdict(knobs)
