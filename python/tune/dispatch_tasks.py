@@ -204,16 +204,65 @@ def get_completed_tasks(module_name: str, module_instance, tuning_mode: str, ver
     finally:
         conn.close()
 
+class TuneEntrySource:
+    """`dispatch.driver.EntrySource` for tuning (D07): cross product via
+    `generate_filtered_entries`, a single `None` batch (tuning has no
+    insert-order dependency, dispatch-perfmon.md §5.7), `class`/`subclass`
+    from D01's `WORKLOAD_TASK_SELECTOR` table.
+
+    `entries()` regenerates the filtered cross product once per `arch`
+    (`generate_filtered_entries` is deterministic and side-effect-free), so
+    the driver's batch/arch/entry loop nesting visits the same (arch,
+    entry) pairs as before, just in a different order -- §5.7 again: order
+    does not matter here."""
+
+    def __init__(self, module_name: str, module_instance, args):
+        self.module_name = module_name
+        self.module_instance = module_instance
+        self.args = args
+        self.ENTRY_CLASS = module_instance.ENTRY_CLASS
+
+    def batches(self):
+        yield None
+
+    def entries(self, batch, arch):
+        yield from generate_filtered_entries(self.module_instance, self.args)
+
+    def validate_hw_feature(self, arch, entry):
+        return self.module_instance.validate_hw_feature(arch, entry)
+
+    def task_config(self, batch, arch, entry) -> dict:
+        task_config = {
+            "arch": arch,
+            "module": self.module_name,
+            "tuning_level": self.args.tuning_mode,
+            "entry": asdict(entry),
+        }
+        # Add max_hsaco if specified
+        if self.args.max_hsaco is not None:
+            task_config["max_hsaco"] = {"*": self.args.max_hsaco}
+        return task_config
+
+    def queue_row(self, task_config: dict) -> dict:
+        # 'class' names the DAG this task starts (perfmon rev2 R01/R02) --
+        # dispatch_tasks.py only ever dispatches the tune_kernel DAG; a
+        # --class flag to dispatch perf_measure tasks is future work
+        # (rev2 Stage P), out of scope here.
+        return {
+            'arch': task_config['arch'],
+            'module': task_config['module'],
+            'class': 'tune_kernel',
+            'subclass': task_config['tuning_level'],
+            'task_config': task_config,
+            'priority': 5  # Default priority
+        }
+
 def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
     """Dispatch tuning tasks to PostgreSQL queue."""
-    from .pq.dispatcher import TaskDispatcher
-    from dataclasses import asdict
+    from .dispatch import driver as _driver
 
     # Get database connection parameters
     conn_params = get_db_connection_params()
-
-    # Generate filtered entries (don't materialize the list)
-    entries_generator = generate_filtered_entries(module_instance, args)
 
     print(f"Dispatching tasks to architecture(s): {', '.join(args.arch)}")
 
@@ -229,106 +278,10 @@ def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
             if completed_configs:
                 print(f"Example: {next(iter(completed_configs))}")
 
-    # Extract entry field names once for make_hashable (avoid repeated metadata access)
-    entry_class = module_instance.ENTRY_CLASS
-    entry_field_names = tuple(f.name for f in fields(entry_class))
-
-    # Convert task_config to hashable tuple for set lookup
-    def make_hashable(task_config):
-        arch = task_config['arch']
-        entry_dict = task_config['entry']
-        field_values = tuple(entry_dict[fname] for fname in entry_field_names)
-        return (arch,) + field_values
-
-    # Generate task configs
-    tty_output = sys.stdin.isatty()
-    printed_hw_reasons = set()
-    def task_config_gen():
-        for entry in entries_generator:
-            for arch in args.arch:
-                supported, reason = module_instance.validate_hw_feature(arch, entry)
-                if not supported:
-                    if tty_output:
-                        key = (arch, reason)
-                        if key not in printed_hw_reasons:
-                            printed_hw_reasons.add(key)
-                            print(f"Skipping {arch} configurations: {reason}")
-                    continue
-                task_config = {
-                    "arch": arch,
-                    "module": module_name,
-                    "tuning_level": args.tuning_mode,
-                    "entry": asdict(entry),
-                }
-                # Add max_hsaco if specified
-                if args.max_hsaco is not None:
-                    task_config["max_hsaco"] = {"*": args.max_hsaco}
-                yield task_config
-
-    # Collect tasks to dispatch (filter out completed ones)
-    tasks_to_dispatch = []
-    skipped_count = 0
-
-    for task_config in task_config_gen():
-        # Check if this task is already completed
-        if args.skip_completed:
-            config_key = make_hashable(task_config)
-            if config_key in completed_configs:
-                skipped_count += 1
-                if args.verbose:
-                    print(f"Skipping completed task: {task_config['entry']}")
-                continue
-
-        # Prepare task for dispatcher. 'class' names the DAG this task
-        # starts (perfmon rev2 R01/R02) -- dispatch_tasks.py only ever
-        # dispatches the tune_kernel DAG; a --class flag to dispatch
-        # perf_measure tasks is future work (rev2 Stage P), out of scope here.
-        tasks_to_dispatch.append({
-            'arch': task_config['arch'],
-            'module': task_config['module'],
-            'class': 'tune_kernel',
-            'subclass': task_config['tuning_level'],
-            'task_config': task_config,
-            'priority': 5  # Default priority
-        })
-
-        if args.verbose:
-            print(f"Prepared task for {task_config['arch']}: {task_config['entry']}")
-
-    print(f"Prepared {len(tasks_to_dispatch)} tasks for dispatch")
-    if args.skip_completed and skipped_count > 0:
-        print(f"Skipped {skipped_count} already-completed tasks")
-
-    # Confirmation prompt (skip if -y flag or stdin is not a tty)
-    if not args.yes and sys.stdin.isatty():
-        for key, value in vars(args).items():
-            print(f"  {key}: {value}")
-        try:
-            response = input(f"Proceed with dispatch? [y/N]: ")
-            if response.lower() not in ('y', 'yes'):
-                print("Dispatch cancelled")
-                return
-        except (KeyboardInterrupt, EOFError):
-            print("\nDispatch cancelled")
-            return
-
-    if args.dry_run:
-        print("Dry run mode - tasks not dispatched")
-        return
-
-    # Dispatch tasks using bulk INSERT
-    dispatcher = TaskDispatcher(conn_params)
-
-    # Ensure partitions exist for all architectures
-    for arch in args.arch:
-        try:
-            dispatcher.ensure_partition(arch)
-        except Exception as e:
-            print(f"Warning: Failed to ensure partition for {arch}: {e}", file=sys.stderr)
-
-    # Dispatch tasks
-    dispatched = dispatcher.dispatch_bulk(tasks_to_dispatch, batch_size=1000)
-    print(f"Dispatched {dispatched} tasks to PostgreSQL queue")
+    source = TuneEntrySource(module_name, module_instance, args)
+    return _driver.dispatch(source=source, arch_list=args.arch,
+                             conn_params=conn_params, args=args,
+                             completed_configs=completed_configs)
 
 def str_to_bool(s):
     """Convert '0' or '1' string to boolean for argparse."""
