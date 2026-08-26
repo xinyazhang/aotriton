@@ -81,38 +81,47 @@ class KernelDescription(Interface):
         # by the linker's _build_flycs (PLAN-PHASE2.md Task 5). These are what
         # iter_launch_arguments()/iter_context_helpers() walk, and what
         # FlycTuneCodeGenerator (python/codegen/flytune.py) calls directly
-        # (builder_fn(choices, hints), plus hints() for the 2nd argument) to
-        # obtain the knobs dict at generate time -- WITHOUT ever calling the
-        # `build` callable that same call returns, which is what would import
-        # flydsl.
+        # (builder_fn(arch, choices, hints), plus hints() for the 3rd
+        # argument) to obtain the knobs dict at generate time -- WITHOUT ever
+        # calling the `build` callable that same call returns, which is what
+        # would import flydsl.
         self.tensors = list(tensors) if tensors else []
         self.scalars = list(scalars) if scalars else []
         self.builder_fn = builder_fn
         self.hints_cls = hints_cls
+        # The real, AST-parsed flyc kernel parameter list, per arch -- item D
+        # means this is no longer knowable at link time (no `Functional`
+        # exists yet to call `builder_fn` with), so it is resolved lazily,
+        # once per arch, by `ensure_stub_resolved` (called from
+        # codegen/flytune.py's `_gen_signatures` right after it calls
+        # `builder_fn(arch, choices, hints)` for a real functional). Cached
+        # here rather than recomputed per functional: every functional of one
+        # arch shares the same vendored file/def name in Phase A (the
+        # description "ignores" `arch` for now), and re-parsing the vendored
+        # file on every functional would be needless AST work even once that
+        # stops being true.
+        self._real_params_by_arch = {}
 
     @property
     def gpu_symbol_name(self):
-        """The HIP kernel symbol the hsaco actually exports.
+        """The HIP kernel symbol the hsaco actually exports: `self.NAME`, the
+        flyc DESCRIPTION's own identity (e.g. 'flyc_attn_fwd') -- item E.
 
-        NOT `self.NAME`. `NAME` is the description's identity ('flyc_attn_fwd');
-        the ELF exports the `@flyc.kernel` def's name with FlyDSL's kernel id
-        appended ('flash_attn_func_aiw_kernel_0'). A Triton kernel's two names
-        coincide by convention, which is why the shim template originally passed
-        `shim_kernel_name` here and why the mismatch only showed up as a runtime
-        `hipModuleGetFunction` failure on the flyc path.
-
-        The `_0` is the kernel id, not a uniquing suffix. FlyDSL's
-        `_emit_kernel` (compiler/kernel_function.py) names an unnamed kernel
-        `f"{func.__name__}_{kernel_id}"`, and `kernel_id` comes from a
-        per-compilation counter -- so it is 0 for every kernel we build, because
-        `aotriton.flyc_compile` drives exactly one kernel per invocation.
-
-        Both halves of that are assumptions about FlyDSL, so `flyc_compile`
-        checks the symbol it actually finds in the ELF against this name and
-        fails the build if they diverge. A convention change should stop the
-        build, not produce kernels that cannot be looked up."""
-        stub = self.kernel_decl.kernel
-        return f'{stub.__name__}_0'
+        Used to be FlyDSL's own naming for the `@flyc.kernel` def plus its
+        internal kernel id ('flash_attn_func_aiw_kernel_0'), which needed
+        `self.kernel_decl.kernel` (the AST-located stub) to even ask FlyDSL's
+        question. That stub is no longer resolved this early (item D), and
+        borrowing FlyDSL's internal name was fragile regardless -- an
+        arch-dependent vendored file (Phase C) could rename the def, or emit
+        a non-zero kernel id, without this shim noticing. Naming the symbol
+        after the description instead makes it a fact ATI itself controls:
+        `python/flyc_compile.py` sets the `KernelFunction`'s `_name` to
+        exactly this before tracing, so the ELF should export it verbatim.
+        `flyc_compile.py`'s `_verify_elf` checks that the symbol it actually
+        finds in the ELF matches this name and fails the build if they
+        diverge -- a convention change should stop the build, not produce
+        kernels that cannot be looked up."""
+        return self.NAME
 
     @property
     def perf_cfields(self):
@@ -219,14 +228,16 @@ class KernelDescription(Interface):
         return False
 
     # --- builder invocation: the code generator (FlycTuneCodeGenerator,
-    # python/codegen/flytune.py) calls `self.builder_fn(choices, hints)`
-    # directly and keeps only the `knobs` half of its `(build, knobs)` return
-    # -- see that module for the sys.path setup.
+    # python/codegen/flytune.py) calls `self.builder_fn(arch, choices, hints)`
+    # directly, keeps the `knobs` half of its `(build, knobs)` return, and
+    # passes `build` to `ensure_stub_resolved` (above) for its two attribute
+    # reads -- see that module for the sys.path setup.
     # There is deliberately no `build()` method on this class: the generator
     # must never invoke the FlyDSL compiler, and a wrapper method here would
     # just be one more place that could grow a `build()` call by mistake. Only
     # `python/flyc_compile.py`, run by ninja at build time, may call the
-    # deferred `build` callable a description's fn(choices, hints) returns. ---
+    # deferred `build` callable a description's fn(arch, choices, hints)
+    # returns. ---
 
     def hints(self):
         """The hints dataclass instance passed as the builder's 2nd argument, or
@@ -237,17 +248,53 @@ class KernelDescription(Interface):
 
     # --- launch-argument vector (PLAN-PHASE2.md Task 5) ---
 
-    def iter_launch_arguments(self):
+    def ensure_stub_resolved(self, arch, build):
+        """Populate the `arch` entry of the real-kernel-parameter cache from
+        `build` -- the closure a description's `builder_fn(arch, choices,
+        hints)` just returned. Reads only `build.flyc_source` /
+        `build.flyc_kernel_name` (two plain strings); NEVER calls `build`
+        itself (that would invoke the FlyDSL compiler from the generator,
+        which must not happen -- see the note above `hints()`).
+
+        Idempotent per arch (a no-op once cached), so `codegen/flytune.py`
+        can call this once per functional without re-parsing the vendored
+        file for every one of an arch's many functionals."""
+        if arch in self._real_params_by_arch:
+            return
+        from pathlib import Path
+        from ...specs.flyc import _flyc_kernel_stub
+
+        module_path = Path(self.source_path) / build.flyc_source
+        stub = _flyc_kernel_stub(module_path, build.flyc_kernel_name)
+        # `stub.params` is already the plain parameter-name list
+        # (ast_params.collect_params returns `[p.arg for p in ...]`, not
+        # ParamSpec objects -- KernelStub is shared with @ati.source, whose
+        # own params are always bare strings too).
+        self._real_params_by_arch[arch] = list(stub.params)
+
+    def iter_launch_arguments(self, arch):
         """Yield the C++ launch-argument vector entries in the REAL kernel's
         signature order (see codegen.common.LaunchArg). Unlike triton's
         equivalent, there is no `aux` (no global_scratch/profile_scratch: the
         flyc kernel's 44 parameters don't include Triton's two trailing scratch
-        pointers) and a 4th LaunchArg.kind, 'context_helper', is possible."""
+        pointers) and a 4th LaunchArg.kind, 'context_helper', is possible.
+
+        `arch`-keyed (item D): the real parameter order can no longer come
+        from `self._built.arguments` (the single, arch-independent list
+        `build_kernel` computed at link time from a synthesized stand-in, see
+        specs/flyc.py's `_synth_param_order`) -- it must be the real, AST-
+        resolved signature, which `ensure_stub_resolved` must already have
+        cached for `arch` (codegen/flytune.py's `_gen_signatures` does this
+        for every functional before this method is ever called)."""
         # Lazy: same aotriton.codegen -> template_instantiation cycle as
         # ir/triton/kdesc.py's iter_launch_arguments.
         from aotriton.codegen.common import LaunchArg
 
-        real_param_order = self._built.arguments
+        real_param_order = self._real_params_by_arch.get(arch)
+        assert real_param_order is not None, (
+            f'flyc kernel {self.NAME!r}: no resolved kernel stub for arch '
+            f'{arch!r} -- ensure_stub_resolved(arch, build) must run before '
+            f'iter_launch_arguments (see codegen/flytune.py _gen_signatures)')
 
         tensor_ptr_lookup = {}
         for t in self.tensors:

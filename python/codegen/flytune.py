@@ -14,12 +14,14 @@
 # (`modules/flash/aot/flyc_attn_fwd.py`): `build` is a deferred callable that
 # actually constructs the FlyDSL module (and, for the standalone
 # `flyc_compile.py` driver, transitively imports flydsl), while `knobs` is a
-# plain dict already known by the time `fn(choices, hints)` returns. This
-# generator calls `fn(choices, hints)` for `knobs` alone and discards `build`
-# without ever calling it -- so the FlyDSL compiler is never invoked 288 times
-# per configure. `knobs` is what feeds `ir/flyc/ksignature.py`'s
-# `perf_section` (Task 2); the true on-disk `<hsaco>.json` knobs is a
-# separate, later, build-time artifact this generator never reads.
+# plain dict already known by the time `fn(arch, choices, hints)` returns.
+# This generator calls `fn(arch, choices, hints)` for `knobs` (plus two plain
+# string attributes off `build` -- `flyc_source`/`flyc_kernel_name`, item D)
+# and discards `build` without ever CALLING it -- so the FlyDSL compiler is
+# never invoked 288 times per configure. `knobs` is what feeds
+# `ir/flyc/ksignature.py`'s `perf_section` (Task 2); the true on-disk
+# `<hsaco>.json` knobs is a separate, later, build-time artifact this
+# generator never reads.
 
 import sys
 from pathlib import Path
@@ -70,15 +72,23 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
             f'flyc kernel {kdesc.NAME!r} has no builder_fn '
             f'(linker.py:_build_flycs must thread builder_fn=decl.fn)')
         # The description imports its vendored kernel/tuning modules by bare name
-        # (e.g. `import fmha_tuning_gfx1201`), resolved relative to the directory
-        # holding kdesc.source_path. A path, not flydsl -- fine for the generator.
-        kernel_dir = str(Path(kdesc.source_path).parent)
+        # (e.g. `import fmha_tuning_gfx1201`), resolved relative to
+        # kdesc.source_path -- the vendored flyc DIRECTORY itself (item D; it
+        # used to be a specific kernel FILE's parent). A path, not flydsl --
+        # fine for the generator.
+        kernel_dir = str(kdesc.source_path)
         if kernel_dir not in sys.path:
             sys.path.insert(0, kernel_dir)
         # (build, knobs): `build` is a deferred callable that would construct the
         # FlyDSL module; `knobs` is already resolved. Discard `build` WITHOUT EVER
         # CALLING IT -- the one architectural rule this generator must not break.
-        _build, knobs = kdesc.builder_fn(choices, hints)
+        # `f.arch` is now the builder's first argument (item F): every flyc
+        # description takes (arch, choices, hints), arch arriving first, not
+        # smuggled into choices.
+        build, knobs = kdesc.builder_fn(f.arch, choices, hints)
+        # `build.flyc_source`/`build.flyc_kernel_name` (item D) are the only
+        # two attributes read off `build` -- never call it (see above).
+        kdesc.ensure_stub_resolved(f.arch, build)
         yield KernelSignature(f, psels=knobs)
 
     def generate(self):
@@ -135,14 +145,45 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         constexpr baking (no assign_skips[i] ever True), so assign_skips is
         always the all-False tuple of the same length, and the
         SignaturedFunctionRegistry naturally deduplicates it to a single
-        registration across all 288 functionals. Context helpers (if any) are
-        populated by a preamble right before the return statement -- their
-        return value has no other stable home for pp_args's `const context&`
-        signature to take the address of (see ir/flyc/kdesc.py's
-        iter_context_helpers / iter_launch_arguments)."""
+        registration across all 288 functionals.
+
+        item C (mirroring autotune.py's constexpr fold via
+        `Functional.pp_arg_doc`) was implemented and build-verified, then
+        REVERTED: autotune.py's fold is only sound for Triton because
+        `tl.constexpr` parameters are genuinely elided from the JIT-compiled
+        kernel's ABI, so a shorter pp_args vector matches that functional's
+        differently-compiled binary. flyc's vendored kernel functions are
+        fixed, static `@flyc.kernel`-decorated Python signatures (grep-
+        confirmed for `flash_attn_func_aiw_kernel` in
+        flash_attn_func_gfx1201_aiw.py and `bwd_dq_kernel` in
+        fmha_bwd_dq_gfx1201_kernel.py): `window_left`, `window_right`,
+        `philox_offset2`, `hdim_qk`, `hdim_vo` are ALWAYS formal `fx.Int32`/
+        `fx.Int64` parameters of the compiled kernel, resolved at RUNTIME
+        inside the kernel body (e.g. via `fmha_common_gfx1201.resolve_window`)
+        -- never elided from the kernarg ABI based on the operator
+        description's `@ati.derives`/VarRef-driven constexpr-ness. flyc's
+        `real_param_order` is a static, arch-wide (not per-functional) AST
+        parse of that fixed signature, and `flyc_compile.py`'s
+        `synthesise_args` builds trace placeholders from parameter
+        ANNOTATION TYPE alone, never from the functional's resolved value --
+        there is no per-functional ABI specialization to match a folded
+        vector against. Commenting an entry out of the return vector would
+        therefore desync the `std::vector<void*>` positionally against the
+        compiled hsaco's actual, unchanging `hipModuleLaunchKernel`
+        kernelParams layout for every OTHER functional sharing that pattern.
+        This directly contradicts the plan's own claim that
+        `pp_arg_doc`/`Functional.resolved` make the fold "no new mechanism"
+        for flyc; the plan's stated EXPECTED outcome ("gfx1201's all-False
+        pattern") is the one this reverted, no-fold implementation actually
+        produces. See the Phase A execution report for the full writeup.
+
+        Context helpers (if any) are populated by a preamble right before the
+        return statement -- their return value has no other stable home for
+        pp_args's `const context&` signature to take the address of (see
+        ir/flyc/kdesc.py's iter_context_helpers / iter_launch_arguments)."""
         kdesc = self._f.meta_object
         pp_registry = self._parent_repo.get_signatured_function_registry('pp_function')
-        largs = list(kdesc.iter_launch_arguments())
+        largs = list(kdesc.iter_launch_arguments(self._f.arch))
         assign_skips = (False,) * len(largs)
         hit, findex = pp_registry.contains(assign_skips)
         if hit:

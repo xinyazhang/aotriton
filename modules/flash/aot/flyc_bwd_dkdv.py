@@ -141,8 +141,8 @@ def _flyc_bwd_dkdv_disabled(f):
 @ati.scalar('hdim_vo',    'i32',  wires_to='hdim_vo')
 @ati.scalar('sm_scale',   'fp32', wires_to='sm_scale')
 @ati.flyc.hints(FlycBwdHints)
-@ati.flyc.kernel('../flyc/fmha_bwd_dkdv_gfx1201_kernel.py')
-def flyc_bwd_dkdv(choices, hints):
+@ati.flyc.kernel()
+def flyc_bwd_dkdv(arch, choices, hints):
     """Build one dK/dV hsaco for the functional described by `choices`.
 
     Executed by `aotriton.flyc_compile` at build time, in a venv that has
@@ -194,6 +194,13 @@ def flyc_bwd_dkdv(choices, hints):
         so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
         from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
         return build_bwd_dkdv_module_primary(meta, knobs)
+
+    # Two plain strings (item D): the vendored file, relative to
+    # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
+    # Read by codegen/flytune.py and flyc_compile.py off the `build` closure
+    # WITHOUT ever calling it.
+    build.flyc_source = 'fmha_bwd_dkdv_gfx1201_kernel.py'
+    build.flyc_kernel_name = 'bwd_dkdv_kernel'
 
     sidecar = asdict(knobs)
     # BLOCK_N is what the grid's x extent divides Max_seqlen_k by, and unlike

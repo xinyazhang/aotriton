@@ -16,12 +16,12 @@ Invoked as `python -m aotriton.flyc_compile`:
 
 **Kernel-agnostic by construction.** This module drives *any*
 `@ati.flyc.kernel` description through `fn.__ati_node__` (`source_path`,
-`hints()`) and the plain `fn(choices, hints) -> built` call — it does not
-import a specific kernel family's tuning module, and nothing here names a
-specific kernel. It enters at the `@flyc.jit` `JitFunction` the description's
-builder produced (`jit_function_of`), synthesises typed dummy arguments from
-the launcher's own signature (`synthesise_args`) and calls it directly — no
-host marshalling, no fabricated tensors, no kernel-specific shapes.
+`hints()`) and the plain `fn(arch, choices, hints) -> (build, sidecar)` call
+— it does not import a specific kernel family's tuning module, and nothing
+here names a specific kernel. It enters at the `@flyc.jit` `JitFunction`
+`build()` produces (`jit_function_of`), synthesises typed dummy arguments
+from the launcher's own signature (`synthesise_args`) and calls it directly
+— no host marshalling, no fabricated tensors, no kernel-specific shapes.
 """
 
 import dataclasses
@@ -433,15 +433,29 @@ def _launcher_signature(jf):
     return resolve_signature(jf.func)
 
 
-def kernel_function_of(jf):
-    """The `@flyc.kernel` `KernelFunction` a `JitFunction`'s launcher closes
-    over -- reachable from `jf.func`'s closure, NOT from the builder's
-    returned wrapper's (`kernel_function_of` walks `jf.func`, unlike
-    `jit_function_of` which walks `built`; the two closures are not the
-    same one)."""
+def kernel_function_of(jf, kernel_name):
+    """The `@flyc.kernel` `KernelFunction` named `kernel_name`, reachable from
+    a `JitFunction`'s launcher closure -- `jf.func`'s closure, NOT the
+    builder's returned wrapper's (`kernel_function_of` walks `jf.func`,
+    unlike `jit_function_of` which walks `built`; the two closures are not
+    the same one).
+
+    Selected by NAME (item G part 2, `build.flyc_kernel_name`), not by "the
+    only KernelFunction in this closure": a closure can legitimately hold
+    more than one, and an implicit uniqueness assumption breaks silently the
+    day a vendored file's launcher closes over a second one (e.g. a nested
+    helper kernel)."""
     from flydsl.compiler.kernel_function import KernelFunction
 
-    return _find_unique(jf.func, KernelFunction)
+    candidates = [c.cell_contents for c in (jf.func.__closure__ or ())
+                  if isinstance(c.cell_contents, KernelFunction)]
+    matches = [kf for kf in candidates if kf._func.__name__ == kernel_name]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f'kernel_function_of: expected exactly one KernelFunction named '
+            f'{kernel_name!r} reachable from {jf.func!r}, found {len(matches)} '
+            f'(of {len(candidates)} KernelFunction(s) total).')
+    return matches[0]
 
 
 def _extract_hsaco(jf) -> bytes:
@@ -531,7 +545,11 @@ def _elf_metadata(report: str) -> dict:
 
 
 def _expected_gpu_symbol(node) -> str:
-    """The HIP symbol the shim will ask `hipModuleGetFunction` for.
+    """The HIP symbol the shim will ask `hipModuleGetFunction` for: the flyc
+    DESCRIPTION's own name (item E), e.g. 'flyc_attn_fwd' -- not FlyDSL's
+    internal '<kernel_def>_<id>'. `do_compile` sets the `KernelFunction`'s
+    `_name` to exactly this before tracing (see below), so the ELF should
+    export it verbatim.
 
     Must match `ir/flyc/kdesc.py`'s `gpu_symbol_name`, which the generated shim
     embeds. Duplicated deliberately rather than imported: the two are computed in
@@ -540,7 +558,7 @@ def _expected_gpu_symbol(node) -> str:
     a value -- only a rule. `_verify_elf` is what stops the two copies of the
     rule from drifting apart silently.
     """
-    return f'{node.kernel.__name__}_0'
+    return node.name
 
 
 def _verify_elf(meta: dict, target: str, report: str, node=None):
@@ -557,13 +575,15 @@ def _verify_elf(meta: dict, target: str, report: str, node=None):
                 f"--verify: this hsaco exports {meta['kernel_name']!r}, but the "
                 f"generated shim looks up {want!r}, so every launch would fail "
                 f"in hipModuleGetFunction.\n\n"
-                f"The shim's name comes from ir/flyc/kdesc.py's gpu_symbol_name: "
-                f"the @flyc.kernel def's name plus FlyDSL's kernel id. A mismatch "
-                f"means one of that rule's two assumptions no longer holds -- "
-                f"either the kernel gained an explicit name= (FlyDSL's "
-                f"_emit_kernel then uses it verbatim, with no id suffix), or a "
-                f"single compilation now emits more than one kernel so the id is "
-                f"no longer 0.\n\nFull report:\n{report}"
+                f"The shim's name comes from ir/flyc/kdesc.py's gpu_symbol_name, "
+                f"which is exactly the flyc DESCRIPTION's own name (item E) -- "
+                f"this driver is supposed to make the ELF export that same "
+                f"string verbatim by setting the traced KernelFunction's "
+                f"`_name` to `args.kernel_name` before `jf(*launch_args)` runs "
+                f"(see do_compile). A mismatch here means either that assignment "
+                f"did not take effect (e.g. `kf` was the wrong KernelFunction, "
+                f"see kernel_function_of), or FlyDSL's `_emit_kernel` stopped "
+                f"honouring an explicit `_name` verbatim.\n\nFull report:\n{report}"
             )
 
 
@@ -574,7 +594,10 @@ def do_compile(args):
 
     fn = _load_description_module(Path(args.path), args.kernel_name)
     node = fn.__ati_node__
-    kernel_dir = str(Path(node.source_path).parent)
+    # `node.source_path` is the vendored flyc DIRECTORY itself (item D; it
+    # used to be a specific kernel FILE's parent, back when @ati.flyc.kernel
+    # still carried a path).
+    kernel_dir = str(node.source_path)
     if kernel_dir not in sys.path:
         sys.path.insert(0, kernel_dir)
 
@@ -596,10 +619,26 @@ def do_compile(args):
     # The description returns a DEFERRED builder, not a built module: the code
     # generator calls `fn` for its knobs and never calls `build`, so it never
     # imports flydsl. Only this driver -- run by ninja -- calls `build()`.
-    build, sidecar = fn(choices, hints)
+    # `args.target` is the builder's first argument (item F): every flyc
+    # description takes (arch, choices, hints), arch arriving first, not
+    # smuggled into choices.
+    build, sidecar = fn(args.target, choices, hints)
     built = build()
 
     jf = jit_function_of(built)
+    # `build.flyc_kernel_name` (item D) selects which KernelFunction in
+    # jf.func's closure to drive -- by name (item G part 2), not uniqueness.
+    kf = kernel_function_of(jf, build.flyc_kernel_name)
+    # Item E: the hsaco's exported symbol becomes the name of the def
+    # @ati.flyc.kernel decorates (args.kernel_name, e.g. 'flyc_attn_fwd'), not
+    # FlyDSL's own '<kernel_def>_<id>' naming. Must be set before
+    # jf(*launch_args) below: KernelFunction._emit_kernel only reads
+    # self._name at emission time (flydsl/compiler/kernel_function.py), and
+    # setting it makes `ctx.unique_kernel_name` return it verbatim (no id
+    # suffix) as long as nothing else in this compilation claims the same
+    # name -- true here, since this driver compiles exactly one kernel per
+    # invocation.
+    kf._name = args.kernel_name
     launch_args = synthesise_args(jf)
     jf(*launch_args)  # COMPILE_ONLY=1 -> traces and compiles, returns None, launches nothing
     hsaco = _extract_hsaco(jf)
@@ -610,7 +649,7 @@ def do_compile(args):
     # never makes it into the hsaco. flydsl itself validates the real launch
     # against this same value in `KernelLauncher._check_block_vs_known`, so
     # `_known_block_size` is the authoritative source, not a guess.
-    block_size = kernel_function_of(jf)._known_block_size[0]
+    block_size = kf._known_block_size[0]
 
     out_path = args.out_path
     with open(out_path.with_suffix('.hsaco'), 'wb') as f:

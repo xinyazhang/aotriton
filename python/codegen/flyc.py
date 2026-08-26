@@ -104,7 +104,13 @@ class FlycShimGenerator(InterfaceGenerator):
         print(self.SOURCE_TEMPLATE.format_map(d), file=fout)
 
     def codegen_per_kernel_packed_string(self):
-        return self._this_repo.get_data('per_kernel_packed_string')
+        # Same "zero enabled functionals never lazily creates the registry"
+        # gap as codegen_kernel_arguments above -- an empty packed string is
+        # the correct answer, not a crash. But the template substitutes this
+        # value directly as the initializer of `const char foo[] =\n{value}\n;`
+        # with no surrounding braces (see template/flyc.cc), so the value must
+        # itself be a valid C++ string-literal expression -- '""', not ''.
+        return self._this_repo.get_data('per_kernel_packed_string', return_none=True) or '""'
 
     def codegen_declare_compiled_in_features(self):
         kdesc = self._iface
@@ -159,7 +165,12 @@ const std::vector<{infotype}>& {meta_class}::get_{tp.repr_name}_choices()
 
     def codegen_kernel_arguments(self):
         context_class_name = self._iface.context_class_name
-        pp_registry = self._this_repo.get_data('pp_function')
+        # return_none=True: an arch where every functional of this kernel is
+        # disabled (e.g. flyc kernels on an arch that has not been wired up
+        # yet) never runs a single FlycTuneCodeGenerator, so the registry is
+        # never lazily created. Zero functionals means zero pp_args
+        # functions, not a bug -- do not let it raise.
+        pp_registry = self._this_repo.get_data('pp_function', return_none=True) or {}
         stmt = []
         array = []
         for assign_skips, (findex, src) in pp_registry.items():

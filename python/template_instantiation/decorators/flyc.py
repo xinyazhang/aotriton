@@ -18,10 +18,12 @@ nothing else can supply. Its description uses the stacked-@ form:
     ...
     @ati.scalar('varlen_bits', 'i32', wires_to=ati.context_helper('flyc_varlen_bits'))
     @ati.flyc.hints(FlycFwdHints)                 # optimization-input dataclass
-    @ati.flyc.kernel('../flyc/flash_attn_func_gfx1201_aiw.py')   # innermost marker
-    def flyc_attn_fwd(f, hints):
+    @ati.flyc.kernel()                            # innermost marker, no path (item D)
+    def flyc_attn_fwd(arch, choices, hints):
         ...
-        return built, sidecar
+        build.flyc_source = 'flash_attn_func_gfx1201_aiw.py'   # relative to modules/flash/flyc/
+        build.flyc_kernel_name = 'flash_attn_func_aiw_kernel'  # the @flyc.kernel def's own name
+        return build, sidecar
 
 These produce passive spec records; specs/flyc.py collects them into a FlycDecl.
 Phase 1: no build, no codegen — the description exists so `aotriton.flyc_compile`
@@ -31,9 +33,6 @@ Phase 1: no build, no codegen — the description exists so `aotriton.flyc_compi
 
 from __future__ import annotations
 
-import inspect
-from pathlib import Path
-
 from ..specs.base import StackedSpec
 
 
@@ -41,16 +40,20 @@ from ..specs.base import StackedSpec
 
 
 class FlycKernelSpec(StackedSpec):
-    """@ati.flyc.kernel(path): the innermost marker that makes
-    the def a flyc-kernel description (the flyc analogue of @ati.affine.aiter_asm /
-    @ati.source). `module_path` is the vendored kernel-directory FILE `path`
-    resolved relative to the caller's __file__ (the description module) — same
-    idiom as decorators/source.py's `source()`, so
-    `../flyc/flash_attn_func_gfx1201_aiw.py` written in
-    `modules/flash/aot/flyc_attn_fwd.py` resolves under `modules/flash/flyc/`. Not
-    imported here — only path-resolved; the description body imports from it
-    lazily, at build-drive time (flyc_compile.py puts the vendored directory on
-    sys.path first).
+    """@ati.flyc.kernel: the innermost marker that makes the def a
+    flyc-kernel description (the flyc analogue of @ati.affine.aiter_asm /
+    @ati.source).
+
+    Carries NO path (item D). The vendored kernel FILE the description's
+    builder actually drives can vary by `arch` -- Phase C's whole point -- so
+    it cannot be known here, at decoration time, before any arch is chosen.
+    Instead the description's builder function sets it, once it has resolved
+    `arch`, as two attributes on the `build` closure it returns:
+    `build.flyc_source` (the vendored file, relative to
+    `modules/flash/flyc/`) and `build.flyc_kernel_name` (the `@flyc.kernel`
+    def's own name inside that file). `codegen/flytune.py` and
+    `flyc_compile.py` read those two strings off `build` -- never anything
+    eagerly stashed here.
 
     The operator whose functionals this kernel inherits is NOT declared here.
     It used to be, as `functionals_of=`, when a flyc kernel was reachable no
@@ -60,13 +63,10 @@ class FlycKernelSpec(StackedSpec):
     there: which operator a kernel serves is the operator's fact, not the
     kernel's."""
 
-    __slots__ = ('module_path',)
-
-    def __init__(self, module_path):
-        self.module_path = module_path
+    __slots__ = ()
 
     def __repr__(self):
-        return f'FlycKernelSpec({self.module_path!r})'
+        return 'FlycKernelSpec()'
 
 
 class FlycHintsSpec(StackedSpec):
@@ -93,14 +93,12 @@ class FlycHintsSpec(StackedSpec):
 # --- public decorator namespace (ati.flyc.*) --------------------------------
 
 
-def kernel(path):
-    """@ati.flyc.kernel(path): innermost marker.
-    `path` is resolved relative to the DESCRIPTION file (the caller's __file__),
-    not cwd — matches decorators/source.py's `source()`."""
-    caller_file = inspect.stack()[1].filename
-    base = Path(caller_file).resolve().parent
-    module_path = (base / path).resolve()
-    return FlycKernelSpec(module_path)
+def kernel():
+    """@ati.flyc.kernel(): innermost marker, no path (item D). See
+    FlycKernelSpec for where the vendored file/def name actually come from
+    now: the `build` closure the description's builder function returns,
+    resolved lazily once `arch` is known."""
+    return FlycKernelSpec()
 
 
 def hints(hints_cls):

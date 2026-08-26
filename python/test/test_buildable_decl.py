@@ -96,14 +96,25 @@ def test_flyc_only_fields_survive_the_clone():
         assert getattr(copy, attr) is not None, f'{attr} lost'
 
 
-def test_source_path_is_the_one_name_for_the_kernel_file():
+def test_source_path_is_the_one_name_for_the_vendored_directory():
     """`FlycDecl` used to carry the vendored kernel path twice -- once as
-    `module_path`, once inside its KernelStub. One fact, one field."""
+    `module_path`, once inside an eagerly-resolved KernelStub. One fact, one
+    field -- still true post item D, just a different fact: `source_path` is
+    now the vendored flyc DIRECTORY (e.g. `modules/flash/flyc/`), not a
+    specific kernel FILE, because the real per-arch file/def name is no
+    longer knowable at link time (see specs/flyc.py's `_synth_param_order`
+    and `collect_flyc_decl`). `decl.kernel` stays `None` for a `FlycDecl` --
+    there is no eager KernelStub to resolve `source_path` from anymore, so
+    unlike a Triton `KernelDecl` the two can no longer be cross-checked
+    against each other."""
     from aotriton.codegen.linker import Linker
     _k, _o, _a, flycs = Linker(_MODULES).link_all_families()
     decl = flycs[0].kernel_decl
     assert not hasattr(decl, 'module_path')
-    assert decl.source_path == decl.kernel.source_path
+    assert decl.kernel is None
+    assert decl.source_path is not None
+    assert Path(decl.source_path).name == 'flyc'
+    assert Path(decl.source_path).is_dir()
 
 
 def main():

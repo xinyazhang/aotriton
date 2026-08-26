@@ -187,7 +187,11 @@ class RootGenerator(object):
             fsg = FlycShimGenerator(self._args, fk, parent_repo=None)
             fsg.generate()
             shims += fsg.shim_files
-            hsacos = fsg.this_repo.get_data('hsaco')
+            # return_none=True: an arch where every functional of this flyc
+            # kernel is disabled (e.g. gfx950 before it is wired up) never
+            # registers the HsacoRegistry at all -- same gap the affine loop
+            # above already guards against for 'asms'. Empty is correct here.
+            hsacos = fsg.this_repo.get_data('hsaco', return_none=True) or {}
             flyc_hsaco_for_kernels.append((fk, hsacos))
 
         if args.build_for_tuning_second_pass:
