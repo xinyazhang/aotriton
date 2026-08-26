@@ -266,6 +266,50 @@ def dispatch_tasks(workdir: Path, module_name: str, module_instance, args):
                              conn_params=conn_params, args=args,
                              completed_configs=completed_configs)
 
+def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
+    """Dispatch perf_measure tasks to PostgreSQL queue (D10).
+
+    No `--skip_completed` support yet: there is no perf_measure analogue of
+    `get_completed_tasks()` (D11's `pq/perf.py` only adds `save_perf_result`/
+    `get_perf_results`/`iter_perf_rows_for_export` -- no completed-task
+    query), so `--skip_completed` on a perfmon invocation is accepted
+    (`add_common_arguments`, shared) but has no effect: `completed_configs`
+    stays empty, same as tuning's own default before any completion query
+    ran. Future work, not this task's.
+    """
+    from .dispatch import driver as _driver
+    from .perfmon.source import PerfEntrySource
+    from .perfmon.presets import available_presets
+
+    conn_params = get_db_connection_params()
+
+    # --preset SELECTS a subset of the configured presets; it does not
+    # validate one (dispatch-perfmon.md §3.4) -- given values are used
+    # as-is, never checked against available_presets().
+    presets = args.preset if args.preset else available_presets(workdir)
+
+    print(f"Dispatching tasks to architecture(s): {', '.join(args.arch)}")
+    print(f"Presets: {', '.join(presets)}")
+
+    source = PerfEntrySource(module_name, module_instance, args, presets=presets)
+
+    if args.dry_run:
+        print("perf_measure --dry_run: counts below are QUEUE ROWS (entries)"
+              " per (arch, preset), not measurements. The number of "
+              "MEASUREMENTS per entry is a per-arch, per-preset multiple "
+              "that is NOT known at dispatch time -- it depends on the GPU "
+              "and even differs per AOTriton version (dispatch-perfmon.md "
+              "§6).")
+        for preset in source.batches():
+            for arch in args.arch:
+                count = sum(1 for entry in source.entries(preset, arch)
+                            if source.validate_hw_feature(arch, entry)[0])
+                print(f"  {arch} / {preset}: {count} entries")
+
+    return _driver.dispatch(source=source, arch_list=args.arch,
+                             conn_params=conn_params, args=args,
+                             completed_configs=None)
+
 def str_to_bool(s):
     """Convert '0' or '1' string to boolean for argparse."""
     if s == '0':
@@ -316,9 +360,12 @@ def build_module_parser(module_name, module_instance):
     It only runs when `module_instance` exposes `get_entry_choices()`
     (`TuningDescription` does; `PerfDescription` does not -- perfmon's
     entry space is a curated prime/coverage set, not a per-field cross
-    product, and giving it its own dispatch flags --preset/--entry_set/
-    --max_seqlen is D10's job, not this one's). For a perfmon module this
-    parser is just `add_common_arguments()`'s flags.
+    product). A perfmon module instead gets D10's own three flags:
+    `--preset`, `--entry_set`, `--max_seqlen` -- tuning has no use for any
+    of them, mirroring how `--max_hsaco` (added by `add_common_arguments`,
+    shared) has no use for perfmon; splitting the shared/tuning-only/
+    perfmon-only flags apart is deliberately deferred (dispatch-perfmon.md
+    §13).
     """
     module_parser = argparse.ArgumentParser(
         prog=f'dispatch_tasks --module .../{module_name}',
@@ -329,6 +376,24 @@ def build_module_parser(module_name, module_instance):
     add_common_arguments(module_parser)
 
     if not hasattr(module_instance, 'get_entry_choices'):
+        # PerfDescription (D10): its own dispatch flags, not shared with
+        # tuning's per-field cross product below.
+        module_parser.add_argument(
+            '--preset', type=str, nargs='+', default=None,
+            help="Preset(s) ('rocm<ver>+aotriton<tag>') to dispatch, "
+                 "repeatable. NARROWS the configured set for a partial "
+                 "run -- selects, does not validate that a preset is real "
+                 "or servable (dispatch-perfmon.md §3.4). Default: every "
+                 "preset this fleet is configured to measure "
+                 "(perfmon.presets.available_presets).")
+        module_parser.add_argument(
+            '--entry_set', choices=['prime', 'coverage'], default='prime',
+            help="Which curated entry set to dispatch (default: %(default)s).")
+        module_parser.add_argument(
+            '--max_seqlen', type=int, default=None, metavar='N',
+            help="Override the seqlen ceiling validate_hw_feature enforces "
+                 "(default: no CLI override -- only each arch's own "
+                 "measured ceiling, if any, applies).")
         return module_parser
 
     all_choices = get_parameter_choices(module_instance)
@@ -506,15 +571,10 @@ def main():
         print(f"No --arch specified, using all registered: {', '.join(args.arch)}")
 
     if args.workload == 'perfmon':
-        # D10 (PerfEntrySource) wires up perf_measure dispatch; this task
-        # (D09) only had to get --workload perfmon parsing, resolving to
-        # the right module, and mapping to the right class/subclass --
-        # not actually dispatching it yet.
-        sys.exit("Error: --workload perfmon dispatch is not implemented yet "
-                  "(dispatch-perfmon-exec.md D10 adds it)")
-
-    # Dispatch tasks
-    dispatch_tasks(args.workdir, family, module_instance, args)
+        # D10: PerfEntrySource wires up perf_measure dispatch.
+        dispatch_perf_tasks(args.workdir, family, module_instance, args)
+    else:
+        dispatch_tasks(args.workdir, family, module_instance, args)
 
 if __name__ == '__main__':
     main()
