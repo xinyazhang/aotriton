@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: caee9257  (was 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
+commit: 7e258c99  (was caee9257, was 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
 path:   kernels/attention/parity/
 ```
 
@@ -261,6 +261,36 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
 — but `grid_calculator()` still needs a batch count, since the grid's z extent is
 `num_seqlens != 0 ? num_seqlens : batch_size`. It now comes off `FlycVarlenRow` directly
 (`modules/flash/csrc/flyc_common.h`).
+
+## Re-sync cost, measured at `7e258c99`
+
+The cheap kind, and the first one driven by our own test results rather than by
+upstream drift: AOTriton's Level-3 pass reported 7506 failures out of 202k, and
+`455976b7` + `7e258c99` are upstream's fixes for them.
+
+| | |
+|---|---|
+| upstream commits spanned | 2 |
+| vendored files changed | 2 — `fmha_bwd_dq_gfx1201_kernel.py`, `fmha_tuning_bwd_dq_gfx1201.py` |
+| our re-wiring | 3 lines (the one import block); the tuning module is verbatim |
+| kernarg ABI | **unchanged** — 50 params, every one still claimed |
+| `BwdDqKnobs` fields | **unchanged**, so psel strings, AKS2 entry names and the generated shim are all unchanged |
+| ATI description changes needed | none required; one clarifying `head_dim_v=tile` added |
+
+`BwdDqInputMetadata` gained `head_dim_v`, and the contract behind it is worth
+knowing because it is a trap that would look like a kernel bug: the dQ kernel
+has ONE compiled tile, so the tile covers the wider of hdim_qk/hdim_vo and the
+narrower axis is masked at RUNTIME via `vo_cols = MaskedAxis(hdim_vo,
+active=PADDED_HEAD)`. With `PADDED_HEAD` off, the V/O axis is not bounded at all
+and a narrower V is walked to the full tile. AOTriton's
+`attn_bwd.cc` already sets `PADDED_HEAD = (hdim_qk != hdim_rounded || hdim_vo !=
+hdim_rounded)`, which is precisely the condition upstream's `resolve_knobs`
+derives when it is asked to choose — so the description passing
+`choices.PADDED_HEAD` is the same answer rather than a lucky one.
+
+Because only the dQ code objects changed, this re-sync needed only those
+regenerated, not a full rebuild — see the note at the end of the re-sync
+procedure for why that is a manual step.
 
 ## Re-sync procedure
 

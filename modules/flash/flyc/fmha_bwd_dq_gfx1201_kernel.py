@@ -650,6 +650,10 @@ def build_bwd_dq_module_primary(meta, knobs):
         def load_global_v8f16(base_ptr, base64, off32):
             return _pointer_load(v8f16_type, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
+        def store_global_f16(base_ptr, off64, val):
+            """One dB element. Scalar because the guard is per column."""
+            _pointer_store(val, buffer_ops.get_element_ptr(base_ptr, fx.Int64(off64), elem_type=elem_type))
+
         def store_global_v8(base_ptr, base64, off32, val):
             _pointer_store(val, fmha.split_ptr(base_ptr, base64, off32, elem_type))
 
@@ -674,21 +678,6 @@ def build_bwd_dq_module_primary(meta, knobs):
         # produced, so it inherits every layout for free -- the forward's
         # `sdpa-bias-plan.md` 3 argument, unchanged. One row per lane, since a
         # lane owns one Q row for the whole KV loop.
-        if const_expr(BIAS_TYPE):
-            _b_ptr = fmha.pointer_to_llvm_ptr(B)
-            _b_row = (
-                _q_batch_v * fx.Index(stride_b_batch)
-                + head_q * fx.Index(stride_b_head)
-                + (_q_row_off_v + q_row) * fx.Index(stride_b_seq_q)
-            )
-            # DB is a different tensor and may be laid out differently, so it
-            # gets its own row rather than reusing B's.
-            _db_row = (
-                _q_batch_v * fx.Index(stride_db_batch)
-                + head_q * fx.Index(stride_db_head)
-                + (_q_row_off_v + q_row) * fx.Index(stride_db_seq_q)
-            )
-            _db_ptr = fmha.pointer_to_llvm_ptr(DB)
 
         q_rows_axis = fmha.MaskedAxis(fx.Index(seqlen_q_i32))
         q_ap = fmha.Aperture(qk_cols, rows=q_rows_axis)
@@ -706,6 +695,35 @@ def build_bwd_dq_module_primary(meta, knobs):
         # measured 6% on the forward's widest causal build, which is why
         # `read_v8` takes the gate rather than recomputing it.
         _q_in, _q_safe = q_ap.rows.gate(q_row, q_row_in_tile)
+
+        # Bias is (B, H, Sq, Sk): its last axis is the KV column, so its "row"
+        # stride is the seq_q one and the contiguous axis is the one the KV
+        # loop walks. Built here rather than earlier because it needs the row
+        # gate: a lane whose Q row is past `seqlen_q` still executes every
+        # iteration, and an unclamped row walks off the tensor.
+        #
+        # `_q_in` with the **absolute** `q_row`, not `_q_safe` -- `MaskedAxis.
+        # safe` returns the offset *within the tile*, because that is what the
+        # Q/dO address closures want on top of a per-tile base. B has no such
+        # base and is indexed absolutely, so `_q_safe` here silently addresses
+        # row `q - start_q`: correct only for the first Q block, wrong for
+        # every other one.
+        if const_expr(BIAS_TYPE):
+            _bq = fx.Index(q_row) if _q_in else fx.Index(0)
+            _b_ptr = fmha.pointer_to_llvm_ptr(B)
+            _b_row = (
+                _q_batch_v * fx.Index(stride_b_batch)
+                + head_q * fx.Index(stride_b_head)
+                + (_q_row_off_v + _bq) * fx.Index(stride_b_seq_q)
+            )
+            # DB is a different tensor and may be laid out differently, so it
+            # gets its own row rather than reusing B's.
+            _db_row = (
+                _q_batch_v * fx.Index(stride_db_batch)
+                + head_q * fx.Index(stride_db_head)
+                + (_q_row_off_v + _bq) * fx.Index(stride_db_seq_q)
+            )
+            _db_ptr = fmha.pointer_to_llvm_ptr(DB)
         q_packs = []
         do_packs = []
         for ks in range_constexpr(K_STEPS_QK):
@@ -987,14 +1005,19 @@ def build_bwd_dq_module_primary(meta, knobs):
                 # Not a gather: element `_st*8 + _r` is KV column
                 # `_st*16 + klane*8 + _r`, so within a group only `_r` varies
                 # and one v8 load covers all eight.
+                # The *value* is zeroed past `seqlen_k`, not the address. The
+                # address cannot be clamped: moving the eight-wide base to keep
+                # it in-row would shift which column each element carries, so
+                # the in-range ones would take a neighbour's bias. Zeroing after
+                # the load keeps those exact and stops an arbitrary neighbouring
+                # row's value entering the arithmetic -- which matters because
+                # the mask below is a select, and this build assumes no NaNs.
                 for _st in range_constexpr(NUM_S_ACCS):
-                    _bv = load_global_v8f16(
-                        _b_ptr,
-                        _b_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
-                        fx.Index(0),
-                    )
+                    _c0 = fx.Int32(kv_block_start) + fx.Int32(_st * WMMA_N) + fx.Int32(klane) * fx.Int32(8)
+                    _bv = load_global_v8f16(_b_ptr, _b_row + fx.Index(_c0), fx.Index(0))
                     for _r in range_constexpr(8):
-                        _bs = fx.Float32(Vec(_bv)[_r].to(fx.Float32))
+                        _live = _c0 + fx.Int32(_r) < seqlen_k_i32
+                        _bs = fx.Float32(fx.Float32(Vec(_bv)[_r].to(fx.Float32)) if _live else fx.Float32(0.0))
                         s_raw[_st * 8 + _r] = fastmath.add(s_raw[_st * 8 + _r], fastmath.mul(_bs, fx.Float32(_LOG2E)))
 
             if const_expr(_MASK_STEPS):
@@ -1070,17 +1093,28 @@ def build_bwd_dq_module_primary(meta, knobs):
                 # v8; dK/dV would walk down a column. And because bias excludes
                 # causal, the visited region is the full rectangle, so between
                 # them the Q blocks cover every (q, kv) exactly once.
-                for _st in range_constexpr(NUM_S_ACCS):
-                    _dbv = Vec.from_elements(
-                        [fx.Float32(ds_vals[_st * 8 + _j]).to(elem_dtype) for _j in range_constexpr(8)],
-                        elem_dtype,
-                    ).ir_value()
-                    store_global_v8(
-                        _db_ptr,
-                        _db_row + fx.Index(kv_block_start) + fx.Index(_st * WMMA_N) + klane * fx.Index(8),
-                        fx.Index(0),
-                        _dbv,
-                    )
+                # **Bounded, and per element.** A v8 here would be wrong at
+                # any ragged extent: dB's KV pitch is exactly `seqlen_k` with
+                # no padding, so a chunk straddling the end lands in the *next
+                # row*. That is unlike `fmha.write_v8`, whose whole-chunk skip
+                # is exact only because the head-dim pitch is a 16-byte
+                # multiple. `dS` is already 0 in those columns -- masked to
+                # -inf, so `p` is 0 -- which is precisely why the address, not
+                # the value, is what has to be guarded.
+                #
+                # The row guard is the same point: a lane past `seqlen_q` has
+                # a clamped `_q_safe`, so an unguarded store would write real
+                # row 0's gradient.
+                if _q_in:
+                    for _st in range_constexpr(NUM_S_ACCS):
+                        _c0 = fx.Int32(kv_block_start) + fx.Int32(_st * WMMA_N) + fx.Int32(klane) * fx.Int32(8)
+                        for _j in range_constexpr(8):
+                            if _c0 + fx.Int32(_j) < seqlen_k_i32:
+                                store_global_f16(
+                                    _db_ptr,
+                                    _db_row + fx.Index(_c0 + fx.Int32(_j)),
+                                    fx.Float32(ds_vals[_st * 8 + _j]).to(elem_dtype),
+                                )
 
             # ==== Build the dS packs ====
             # Truncated to the input's 16-bit type because RDNA4 WMMA has no

@@ -104,6 +104,20 @@ def flyc_bwd_dq(choices, hints):
         # Unread by resolve_knobs, whose policy keys on head_dim and causal.
         num_heads=1,
         head_dim=tile,
+        # Both the same, because AOTriton has ONE BLOCK_DMODEL axis and this
+        # kernel has one compiled tile (unlike dK/dV, which carries a second
+        # block_dmodel_v). The tile covers the wider of the two extents and the
+        # narrower axis rides as a masked RUNTIME extent -- the kernel's
+        # `vo_cols` is `MaskedAxis(hdim_vo, active=PADDED_HEAD)`.
+        #
+        # Which makes PADDED_HEAD load-bearing rather than cosmetic: with the
+        # flag off the V/O axis is not bounded at all and a narrower V is walked
+        # to the full tile. AOTriton sets it as
+        # `hdim_qk != hdim_rounded || hdim_vo != hdim_rounded`
+        # (modules/flash/csrc/attn_bwd.cc), which is exactly the condition
+        # upstream's resolve_knobs derives when asked to choose -- so passing
+        # `choices.PADDED_HEAD` below is the same answer, not a coincidence.
+        head_dim_v=tile,
         causal=choices.CAUSAL_TYPE != 0,
         causal_type=choices.CAUSAL_TYPE,
         dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
