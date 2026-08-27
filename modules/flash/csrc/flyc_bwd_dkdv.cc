@@ -103,27 +103,23 @@ FlycBwdDkdvContext::flyc_padded_head() const {
 // flyc_common.h's flyc_grid_axis_order for why this reads perf() rather than
 // assuming either.
 //
-// The KV tile size is also NOT spelled the same way on both arches. On
-// gfx1201 it is not a resolve_knobs output at all -- BLOCK_N, derived by this
-// file's own description as `ROWS_PER_WAVE * NUM_TEAMS` and put in the
-// sidecar under 'block_n' (see the comment at the bottom of
-// modules/flash/aot/flyc_bwd_dkdv.py). On gfx950 it IS a flat resolved field,
-// `BwdDkDvKnobs.block_kv`, mirrored verbatim under 'block_kv'. Rather than
-// force one Python-side name onto both, this reads whichever key the active
-// arch's sidecar actually populated.
+// The KV tile size is also NOT resolved the same way on both arches -- on
+// gfx1201 it is not a resolve_knobs output at all, but BLOCK_N derived by
+// this file's own description as `ROWS_PER_WAVE * NUM_TEAMS` (see the
+// sidecar note in modules/flash/aot/flyc_bwd_dkdv.py); on gfx950 it IS a flat
+// resolved field, `BwdDkDvKnobs.block_kv`. Both land under the same sidecar
+// key, 'block_kv', normalised in Python (the derivation differs; the wire
+// concept and its name do not), so this reads exactly one key.
 dim3
 FlycBwdDkdvContext::grid_calculator() const {
   const auto row = classify(*params);
   const auto axis_order = flyc_grid_axis_order(perf(), "flyc dkdv");
 
-  auto block_kv_opt = perf().get_int("block_kv");
-  if (!block_kv_opt) {
-    block_kv_opt = perf().get_int("block_n");
-  }
+  const auto block_kv_opt = perf().get_int("block_kv");
   if (!block_kv_opt) {
     AOTRITON_LOG(LOG_ERROR,
-                 "flyc dkdv grid_calculator: perf() is missing both the 'block_kv' and 'block_n' keys");
-    throw std::runtime_error("flyc dkdv grid_calculator: missing 'block_kv'/'block_n' in perf()");
+                 "flyc dkdv grid_calculator: perf() is missing the 'block_kv' key");
+    throw std::runtime_error("flyc dkdv grid_calculator: missing 'block_kv' in perf()");
   }
   const auto block_kv = static_cast<uint32_t>(*block_kv_opt);
   const auto num_kv_tiles =

@@ -17,7 +17,8 @@ What differs from the forward, beyond the operand list:
   for. AOTriton's Triton `bwd_preprocess` computes exactly that, in fp32, so
   the backend is a metro (`metro_bwd_flyc` in `__init__.py`) that runs the
   Triton preprocess and then this kernel and `flyc_bwd_dq`.
-* **`block_n` is derived, not resolved.** See the sidecar note at the bottom.
+* **The tile-width sidecar key is derived, not resolved, on this arch.** See
+  the sidecar note at the bottom.
 """
 
 from dataclasses import asdict
@@ -248,8 +249,14 @@ def flyc_bwd_dkdv(arch, choices, hints):
         # A divergence between the two copies is a wrong grid rather than a build
         # failure, so this is a real coupling to the vendored file -- check it on
         # every re-sync, the same way the kernarg order is checked.
+        #
+        # Filed under 'block_kv', not 'block_n': there is no upstream field
+        # this key belongs to on this arch (we compute it, we don't rename
+        # someone else's), and gfx950's BwdDkDvKnobs already owns a real
+        # 'block_kv' field for the same concept (see the gfx950 branch below)
+        # -- so grid_calculator() reads one key regardless of arch.
         team_waves = 2 * knobs.contraction_shards if knobs.split_head_dim else 1
-        sidecar['block_n'] = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
+        sidecar['block_kv'] = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
         # gfx1201's own knob class has no GRID_AXIS_ORDER field (§4.2): unlike
         # the forward and dQ, this kernel walks (tile, head, seq) --
         # TILE_FASTEST -- because it is one workgroup per KV head with the GQA
@@ -302,10 +309,11 @@ def flyc_bwd_dkdv(arch, choices, hints):
 
         # block_kv and GRID_AXIS_ORDER are flat resolved fields on BwdDkDvKnobs
         # already (§4.2) -- no mirroring needed, unlike the gfx1201 branch
-        # above. Note the field name mismatch this hands to csrc: gfx1201's
-        # sidecar spells the tile-size knob 'block_n' (there is no such field
-        # to rename), gfx950's spells it 'block_kv' -- grid_calculator() reads
-        # whichever name matches GRID_AXIS_ORDER's arch (see flyc_bwd_dkdv.cc).
+        # above. The two arches derive this value differently (gfx950 resolves
+        # it as a real knob; gfx1201 has no such field and derives it from
+        # three others, see the sidecar note there), but both land on the same
+        # 'block_kv' sidecar key, so grid_calculator() reads one key regardless
+        # of arch (see flyc_bwd_dkdv.cc).
         return build, asdict(knobs)
 
     else:
