@@ -335,6 +335,52 @@ class KernelDescription(Interface):
                     f'{name!r} (not bound by any @ati.tensor/@ati.scalar and not '
                     f'a resolved stride argument)')
 
+    def pp_arg_doc(self, aname):
+        """(is_constexpr, comment_value) for one REAL kernel argument's
+        pp_args entry -- flyc's counterpart to `ir/functional.py`'s
+        `Functional.pp_arg_doc`, read by `codegen/flytune.py`'s
+        `codegen_deduplicated_pp_args_function_index` the same way
+        `codegen/autotune.py` reads the Triton version.
+
+        Deliberately does NOT delegate to `Functional.resolved` the way the
+        Triton version does. `aname` here can be a name like `Workspace`,
+        `BlockTable` or `block_table_stride` -- real parameters of the gfx950
+        kernel signature (`real_param_order`, above) that are not, and never
+        will be, axes of the shared operator this kdesc borrows its
+        functional space from (module docstring: a flyc kdesc adds no axes
+        of its own). `functionals_source.resolved` simply has no entry for
+        them, so this cannot ask the question the Triton version asks.
+
+        Instead, constexpr-ness comes straight off THIS kernel's own
+        `@ati.scalar([...], options=[...])` declaration for `aname` (e.g.
+        `flyc_attn_fwd.py`'s `@ati.scalar(['Workspace', 'BlockTable',
+        'block_table_stride'], options=[0])`) -- deliberately independent of
+        whatever FlyDSL's own `_WS_ANN`/`_BT_ANN`/`_BTS_ANN` resolve to in the
+        vendored kernel source. That independence is what makes it safe: our
+        builds pin `paged=False, num_kv_splits=1` everywhere on gfx950, so
+        the annotation these three collapse to in the real kernel is the
+        same for every functional, uniformly -- there is no per-functional
+        divergence for a shared, deduplicated pp_args registration to
+        desync against. That is NOT true in general (see the long docstring
+        on `codegen_deduplicated_pp_args_function_index` explaining why
+        folding an axis whose constexpr-ness genuinely varies by functional
+        was implemented and then reverted for flyc); it only holds here
+        because the declaration is a per-description, build-wide fact
+        rather than a per-functional derived one. An axis-MARKER scalar
+        (item I's `BLOCK_DMODEL`/`PADDED_HEAD`, also `options=`-declared)
+        never collides with this: it is never a real kernel argument, so it
+        never appears in `real_param_order` and this method is never asked
+        about it via `iter_launch_arguments`'s yielded `aname`s."""
+        for s in self.scalars:
+            if aname not in s.arg_names:
+                continue
+            if s.options is None:
+                return False, None
+            if len(s.options) == 1:
+                return True, str(s.options[0])
+            return True, '/'.join(str(o) for o in s.options)
+        return False, None
+
     def context_helper_for_functional(self, aname):
         """Item I sub-step (c): the context-helper member-function name that
         should stand in for functional axis `aname` in godel_number(), or

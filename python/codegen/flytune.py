@@ -141,41 +141,57 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
 
     def codegen_deduplicated_pp_args_function_index(self):
         """Unlike autotune.py's equivalent, flyc collapses every functional onto
-        ONE shared pp_args function (PLAN-PHASE2.md Task 5): there is no
-        constexpr baking (no assign_skips[i] ever True), so assign_skips is
-        always the all-False tuple of the same length, and the
-        SignaturedFunctionRegistry naturally deduplicates it to a single
-        registration across all 288 functionals.
+        very few shared pp_args functions (PLAN-PHASE2.md Task 5), rather than
+        one per compiled variant: the SignaturedFunctionRegistry deduplicates
+        on `assign_skips`, and on gfx1201 that tuple is always all-False, so
+        every one of gfx1201's functionals still shares a single registration.
 
-        item C (mirroring autotune.py's constexpr fold via
-        `Functional.pp_arg_doc`) was implemented and build-verified, then
-        REVERTED: autotune.py's fold is only sound for Triton because
-        `tl.constexpr` parameters are genuinely elided from the JIT-compiled
-        kernel's ABI, so a shorter pp_args vector matches that functional's
-        differently-compiled binary. flyc's vendored kernel functions are
-        fixed, static `@flyc.kernel`-decorated Python signatures (grep-
-        confirmed for `flash_attn_func_aiw_kernel` in
-        flash_attn_func_gfx1201_aiw.py and `bwd_dq_kernel` in
-        fmha_bwd_dq_gfx1201_kernel.py): `window_left`, `window_right`,
-        `philox_offset2`, `hdim_qk`, `hdim_vo` are ALWAYS formal `fx.Int32`/
-        `fx.Int64` parameters of the compiled kernel, resolved at RUNTIME
-        inside the kernel body (e.g. via `fmha_common_gfx1201.resolve_window`)
-        -- never elided from the kernarg ABI based on the operator
-        description's `@ati.derives`/VarRef-driven constexpr-ness. flyc's
-        `real_param_order` is a static, arch-wide (not per-functional) AST
-        parse of that fixed signature, and `flyc_compile.py`'s
-        `synthesise_args` builds trace placeholders from parameter
-        ANNOTATION TYPE alone, never from the functional's resolved value --
-        there is no per-functional ABI specialization to match a folded
-        vector against. Commenting an entry out of the return vector would
-        therefore desync the `std::vector<void*>` positionally against the
-        compiled hsaco's actual, unchanging `hipModuleLaunchKernel`
-        kernelParams layout for every OTHER functional sharing that pattern.
-        This directly contradicts the plan's own claim that
-        `pp_arg_doc`/`Functional.resolved` make the fold "no new mechanism"
-        for flyc; the plan's stated EXPECTED outcome ("gfx1201's all-False
-        pattern") is the one this reverted, no-fold implementation actually
-        produces. See the Phase A execution report for the full writeup.
+        item C (mirroring autotune.py's constexpr fold via a
+        `pp_arg_doc`-shaped `(is_constexpr, comment_value)` lookup) was
+        implemented once for the GENERAL, per-functional case, build-
+        verified, then REVERTED: autotune.py's fold is only sound for Triton
+        because `tl.constexpr` parameters are genuinely elided from the
+        JIT-compiled kernel's ABI on a PER-FUNCTIONAL basis, so a shorter
+        pp_args vector matches that functional's differently-compiled
+        binary. flyc's vendored kernel functions are fixed, static
+        `@flyc.kernel`-decorated Python signatures (grep-confirmed for
+        `flash_attn_func_aiw_kernel` in flash_attn_func_gfx1201_aiw.py and
+        `bwd_dq_kernel` in fmha_bwd_dq_gfx1201_kernel.py): `window_left`,
+        `window_right`, `philox_offset2`, `hdim_qk`, `hdim_vo` are ALWAYS
+        formal `fx.Int32`/`fx.Int64` parameters of the compiled kernel,
+        resolved at RUNTIME inside the kernel body (e.g. via
+        `fmha_common_gfx1201.resolve_window`) -- never elided from the
+        kernarg ABI based on the operator description's `@ati.derives`/
+        VarRef-driven constexpr-ness, which is what the reverted, general
+        `Functional.pp_arg_doc`-based fold would have kept baking per
+        functional. flyc's `real_param_order` is a static, arch-wide (not
+        per-functional) AST parse of that fixed signature, and
+        `flyc_compile.py`'s `synthesise_args` builds trace placeholders from
+        parameter ANNOTATION TYPE alone, never from the functional's
+        resolved value -- there is no per-functional ABI specialization to
+        match a PER-FUNCTIONAL-VARYING folded vector against for those axes.
+
+        What is now (re-)implemented is a NARROWER fold that does not have
+        that problem: `kdesc.pp_arg_doc(aname)` (`ir/flyc/kdesc.py`) answers
+        is_constexpr from THIS kernel's own `@ati.scalar([...], options=...)`
+        declaration for a real kernel argument, not from the functional's
+        resolved axis choice. For an argument like gfx950's `Workspace`/
+        `BlockTable`/`block_table_stride` (see `flyc_attn_fwd.py`'s
+        `@ati.scalar(['Workspace', 'BlockTable', 'block_table_stride'],
+        options=[0])`), that declared constexpr-ness is a build-config-wide
+        fact -- true uniformly for every functional, because every gfx950
+        build here pins `paged=False, num_kv_splits=1` -- so folding it out
+        of the shared pp_args vector desyncs nothing: every functional this
+        pp_args registration is shared across agrees the parameter is
+        skipped. The general, per-functional-varying case above remains
+        unimplemented and reverted; only this uniform, per-description case
+        is folded. `flyc_compile.py`'s `_operand_for`/`_expected_kernarg_size`
+        independently confirm (from the real, `eval_str=True`-resolved
+        `Constexpr` annotation) that FlyDSL itself elides the same
+        parameters from the compiled kernarg ABI -- this fold and that
+        confirmation are two separate mechanisms that must agree, not one
+        deriving the other; item H's kernarg-size check is what catches it
+        if they ever stop agreeing.
 
         Context helpers (if any) are populated once, in `lookup_optimal()`,
         BEFORE pp_args ever runs (item I, PLAN-PHASE2.md Task 5 option (b);
@@ -192,19 +208,32 @@ class FlycTuneCodeGenerator(BaseTuneCodeGenerator):
         kdesc = self._f.meta_object
         pp_registry = self._parent_repo.get_signatured_function_registry('pp_function')
         largs = list(kdesc.iter_launch_arguments(self._f.arch))
-        assign_skips = (False,) * len(largs)
+        # IR-neutral, flyc-shaped: kdesc.pp_arg_doc(aname) -> (is_constexpr,
+        # comment_value), sourced from THIS kernel's own @ati.scalar
+        # declarations (see ir/flyc/kdesc.py's pp_arg_doc for why it cannot
+        # delegate to Functional.resolved the way autotune.py's does).
+        doc = {larg.aname: kdesc.pp_arg_doc(larg.aname) for larg in largs}
+        assign_skips = tuple(doc[larg.aname][0] for larg in largs)
         hit, findex = pp_registry.contains(assign_skips)
         if hit:
             return findex
-        stmt = []
-        ret_lines = [larg.expr + f', // {larg.aname}' for larg in largs]
+        ret_lines = []
+        for larg in largs:
+            is_constexpr, comment_value = doc[larg.aname]
+            line = larg.expr + f', // {larg.aname}'
+            # Comment out constexpr values -- see the docstring above for why
+            # this is safe here (a uniform, per-description fact) but is not
+            # the same thing as the general, per-functional fold that stays
+            # reverted.
+            if is_constexpr:
+                line = '// ' + line + f' as constexpr {comment_value}'
+            ret_lines.append(line)
         pfx = '  return { '
         join = '\n' + ' ' * len(pfx)
         sfx = '         };'
         # Do NOT join the return-vector lines with ','. There is comment text
         # after each parameter.
-        stmt.append(pfx + join.join(ret_lines) + '\n' + sfx)
-        src = '\n  '.join(stmt)
+        src = pfx + join.join(ret_lines) + '\n' + sfx
         return pp_registry.register(assign_skips, src)
 
     @property
