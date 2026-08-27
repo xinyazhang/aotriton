@@ -449,12 +449,21 @@ class ExaidPerfmonWorker(ExaidWorker):
         self.proxy.write('platform')
         return json.loads(self.proxy.readinfo())
 
-    def enumerate(self, entry_text: str) -> dict:
-        self.proxy.write('enumerate', entry_text)
+    def enumerate(self, entry_text: str, iface: int) -> dict:
+        """Wire shape `enumerate <entry_pon> <iface>` (perfmon/core/main.cc's
+        `enumerate_cmd`, entry_codec.h item 1): `iface` is a separate,
+        already-resolved integer index (`PerfDesc.list_ifaces()` order), not
+        read from `entry_text`'s own `iface=` key, which is Python-side
+        bookkeeping only. `dispatch-perfmon-exec.md` D12 is this method's
+        first caller; prior to that this method sent only `entry_text`,
+        silently missing the `iface` token the runner requires -- fixed here
+        rather than worked around in the handler.
+        """
+        self.proxy.write('enumerate', entry_text, iface)
         return json.loads(self.proxy.readinfo())
 
-    def measure(self, entry_text: str, iface: str, backend: int) -> dict:
-        self.proxy.write('measure', entry_text, iface, str(backend))
+    def measure(self, entry_text: str, iface: int, backend: int) -> dict:
+        self.proxy.write('measure', entry_text, iface, backend)
         return json.loads(self.proxy.readinfo(timeout=600))
 
 

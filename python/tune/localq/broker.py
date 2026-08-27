@@ -300,6 +300,33 @@ class LocalBroker:
         if target_queue:
             self._enqueue_with_priority(target_queue, message)
 
+    def _get_dependency_handler(self, msg_class: str):
+        """The handler whose `resolve_dependency`/`teardown_with_unmet_
+        dependency` governs fan-in for `msg_class`'s DAG.
+
+        Keyed on the DAG name -- `msg_class`'s prefix before its first `/`
+        -- not the bare class itself: every DAG spells its own fan-in
+        message differently (`tune_kernel/postprocess` vs. `perf_measure/
+        finalize`), but each DAG has exactly one, so the DAG name alone is
+        enough to pick it. A blocked message and the incoming message that
+        can resolve it always belong to the same DAG (a `perf_result` never
+        resolves a `tune_kernel/postprocess`), so callers may pass either
+        message's class here.
+
+        Imports are local, as the single-DAG version of this code already
+        did, to avoid a circular import between `broker.py` and the handler
+        modules.
+        """
+        dag_name = msg_class.split('/', 1)[0]
+        if dag_name == 'tune_kernel':
+            from .handlers.tune_kernel import PostprocessHandler
+            return PostprocessHandler(db_conn=None)
+        if dag_name == 'perf_measure':
+            from .handlers.perf_measure import FinalizeHandler
+            return FinalizeHandler(db_conn=None)
+        raise ValueError(f"_get_dependency_handler: no fan-in handler registered "
+                         f"for DAG {dag_name!r} (msg_class={msg_class!r})")
+
     def _resolve_dependencies(self, incoming_msg: dict):
         """
         Check if incoming message resolves any blocked messages.
@@ -312,21 +339,17 @@ class LocalBroker:
         if msg_class not in self.blocked_messages:
             return
 
-        # Get handler registry from first worker that has it
-        # (This is a simplification - in real impl, broker should have handler references)
-        # For now, we use PostprocessHandler.resolve_dependency directly
-
         blocked_list = self.blocked_messages[msg_class]
         unblocked = []
 
+        try:
+            handler = self._get_dependency_handler(msg_class)
+        except ValueError as e:
+            logger.error(f"{e}; {len(blocked_list)} blocked message(s) under "
+                        f"{msg_class!r} will never unblock")
+            return
+
         for blocked_msg in blocked_list:
-            # Import here to avoid circular dependency
-            from .handlers.tune_kernel import PostprocessHandler
-
-            # Create temporary handler instance to call resolve_dependency
-            # (In production, broker should maintain handler registry)
-            handler = PostprocessHandler(db_conn=None)
-
             if handler.resolve_dependency(blocked_msg, incoming_msg):
                 # Dependency resolved
                 unblocked.append(blocked_msg)
@@ -461,25 +484,26 @@ class LocalBroker:
         total = sum(len(msgs) for msgs in self.blocked_messages.values())
         logger.info(f"Tearing down {total} blocked messages")
 
-        # Import PostprocessHandler for teardown
-        from .handlers.tune_kernel import PostprocessHandler
-
-        # Create handler instance (with db_conn=None for broker context)
-        postprocess_handler = PostprocessHandler(db_conn=None)
-
         for dep_class, messages in self.blocked_messages.items():
             for msg in messages:
                 msg_class = msg.get('class')
                 if not msg_class:
                     continue
 
-                # Only postprocess messages need teardown (they're the only ones that can be blocked)
-                if msg_class == 'tune_kernel/postprocess':
-                    logger.info(f"Calling teardown for {msg_class}: task_id={msg.get('task_id')}")
-                    result_msg = postprocess_handler.teardown_with_unmet_dependency(msg)
+                # Only a DAG's own fan-in message (tune_kernel/postprocess,
+                # perf_measure/finalize, ...) needs teardown -- it is the
+                # only kind of message that can be blocked.
+                try:
+                    handler = self._get_dependency_handler(msg_class)
+                except ValueError as e:
+                    logger.warning(f"{e}; skipping teardown for task_id={msg.get('task_id')}")
+                    continue
 
-                    if result_msg:
-                        self._enqueue_with_priority(result_msg['target_queue'], result_msg)
+                logger.info(f"Calling teardown for {msg_class}: task_id={msg.get('task_id')}")
+                result_msg = handler.teardown_with_unmet_dependency(msg)
+
+                if result_msg:
+                    self._enqueue_with_priority(result_msg['target_queue'], result_msg)
 
         self.blocked_messages.clear()
         logger.info("Blocked messages teardown complete")

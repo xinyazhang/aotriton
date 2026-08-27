@@ -16,6 +16,7 @@ from psycopg.rows import dict_row
 
 from .generic_worker import GenericWorker
 from .handlers.tune_kernel import WriteImplResultHandler, PostprocessHandler
+from .handlers.perf_measure import WritePerfResultHandler, FinalizeHandler
 from .handlers.base import GracefulCancelRunningTaskHandler, MarkTaskFailedHandler
 from ..utils import get_db_connection_params, configure_logging_with_flush
 from ..pq.connection import ReconnectableConn
@@ -49,6 +50,8 @@ def main():
     handlers = [
         WriteImplResultHandler(db_conn),
         PostprocessHandler(db_conn),
+        WritePerfResultHandler(db_conn),
+        FinalizeHandler(db_conn),
         GracefulCancelRunningTaskHandler(db_conn),
         MarkTaskFailedHandler(db_conn),
     ]

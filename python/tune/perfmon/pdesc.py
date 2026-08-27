@@ -121,3 +121,18 @@ class PerfDescription(ABC):
         `iface`, given the wall time of one iteration in seconds. Ports
         `modules/<family>/visperf/static/<family>.js`'s formula (rev0 §6,
         §8) -- see e.g. `modules/flash/perfmon/tflops.py`."""
+
+    @abstractmethod
+    def resolve_entry(self, entry, vram_total_gb: float | None):
+        """`ENTRY_CLASS` (queued) -> `INPUT_METADATA` (resolved), against
+        this GPU's own VRAM (D05's per-family memory model, e.g. flash's
+        `modules/flash/perfmon/resolve.py`). `vram_total_gb` is the GPU
+        worker's own runner self-report (D05a); `None` means unknown, and an
+        implementation must not silently shrink the workload in that case.
+
+        Added here (dispatch-perfmon-exec.md D12) so `localq/handlers/
+        perf_measure.py` -- which, like `tune_kernel.py`, must stay
+        family-neutral -- can call `desc.resolve_entry(...)` instead of
+        importing a specific family's `resolve` module directly. D05 itself
+        only committed the flash implementation; this abstract method is the
+        hook that was missing to reach it generically."""

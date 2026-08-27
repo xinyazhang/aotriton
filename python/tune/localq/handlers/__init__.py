@@ -31,6 +31,13 @@ from .tune_kernel import (
     WriteImplResultHandler,
     PostprocessHandler,
 )
+from .perf_measure import (
+    PerfMeasureHandler,
+    ProbeHandler as PerfMeasureProbeHandler,
+    MeasureHandler,
+    WritePerfResultHandler,
+    FinalizeHandler,
+)
 
 __all__ = [
     'MessageHandler',
@@ -42,4 +49,9 @@ __all__ = [
     'TuneImplHandler',
     'WriteImplResultHandler',
     'PostprocessHandler',
+    'PerfMeasureHandler',
+    'PerfMeasureProbeHandler',
+    'MeasureHandler',
+    'WritePerfResultHandler',
+    'FinalizeHandler',
 ]

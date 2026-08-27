@@ -115,3 +115,7 @@ class PerfDesc(PerfDescription):
         fn = _tflops.attn_bwd_tflops if iface == 'attn_bwd' else _tflops.attn_fwd_tflops
         return fn(entry.seqlen_q, entry.seqlen_k, entry.hdim, bool(entry.causal),
                    seconds, entry.BATCH, _n_heads_for_tflops(entry))
+
+    def resolve_entry(self, entry, vram_total_gb: float | None):
+        from .resolve import resolve_entry as _resolve_entry
+        return _resolve_entry(entry, vram_total_gb)
