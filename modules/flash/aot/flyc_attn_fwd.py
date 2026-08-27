@@ -34,14 +34,26 @@ Three consequences, each handled below:
    archives exactly as Triton's are, which is also what keeps Triton's autotune
    code generator reusable for flyc later. See PLAN.md 6.2.
 
-2. **No functional axes are declared here.** They belong to the operator (owned by
-   the default triton backend); this backend inherits them and narrows with
-   `@ati.disable`, exactly as `aiter_fwd.py` does. `flyc_attn_fwd` then reads
-   `choices.NAME` (a `ChoiceView`) — the OPERATOR's choices, parsed from
-   `--signature` text by the driver — and maps them to builder knobs. This is
-   also why the axes cannot
-   be re-declared as `@ati.scalar`: they are not arguments of the flyc kernel at
-   all, they are build-time Python values.
+2. **No functional axes are declared here as kernel ARGUMENTS.** They belong to
+   the operator (owned by the default triton backend); this backend inherits
+   them and narrows with `@ati.disable`, exactly as `aiter_fwd.py` does.
+   `flyc_attn_fwd` then reads `choices.NAME` (a `ChoiceView`) — the OPERATOR's
+   choices, parsed from `--signature` text by the driver — and maps them to
+   builder knobs. This is also why the axes cannot be re-declared as a PLAIN
+   `@ati.scalar`: they are not arguments of the flyc kernel at all, they are
+   build-time Python values.
+
+   `BLOCK_DMODEL`/`PADDED_HEAD` ARE declared below, near the bottom of the
+   stack — but as item-I MARKERS (`options=..., wires_to=ati.context_helper
+   (...)`), a different, narrower shape from every other `@ati.scalar` in this
+   file. A marker never becomes a kernel argument (`options=` and an explicit
+   type are mutually exclusive, so it can never claim a kernarg slot the way
+   `varlen_bits`'s `'i32'` does); it exists purely so `godel_number()` can be
+   redirected to read the rounded value a context helper computes instead of
+   the raw, off-ladder choice (item I, gfx950's ladder is a strict subset of
+   the declared axis). See `ir/flyc/kdesc.py`'s `context_helper_for_functional`
+   for the mechanism and why it must not be confused with the four real,
+   explicit-type helpers above.
 
 3. **The kernarg list is declared, because nothing else can supply it.** aiter hands
    the params struct to a C++ cookie and never names a kernarg; triton gets its list
@@ -281,6 +293,37 @@ def _flyc_fwd_disabled(f):
 # Open question: BLOCK_M/BLOCK_SIZE are FlyDSL KNOBS, and flyc declares no perf axes,
 # so they are not perf fields on the context. They have to reach it some other way —
 # the JSON sidecar folded into the compiled-in metadata is the obvious candidate.
+#
+# --- item I: functional-axis markers, NOT kernel arguments --------------------
+#
+# `BLOCK_DMODEL`/`PADDED_HEAD` are the operator's own axes (inherited via
+# `@ati.cite` above, narrowed by `_flyc_fwd_disabled`'s FLYC_HEAD_DIMS check) --
+# NOT part of `flash_attn_func_aiw_kernel`'s kernarg ABI declared above, so
+# these two lines are deliberately kept out of that ordered block. `options=`
+# makes each one the MARKER shape (mutually exclusive with an explicit type),
+# which is what keeps it from ever being read by `iter_launch_arguments` as a
+# real launch argument -- it is only ever found by axis name, via
+# `context_helper_for_functional` (ir/flyc/kdesc.py).
+#
+# Why either axis needs this at all: V3 dispatch bins the caller's head dim to
+# a BLOCK_DMODEL rung on the OPERATOR's (Triton) ladder before a backend is
+# chosen, and this backend's compiled ladder (FLYC_HEAD_DIMS) is a strict
+# subset of it. Wiring the axis to a context helper lets `godel_number()` read
+# the ROUNDED value the helper computes (modules/flash/csrc/flyc_attn_fwd.cc,
+# item I sub-step (f)) instead of the raw, potentially off-ladder choice.
+# `PADDED_HEAD` must follow BLOCK_DMODEL's rounding decision -- a kernel
+# re-rounded to a wider rung with `PADDED_HEAD` left false is a silent wrong
+# answer, not a build error (see PLAN-PHASE2.md Task 5/6).
+#
+# The `options=` lists reuse each kernel's own FLYC_*_HEAD_DIMS /
+# `[False, True]` -- the values are otherwise unused (the digit's real range
+# comes from the OPERATOR's axis via `axis_of_arg`, not from this marker), but
+# stating this kernel's own ladder here is free documentation, not a second
+# source of truth: `_flyc_fwd_disabled` above is what actually enforces it.
+@ati.scalar('BLOCK_DMODEL', options=sorted(FLYC_HEAD_DIMS),
+            wires_to=ati.context_helper('flyc_block_dmodel'))
+@ati.scalar('PADDED_HEAD', options=[False, True],
+            wires_to=ati.context_helper('flyc_padded_head'))
 @ati.flyc.hints(FlycFwdHints)
 @ati.flyc.kernel()
 def flyc_attn_fwd(arch, choices, hints):
