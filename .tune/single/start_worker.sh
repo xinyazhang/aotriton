@@ -121,16 +121,65 @@ fi
 
 RUNFILE="$WORKER_WORKDIR/run/worker.containerid"
 
-mkdir -p "$WORKER_WORKDIR/run"
+# Create the run subdirectories HERE, on the host, as the ssh user -- not
+# inside the container, where worker_service.sh would otherwise be the first
+# to make them. It failed there with
+#     mkdir: cannot create directory '/wkdir/run/pids': Permission denied
+# because the container is not the workdir's owner (see the --user block
+# below). Making them out here means their ownership is never in doubt, and
+# it is the same reason `run/` itself has always been created here.
+mkdir -p "$WORKER_WORKDIR/run" \
+         "$WORKER_WORKDIR/run/pids" \
+         "$WORKER_WORKDIR/run/logs" \
+         "$WORKER_WORKDIR/run/pycache"
 
 if [ -f "$RUNFILE" ]; then
   echo "Worker already running or stale run file exists. Run stop first." >&2
   exit 1
 fi
 
+# --- who the container runs as ------------------------------------------
+#
+# perfmon runs as the INVOKING uid:gid; tuning keeps the image's default
+# (root). They differ on purpose.
+#
+# The perfmon image is built around a non-root user: its venv is owned by
+# the build uid:gid and every RUN step goes through `su`, because -- in that
+# Dockerfile's own words -- "a root-written file inside a user-owned venv
+# makes the next non-root pip install fail with EACCES inside
+# site-packages". Running that image as root at runtime contradicts the way
+# it was built. It is also what produced the mkdir failure above: a root
+# process is not the workdir's owner, and on a host that squashes container
+# root (NFS root_squash, or docker userns-remap) it cannot write into a
+# directory the user owns.
+#
+# .tune/single/build_perfmon.sh already passes --user for the same image,
+# with the same reasoning recorded there ("otherwise installed/perfmon/
+# comes back root-owned and the next build cannot overwrite it").
+#
+# Tuning is deliberately NOT changed here. It has no user-owned venv to
+# protect, it works as root today, and switching it would put GPU device
+# access (/dev/kfd, /dev/dri) behind group membership that has never been
+# tested for it -- an untested change to a path in production use. The two
+# should converge once someone can verify a non-root tuning worker on real
+# hardware.
+DOCKER_USER_ARGS=()
+if [ "$WORKLOAD" = "perfmon" ]; then
+  DOCKER_USER_ARGS=(--user "$(id -u):$(id -g)")
+  # A non-root process needs the render group to open /dev/kfd and
+  # /dev/dri/renderD*; root did not. Added by GID, and only if the host has
+  # such a group, since --group-add on a name that does not exist is a hard
+  # docker error. `video` is already added unconditionally below.
+  render_gid=$(getent group render 2>/dev/null | cut -d: -f3)
+  if [ -n "$render_gid" ]; then
+    DOCKER_USER_ARGS+=(--group-add "$render_gid")
+  fi
+fi
+
 set -x
 WORKER_CONTAINER_ID=$(docker run -d \
   --init \
+  "${DOCKER_USER_ARGS[@]}" \
   --device=/dev/kfd \
   --device=/dev/dri \
   --group-add video \
