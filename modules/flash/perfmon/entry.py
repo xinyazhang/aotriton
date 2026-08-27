@@ -63,7 +63,11 @@ FlashInputMetadata = _flash_entry_module.FlashInputMetadata
 
 # --- rev0 §6.1 prime set -----------------------------------------------------
 
-PRIME_HDIMS = (64, 128, 192, 256, 384, 512)
+# 16 and 32 are the small end of tuning's own hdim ladder
+# (modules/flash/tune/desc.py's get_entry_choices), included for the same
+# reason as the seqlen ladder below: they are shapes the tuning table holds,
+# so they have entries whose performance can be tracked.
+PRIME_HDIMS = (16, 32, 64, 128, 192, 256, 384, 512)
 PRIME_CAUSAL = (False, True)
 
 # Tuning's own seqlen ladder (modules/flash/tune/desc.py's
