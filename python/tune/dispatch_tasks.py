@@ -486,11 +486,10 @@ def build_module_parser(module_name, module_instance, workdir):
                  + ". Validated after parsing, so this line stays readable.")
         module_parser.add_argument(
             '--entry_set', choices=sorted(sets), default=None,
-            help="Supply every axis's values from a named set, instead of "
-                 "giving them all by hand. "
+            help="Supply every axis's values from a named set; overridden "
+                 "by individual options. "
                  + '; '.join(f'{k}: {v}' for k, v in sorted(sets.items()))
-                 + ". No default: with it omitted, every axis below must be "
-                   "given explicitly.")
+                 + ". No default: omit it and give every axis by hand.")
         module_parser.add_argument(
             '--max_seqlen', type=int, default=None, metavar='N',
             help="Seqlen ceiling on top of each arch's own measured one.")
