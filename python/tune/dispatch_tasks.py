@@ -304,6 +304,10 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
                      + (', '.join(configured) or '(none)')
                      + "\n       or pass 'all'.")
         presets = args.preset
+    # Same write-back as the axes (PerfEntrySource): after this, `args`
+    # describes the run that will actually happen -- 'all' expanded, default
+    # filled in -- rather than what was typed.
+    args.preset = presets
 
     # Built BEFORE the banner: resolving the axes can fail (an axis with no
     # values, a --max_seqlen that excludes every pair), and an error is

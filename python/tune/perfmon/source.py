@@ -126,6 +126,8 @@ class PerfEntrySource:
 
         # A CLI-supplied seqlen ceiling has to be reapplied to an axis the
         # operator set by hand, since only the entry set consulted it.
+        # (Applied before the write-back below, so `args` records the values
+        # actually dispatched, not the ones asked for.)
         if args.max_seqlen is not None and 'seqlen_qk' in self.overridden:
             self.axes['seqlen_qk'] = [
                 (q, k) for q, k in self.axes['seqlen_qk']
@@ -134,6 +136,20 @@ class PerfEntrySource:
                 raise ValueError(
                     f"--max_seqlen {args.max_seqlen} excludes every pair "
                     "given to --seqlen_qk.")
+
+        # Write the RESOLVED axes back into `args`, so that from here on a
+        # run driven by `--entry_set` is indistinguishable from one where
+        # every axis was typed out by hand.
+        #
+        # This is not cosmetic. `args` is what the confirmation prompt
+        # prints (driver.dispatch), and before this it showed `causal: None`
+        # for a run that was about to dispatch both causal values -- the
+        # prompt asking for confirmation of a dispatch it was not
+        # describing. It also removes the standing divergence between the
+        # two ways of specifying a run: downstream code reads one thing,
+        # whichever way the operator got there.
+        for name, values in self.axes.items():
+            setattr(args, name, values)
 
     def batches(self):
         yield from self.presets
