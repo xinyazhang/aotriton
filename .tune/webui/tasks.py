@@ -201,28 +201,42 @@ def _merge_progress_rows(progress_rows, speed_rows, stale_rows):
     return result
 
 
+# (label, class, subclass) slices to report on the Tuning Progress table.
+# The dashboard used to render one hardcoded table per tuning level ('Kernel
+# Tuning Progress', 'Op Tuning Progress'); now the level is data. Adding a
+# class/subclass -- e.g. perf_measure once something dispatches it -- only
+# needs a new tuple here, not a new template block.
+_PROGRESS_SECTIONS = (
+    ('Kernel', 'tune_kernel', 'kernel'),
+    ('Op', 'tune_kernel', 'op'),
+)
+
+
 def get_tuning_progress(workdir):
-    """Get kernel and op tuning progress for both tuning levels.
+    """Get per-arch tuning progress across all known (class, subclass) slices.
+
+    Returns {'rows': [...]}: one row per (kind, arch), each carrying a 'kind'
+    label (from _PROGRESS_SECTIONS) alongside the usual per-arch fields. Rows
+    from each section are appended in section order, so arches still group
+    by kind without a separate table per kind.
 
     The queries live in aotriton.tune.pq.queue; this only merges and formats
     what they return.
     """
+    rows = []
     try:
         conn_params = get_db_connection_params(Path(workdir))
         with psycopg.connect(**conn_params, row_factory=dict_row) as conn:
             tq = TaskQueue(conn)
-            # ('tune_kernel', 'kernel') / ('tune_kernel', 'op'): the class
-            # and subclass this page reports on. Both slices of one view now,
-            # rather than one view each (rev2 R07).
-            kernel = tq.get_progress('tune_kernel', 'kernel')
-            op = tq.get_progress('tune_kernel', 'op')
-            return {
-                'kernel': _merge_progress_rows(kernel['progress'], kernel['speed'], kernel['stale']),
-                'op': _merge_progress_rows(op['progress'], op['speed'], op['stale']),
-            }
+            for label, klass, subklass in _PROGRESS_SECTIONS:
+                section = tq.get_progress(klass, subklass)
+                merged = _merge_progress_rows(section['progress'], section['speed'], section['stale'])
+                for row in merged:
+                    row['kind'] = label
+                rows.extend(merged)
     except Exception as e:
         logging.error(f"Failed to get tuning progress: {e}")
-        return {'kernel': [], 'op': []}
+    return {'rows': rows}
 
 
 _TUNE_V3BIS_MARKER = 'TUNE_V3BIS testrun Item: '

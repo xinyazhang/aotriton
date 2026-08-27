@@ -1,10 +1,11 @@
 {% if last_refresh %}<span class="last-refresh">Last refresh: {{ last_refresh }}</span>{% endif %}
 
-{%- macro progress_table(rows) %}
-{% if rows %}
+<h3>Tuning Progress</h3>
+{% if tuning_progress.rows %}
 <table style="width: 100%;">
     <thead>
         <tr>
+            <th>Kind</th>
             <th>Architecture</th>
             <th>Pending</th>
             <th>Running</th>
@@ -17,8 +18,9 @@
         </tr>
     </thead>
     <tbody>
-        {% for row in rows %}
+        {% for row in tuning_progress.rows %}
         <tr>
+            <td>{{ row.kind }}</td>
             <td><code>{{ row.arch }}</code></td>
             <td>{{ row.pending }}</td>
             <td>{{ row.running }}{% if row.stale > 0 %} <span style="color: #ff6b6b;">({{ row.stale }} stale)</span>{% endif %}</td>
@@ -35,10 +37,3 @@
 {% else %}
 <p>No tasks in queue.</p>
 {% endif %}
-{%- endmacro %}
-
-<h3>Kernel Tuning Progress</h3>
-{{ progress_table(tuning_progress.kernel) }}
-
-<h3>Op Tuning Progress</h3>
-{{ progress_table(tuning_progress.op) }}
