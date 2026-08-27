@@ -30,6 +30,25 @@ Phase 1: stored and otherwise unused. No codegen reads `ContextHelper` yet — t
 Phase 2's job (declaring the member on the context class, and any `wires_to`
 consumption in the shim generator). It exists here so descriptions using it (like
 `modules/flash/aot/flyc_attn_fwd.py`) parse whole.
+
+Phase 2 (item I, PLAN-PHASE2.md Task 5) added a generated caller,
+`codegen/flyc.py:codegen_context_helper_evaluate`, that runs every context
+helper for a description exactly once, in declaration order, before
+`lookup_optimal` computes its own `arch_number`/`mod_number` or binds
+`perf()`. That caller RESTS ON an assumption this class does not enforce:
+every helper must be a pure function of `params` and `current_gpu` alone, and
+helpers must be mutually independent (no helper may read `perf()` or another
+helper's result). This holds for every helper that exists as of item I, but
+it is a scope decision with an expiry, not a property `ContextHelper` checks
+or a law of the type -- and breaking it fails SILENTLY (a helper reading
+`perf()` gets a default-constructed Pon; one reading another helper's scratch
+member gets that member's zero-initialised value, not its real result), which
+is exactly why it needs to stay written down instead of being rediscovered by
+debugging a wrong answer. Revisit with a topological sort over declared
+dependencies, or lazy memoised accessors, the day a helper genuinely needs
+`perf()` or another helper's output. See the generated comment at
+`codegen/template/flyc.cc`'s `[[context_helper_evaluate]]` site for the
+C++-side restatement of this same warning.
 """
 
 from __future__ import annotations

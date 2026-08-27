@@ -68,7 +68,6 @@ class FlycShimGenerator(InterfaceGenerator):
             'context_helper_declares'        : self.codegen_context_helper_declares(),
             'context_helper_scratch_members' : self.codegen_context_helper_scratch_members(),
             'compiled_rung_table_declares'   : self.codegen_compiled_rung_table_declares(),
-            'declare_compiled_in_features'  : self.codegen_declare_compiled_in_features(),
             'kernel_table_entry_declares'   : self.codegen_tune_table_entry_declares(functionals),
             'number_of_functionals' : kdesc.godel_number,
             'declare_list_of_deduplicated_lut_functions' : self.codegen_declare_list_of_deduplicated_lut_functions(),
@@ -98,7 +97,6 @@ class FlycShimGenerator(InterfaceGenerator):
             'list_of_pp_args_function_decls' : list_of_pp_args_function_decls,
             'get_archmod_number_body' : self.codegen_archmod_number_body(),
             'number_of_functionals'  : kdesc.godel_number,
-            'define_compiled_in_features' : self.codegen_define_compiled_in_features(),
             'per_kernel_packed_string'  : self.codegen_per_kernel_packed_string(),
             'kernel_table_entries' : self.codegen_tune_table_entries(functionals),
             'list_of_deduplicated_lut_functions' : self.codegen_list_of_deduplicated_lut_functions(),
@@ -115,34 +113,19 @@ class FlycShimGenerator(InterfaceGenerator):
         # itself be a valid C++ string-literal expression -- '""', not ''.
         return self._this_repo.get_data('per_kernel_packed_string', return_none=True) or '""'
 
-    def codegen_declare_compiled_in_features(self):
-        kdesc = self._iface
-        decl_list = []
-        for tp in kdesc.list_functional_params():  # tp: TemplateParam
-            if not tp.emit_feature_table:
-                continue
-            infotype = tp.repr_typed_choice.infotype
-            decl_code = f'static const std::vector<{infotype}>& get_{tp.repr_name}_choices();'
-            decl_list.append(decl_code)
-        return '\n    '.join(decl_list)
-
-    def codegen_define_compiled_in_features(self):
-        def_list = []
-        kdesc = self._iface
-        meta_class = kdesc.metadata_class_name
-        for tp in kdesc.list_functional_params():  # tp: TemplateParam
-            if not tp.emit_feature_table:
-                continue
-            infotype = tp.repr_typed_choice.infotype
-            choices = ', '.join([tc.infotext for tc in tp.choices])
-            def_code = f'''
-const std::vector<{infotype}>& {meta_class}::get_{tp.repr_name}_choices()
-{{
-    static const std::vector<{infotype}> choices = {{ {choices} }};
-    return choices;
-}}'''
-            def_list.append(def_code)
-        return '\n'.join(def_list)
+    # codegen_declare_compiled_in_features / codegen_define_compiled_in_features
+    # used to live here, mirroring kernel.py's KernelShimGenerator (which still
+    # has them, and whose Triton-axis binning site in attn_fwd.cc/attn_bwd.cc
+    # still calls the equivalent AttnFwdMetadata::get_BLOCK_DMODEL_choices()).
+    # Deleted as part of item I: nothing ever called the flyc analogue
+    # (FlycAttnFwdMetadata::get_BLOCK_DMODEL_choices() and siblings), and had
+    # something called it, it would have been the WRONG table for item I's
+    # purposes -- it enumerated the axis's DECLARED choices, not the
+    # arch-specific COMPILED subset autotune_table actually carries, which is
+    # exactly the distinction sub-step (d)'s compiled_<axis> /
+    # compiled_<axis>_count arrays (codegen_compiled_rung_table_defs, above)
+    # exist to get right. Keeping a second, untrue, unused table around was
+    # dead weight at best and a trap for a future caller at worst.
 
     def _rung_table_params(self):
         """Functional axes with an item-I compiled-rung table (sub-step (d)):

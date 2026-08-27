@@ -144,8 +144,13 @@ struct [[context_class_name]] {
 };
 
 struct [[metadata_class_name]] {
-    // Note: FEAT_CHOICES here
-    [[declare_compiled_in_features]]
+    // Deliberately empty: this used to declare get_<axis>_choices() feature
+    // tables (kernel.py's analogue still does, and its Triton binning site
+    // still calls them) but nothing ever called the flyc side, and the table
+    // it would report is the axis's declared choices, not this arch's
+    // compiled subset -- see the context class's own compiled_<axis> /
+    // compiled_<axis>_count arrays (item I sub-step (d)) for the table that
+    // is actually correct and actually used.
 };
 
 namespace flytune {
