@@ -170,6 +170,16 @@ def coverage_axes(max_seqlen: int) -> dict:
 
 ENTRY_SETS = {'prime': prime_axes, 'coverage': coverage_axes}
 
+#: One line per set, for `--entry_set`'s help. Says what the set is FOR, not
+#: just what it contains -- the names alone do not tell an operator which to
+#: reach for.
+ENTRY_SET_HELP = {
+    'prime': "the shapes the tuning table holds -- every tuned seqlen plus "
+             "16384, crossed with hdim x causal x dtype, no dropout or bias",
+    'coverage': "functional breadth -- dropout and bias on and off, over the "
+                "L-shaped seqlen pairs (3n-2, not n^2), at one hdim",
+}
+
 
 def entries_from_axes(axes: dict):
     """Cross product of `axes` -> FlashEntry, one per combination.

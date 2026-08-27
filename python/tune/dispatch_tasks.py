@@ -291,19 +291,34 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
     if not args.preset or 'all' in args.preset:
         presets = configured
     else:
+        # Validated here rather than by argparse `choices`, which would put
+        # all five preset ids in the usage line and make it unreadable. The
+        # check is the same; only where it is reported differs. It is a
+        # spelling check against what this workdir configures, NOT a
+        # servability check -- every worker serves every preset
+        # (dispatch-perfmon.md §3.3).
+        unknown = [p for p in args.preset if p not in configured]
+        if unknown:
+            sys.exit("Error: unknown preset(s): " + ', '.join(unknown)
+                     + "\n       configured here: "
+                     + (', '.join(configured) or '(none)')
+                     + "\n       or pass 'all'.")
         presets = args.preset
 
-    print(f"Dispatching tasks to architecture(s): {', '.join(args.arch)}")
-    print(f"Presets: {', '.join(presets)}")
-
+    # Built BEFORE the banner: resolving the axes can fail (an axis with no
+    # values, a --max_seqlen that excludes every pair), and an error is
+    # easier to read when it is not preceded by two lines announcing work
+    # that will not happen.
     try:
         source = PerfEntrySource(module_name, module_instance, args, presets=presets)
     except ValueError as e:
-        # Axis values are parsed against the entry set's own types, which
-        # argparse cannot do for us (the set is not known when the flag is
-        # declared). Report it the way argparse would rather than as a
-        # traceback -- it is operator input, not an internal fault.
+        # Operator input, not an internal fault -- report it the way argparse
+        # would. argparse itself cannot: which axes are required depends on
+        # --entry_set, which it is parsing at the same time.
         sys.exit(f"Error: {e}")
+
+    print(f"Dispatching tasks to architecture(s): {', '.join(args.arch)}")
+    print(f"Presets: {', '.join(presets)}")
 
     if args.dry_run:
         print("perf_measure --dry_run: counts below are QUEUE ROWS (entries)"
@@ -315,7 +330,9 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
         if source.overridden:
             print("Axes replaced on the command line: "
                   + ', '.join(f'--{a}' for a in source.overridden))
-        print(f"Axes ({args.entry_set} set, with any override applied):")
+        origin = (f"{args.entry_set} set, with any override applied"
+                  if args.entry_set else "given entirely on the command line")
+        print(f"Axes ({origin}):")
         for axis, values in source.axes.items():
             shown = ' '.join(f'{v[0]},{v[1]}' if axis == 'seqlen_qk' else str(v)
                              for v in values)
@@ -366,6 +383,47 @@ def add_common_arguments(parser):
     parser.add_argument('-y', '--yes', action='store_true',
                         help='Skip confirmation prompt and proceed with dispatch')
 
+def _axis_type(name: str, superset: list):
+    """argparse `type=` for one perfmon axis.
+
+    Parsing lives in the parser, not downstream, so a bad value is reported
+    the way every other argparse error is. The target type comes from what
+    the entry sets actually hold for that axis, so a new ENTRY_CLASS field
+    needs no rule added here.
+    """
+    proto = superset[0] if superset else None
+
+    def convert(text: str):
+        if name == 'seqlen_qk':
+            parts = text.split(',')
+            if len(parts) not in (1, 2):
+                raise argparse.ArgumentTypeError(
+                    f"expected <sq>,<sk> or a bare N, got {text!r}")
+            try:
+                nums = [int(part) for part in parts]
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"seqlens must be integers, got {text!r}") from None
+            return (nums[0], nums[-1])
+        if isinstance(proto, bool):
+            if text in ('0', 'false', 'False'):
+                return False
+            if text in ('1', 'true', 'True'):
+                return True
+            raise argparse.ArgumentTypeError(f"expected 0 or 1, got {text!r}")
+        for kind in (int, float):
+            if isinstance(proto, kind):
+                try:
+                    return kind(text)
+                except ValueError:
+                    raise argparse.ArgumentTypeError(
+                        f"expected {kind.__name__}, got {text!r}") from None
+        return text
+
+    convert.__name__ = name
+    return convert
+
+
 def build_module_parser(module_name, module_instance, workdir):
     """Phase 2 (D09): the module's own parser, for everything after `--`.
 
@@ -396,62 +454,63 @@ def build_module_parser(module_name, module_instance, workdir):
     add_common_arguments(module_parser)
 
     if not hasattr(module_instance, 'get_entry_choices'):
-        # PerfDescription (D10): its own dispatch flags, not shared with
-        # tuning's per-field cross product below.
-        # Choices are PROBED from this workdir's workers.db, which the
-        # two-phase parse makes possible: --workdir is a phase-1 argument,
-        # so it is already known by the time this phase-2 parser is built.
+        # PerfDescription: axis flags, not tuning's per-field cross product.
         #
-        # Probing is for discoverability -- `-h` lists what this fleet is
-        # configured to measure, and a typo is caught at parse time instead
-        # of producing an empty run. It is NOT a servability check: every
-        # worker is expected to serve every preset (dispatch-perfmon.md
-        # §3.3), so there is nothing to validate against a fleet.
+        # THE AXES ARE THE GROUND TRUTH for what gets dispatched. --entry_set
+        # is a shortcut that supplies their values; any axis given here wins
+        # over what the set supplied. Said once, here, rather than repeated
+        # in every flag's help.
         from .perfmon.presets import available_presets
-        _configured = available_presets(workdir)
+        import sys as _sys
+
+        sets = module_instance.entry_set_names()
+
+        # `choices` per axis is the UNION over every set -- a superset, not
+        # the chosen set's values, because --entry_set is parsed by this same
+        # parser and so is not known when the flag is declared. A superset
+        # still catches a typo while accepting anything any set legitimately
+        # offers, which is the most argparse can check here.
+        superset: dict[str, list] = {}
+        for set_name in sets:
+            for axis, values in module_instance.entry_set_axes(
+                    set_name, arch=None, max_seqlen=_sys.maxsize).items():
+                for v in values:
+                    if v not in superset.setdefault(axis, []):
+                        superset[axis].append(v)
+
         module_parser.add_argument(
-            '--preset', type=str, nargs='+', default=None,
-            choices=_configured + ['all'],
-            help="Preset(s) ('rocm<ver>+aotriton<tag>') to dispatch, "
-                 "repeatable, or 'all'. Narrows the configured set for a "
-                 "partial run. Default: 'all'. Configured here: "
-                 + (', '.join(_configured) if _configured else '(none)'))
+            '--preset', type=str, nargs='+', default=None, metavar='PRESET',
+            help="Preset(s) to dispatch, or 'all' (default). Configured in "
+                 "this workdir: "
+                 + (', '.join(available_presets(workdir)) or '(none)')
+                 + ". Validated after parsing, so this line stays readable.")
         module_parser.add_argument(
-            '--entry_set', choices=['prime', 'coverage'], default='prime',
-            help="Which curated entry set to dispatch (default: %(default)s).")
+            '--entry_set', choices=sorted(sets), default=None,
+            help="Supply every axis's values from a named set, instead of "
+                 "giving them all by hand. "
+                 + '; '.join(f'{k}: {v}' for k, v in sorted(sets.items()))
+                 + ". No default: with it omitted, every axis below must be "
+                   "given explicitly.")
         module_parser.add_argument(
             '--max_seqlen', type=int, default=None, metavar='N',
-            help="Override the seqlen ceiling validate_hw_feature enforces "
-                 "(default: no CLI override -- only each arch's own "
-                 "measured ceiling, if any, applies).")
+            help="Seqlen ceiling on top of each arch's own measured one.")
 
-        # One flag per AXIS. These are the ground truth for what gets
-        # dispatched; --entry_set above is a shortcut that SUPPLIES their
-        # values, and naming one here replaces what the set supplied.
-        #
-        # Same spelling as tuning's per-field flags and now the same
-        # meaning: both define the entry space rather than filter a fixed
-        # one. What differs is only where the defaults come from -- tuning's
-        # from get_entry_choices(), perfmon's from --entry_set.
-        #
-        # No `choices=`: the legal values depend on --entry_set and
-        # --max_seqlen, which this same parser is still parsing.
-        #
-        # seqlen_q/seqlen_k are ONE flag, --seqlen_qk, taking `<sq>,<sk>`
-        # pairs (a bare N means the diagonal). Neither set crosses q with k
-        # -- prime walks the diagonal, coverage the L-shape -- so two
-        # independent flags could not express either without also
-        # generating pairs the sets deliberately exclude.
         for axis in ('dtype', 'hdim', 'causal', 'dropout_p', 'bias_type'):
             module_parser.add_argument(
-                f'--{axis}', nargs='+', default=None, metavar='V',
-                help=f"{axis} values to dispatch, replacing whatever "
-                     f"--entry_set supplies (default: the set's).")
+                f'--{axis}', nargs='+', default=None,
+                type=_axis_type(axis, superset.get(axis, [])),
+                choices=superset.get(axis) or None,
+                help=f"{axis} values to dispatch."
+                     + (" 0/1 accepted too."
+                        if superset.get(axis) and isinstance(superset[axis][0], bool)
+                        else ""))
         module_parser.add_argument(
             '--seqlen_qk', nargs='+', default=None, metavar='SQ,SK',
-            help="(seqlen_q, seqlen_k) pairs, e.g. --seqlen_qk 1024,4096 "
-                 "128,64. A bare N means the diagonal (N, N). Replaces "
-                 "whatever --entry_set supplies.")
+            type=_axis_type('seqlen_qk', []),
+            help="(seqlen_q, seqlen_k) pairs, e.g. 1024,4096 128,64. A bare "
+                 "N means the diagonal (N, N). No `choices`: the pairs a set "
+                 "supplies are a curated shape (prime's diagonal, coverage's "
+                 "L-shape), not a menu to pick from.")
         return module_parser
 
     all_choices = get_parameter_choices(module_instance)

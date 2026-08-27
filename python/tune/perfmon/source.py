@@ -47,45 +47,6 @@ def norm_value(value) -> str:
     return str(value)
 
 
-def parse_axis_value(name: str, text: str, supplied: list):
-    """Coerce one command-line string to the axis's own value type.
-
-    The type comes from the value the entry set supplied for that axis, not
-    from a per-flag declaration, so a new ENTRY_CLASS field inherits parsing
-    from whatever its set already holds.
-
-    `seqlen_qk` is the one axis whose values are pairs, spelled `<sq>,<sk>`.
-    A bare `N` means the diagonal `(N, N)` -- what the prime set means by a
-    seqlen, and what an operator narrowing a prime run will type.
-    """
-    if name == 'seqlen_qk':
-        parts = text.split(',')
-        if len(parts) not in (1, 2):
-            raise ValueError("--seqlen_qk takes <sq>,<sk> (or a bare N for "
-                             f"the diagonal), got {text!r}")
-        try:
-            nums = [int(part) for part in parts]
-        except ValueError:
-            raise ValueError("--seqlen_qk takes integer seqlens, got "
-                             f"{text!r}") from None
-        return (nums[0], nums[-1])
-    proto = supplied[0] if supplied else text
-    if isinstance(proto, bool):
-        if text in ('0', 'false', 'False'):
-            return False
-        if text in ('1', 'true', 'True'):
-            return True
-        raise ValueError(f"--{name} takes 0/1, got {text!r}")
-    for kind, cast in ((int, int), (float, float)):
-        if isinstance(proto, kind):
-            try:
-                return cast(text)
-            except ValueError:
-                raise ValueError(
-                    f"--{name} takes {kind.__name__} values, got {text!r}") from None
-    return text
-
-
 def norm_text(text: str) -> str:
     """`norm_value` for a string off the command line, so `0.0` and `0`
     agree with each other and with the entry."""
@@ -110,6 +71,10 @@ class PerfEntrySource:
     handed.
     """
 
+    #: Every axis of the entry space. `seqlen_qk` is one axis of (q, k)
+    #: pairs, not two -- see PerfDescription.entry_set_axes.
+    AXIS_NAMES = ('dtype', 'hdim', 'seqlen_qk', 'causal', 'dropout_p', 'bias_type')
+
     def __init__(self, module_name: str, module_instance, args, *, presets: list[str]):
         self.module_name = module_name
         self.module_instance = module_instance
@@ -129,29 +94,46 @@ class PerfEntrySource:
         #
         # `--entry_set` SUPPLIES VALUES to the axes; any axis named on the
         # command line replaces what it supplied. A set is a named bundle of
-        # defaults, not a fixed list of entries, so a combination outside
-        # every set is still reachable for a one-off debug run:
+        # defaults, not a fixed list of entries, so a combination in no set
+        # is still reachable for a one-off debug run.
         #
-        #   --entry_set prime                   the whole prime set
-        #   --entry_set prime --dtype bfloat16  prime, one dtype
-        #   --seqlen_qk 1024,4096 --hdim 128    in no set; exactly this
-        #
-        # This is the inverse of the first implementation, where the curated
-        # generators were authoritative and flags could only subset their
-        # output -- which left a combination outside the sets unreachable.
-        #
-        # `seqlen_qk` is ONE axis of (q, k) pairs; see PerfDescription.
-        # entry_set_axes' docstring for why it is not two.
-        self.axes = module_instance.entry_set_axes(
-            args.entry_set, arch=None,
-            max_seqlen=args.max_seqlen if args.max_seqlen is not None else sys.maxsize)
+        # `--entry_set` has NO DEFAULT, deliberately. Defaulting it to
+        # `prime` would make a bare invocation quietly queue the whole prime
+        # set across every preset -- thousands of rows from a command that
+        # named nothing. Omitting it is legal, but then every axis has to be
+        # given by hand, and the error below says which are missing.
+        max_seqlen = args.max_seqlen if args.max_seqlen is not None else sys.maxsize
+        if args.entry_set is None:
+            self.axes = {}
+        else:
+            self.axes = module_instance.entry_set_axes(
+                args.entry_set, arch=None, max_seqlen=max_seqlen)
+
         self.overridden = []
-        for name, supplied in list(self.axes.items()):
+        for name in self.AXIS_NAMES:
             given = getattr(args, name, None)
             if given is None:
                 continue
-            self.axes[name] = [parse_axis_value(name, v, supplied) for v in given]
+            self.axes[name] = list(given)   # already typed by argparse
             self.overridden.append(name)
+
+        missing = [n for n in self.AXIS_NAMES if not self.axes.get(n)]
+        if missing:
+            raise ValueError(
+                "no values for " + ', '.join(f'--{m}' for m in missing)
+                + ". Give them explicitly, or pass --entry_set to supply "
+                  "every axis at once.")
+
+        # A CLI-supplied seqlen ceiling has to be reapplied to an axis the
+        # operator set by hand, since only the entry set consulted it.
+        if args.max_seqlen is not None and 'seqlen_qk' in self.overridden:
+            self.axes['seqlen_qk'] = [
+                (q, k) for q, k in self.axes['seqlen_qk']
+                if max(q, k) <= args.max_seqlen]
+            if not self.axes['seqlen_qk']:
+                raise ValueError(
+                    f"--max_seqlen {args.max_seqlen} excludes every pair "
+                    "given to --seqlen_qk.")
 
     def batches(self):
         yield from self.presets

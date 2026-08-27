@@ -77,6 +77,9 @@ class PerfDesc(PerfDescription):
     def coverage_entries(self, arch: str, max_seqlen: int):
         yield from _entry.coverage_entries(max_seqlen)
 
+    def entry_set_names(self) -> dict[str, str]:
+        return dict(_entry.ENTRY_SET_HELP)
+
     def entry_set_axes(self, name: str, arch: str, max_seqlen: int) -> dict:
         return _entry.ENTRY_SETS[name](max_seqlen)
 

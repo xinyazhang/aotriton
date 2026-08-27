@@ -86,6 +86,14 @@ class PerfDescription(ABC):
         L-shaped `{(s,s)} ∪ {(s,max)} ∪ {(max,s)}` pairs."""
 
     @abstractmethod
+    def entry_set_names(self) -> dict[str, str]:
+        """Named entry set -> a one-line description of what it is FOR.
+
+        Both halves are used: the keys are `--entry_set`'s legal values, and
+        the descriptions go in its help, because the names alone do not tell
+        an operator which to reach for."""
+
+    @abstractmethod
     def entry_set_axes(self, name: str, arch: str, max_seqlen: int) -> dict:
         """Axis values a named entry set supplies, keyed by ENTRY_CLASS field
         name -- except that `(seqlen_q, seqlen_k)` appear as ONE `seqlen_qk`
