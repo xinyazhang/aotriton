@@ -23,7 +23,7 @@ path:   kernels/attention/parity/
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx950-feature-bwd
-commit: 70b2dbc5
+commit: 7cd69444  (was 70b2dbc5)
 path:   kernels/attention/parity/
 ```
 
@@ -160,7 +160,7 @@ zero import rewrites, one deletion.
 
 | file | what is deleted | why | retire when |
 |---|---|---|---|
-| `flash_attn_func_gfx950.py` | the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 38 lines at `70b2dbc5`: 888–925) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
+| `flash_attn_func_gfx950.py` | the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 45 lines at `7cd69444`: 917–961; was 38 lines at 888–925 at `70b2dbc5`) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1137–1143; was 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
 
 Both blocks go, not just the first: leaving the call site would be a `NameError`
 at trace time if SPLITK were ever enabled, which is a worse failure than the
@@ -322,7 +322,7 @@ function-by-function without touching any other file.
 
 | class | ports from | notes |
 |---|---|---|
-| `DualwaveSwpTraits` | `kernels/attention/flash_attn_utils.py` @ `70b2dbc5`, lines 1476–1582 | **verbatim, 107 lines**, `@dataclass(frozen=True)`, no bases, 78 annotated scalar fields, one `cache_tag` property with zero flydsl references. sha256 `6750ff4e…` |
+| `DualwaveSwpTraits` | `kernels/attention/flash_attn_utils.py` @ `7cd69444`, lines 1476–1582 | **verbatim, 107 lines**, `@dataclass(frozen=True)`, no bases, 78 annotated scalar fields, one `cache_tag` property with zero flydsl references. sha256 `6750ff4e…` — unchanged from `70b2dbc5`, same lines and same hash |
 
 **Retiring condition — not the usual one.** The other six wait on an upstream
 merge. This class is *already* upstream, and byte-identical on `upstream/main`
@@ -427,6 +427,17 @@ read), record the addition here:
   Q.device, stream)` unconditionally (`flash_attn_func_gfx1201_aiw.py:2284`),
   even when dropout is disabled.
 
+**gfx950 needs none, and `7cd69444` is where that could have changed.** The
+pointer rewrite introduced `wire_ptr(t)` in `fmha_dualwave_gfx950.py`, which
+reads `t.dtype` (stringified, keyed through `_TORCH_DTYPE_TO_FX`) and
+`t.data_ptr()` — and `FakeTensor` has no `.dtype`. It does not matter, because
+`wire_ptr` is only reached from `_args`, and `_args` is only reached from
+`plan()` / `__call__`, the torch-facing JIT entry points. The AOT driver enters
+at `@flyc.jit launch_flash_attn_func_gfx950`, whose six tensor operands are now
+`fx.Pointer`, so `flyc_compile.synthesise_args` builds them from the annotation
+alone and no descriptor is consulted. Re-check this on re-sync by confirming
+`wire_ptr` has not migrated into the `@flyc.jit` launcher body.
+
 ## Re-sync cost, measured at `93d8d497`
 
 The `971dce48` -> `93d8d497` re-sync was done deliberately as a cost experiment: copy all
@@ -483,6 +494,62 @@ longer declares `flyc_batch_size()`, so `modules/flash/csrc/flyc_attn_fwd.cc` lo
 — but `grid_calculator()` still needs a batch count, since the grid's z extent is
 `num_seqlens != 0 ? num_seqlens : batch_size`. It now comes off `FlycVarlenRow` directly
 (`modules/flash/csrc/flyc_common.h`).
+
+## Re-sync cost, measured at `7cd69444` (gfx950)
+
+The first gfx950 re-sync, and the one the arch was waiting on: `7cd69444`
+*"[Kernel] gfx950: tensor operands become fx.Pointer, and the kernarg loses its
+descriptors"*. Before it, `flyc_compile._operand_for` raised on `fx.Tensor` and
+the C++ shim had no by-value-descriptor concept, so gfx950 could not be built at
+all.
+
+| | |
+|---|---|
+| upstream commits spanned | 1 (`70b2dbc5`..`7cd69444`) |
+| vendored files changed upstream | 4 of 12 — `flash_attn_func_gfx950.py` (94 lines), `fmha_bwd_dkdv_gfx950.py` (80), `fmha_bwd_dq_gfx950.py` (80), `fmha_dualwave_gfx950.py` (+101, the new `wire_ptr`/`wire_view` pair) |
+| our re-wiring | **none** — still zero import rewrites; only the 1c deletion, re-derived |
+| polyfill changes needed | none — `flash_attn_utils.py` is byte-identical across the span, so `DualwaveSwpTraits` keeps its lines and its `6750ff4e…` |
+| ATI description changes needed | **none** — the kernarg order did not move (below) |
+| Gate B | both halves re-run and unchanged: generator side gives `fwd block_m=256`, `dkdv block_kv=64`, `dq block_m=64`, `GRID_AXIS_ORDER=0/0/0` at head_dim 128 with `flydsl.*` and `kernels.*` blocked; build side imports all three kernels and the 78-field `DualwaveSwpTraits` equivalence check passes |
+
+**The kernarg order did not move, which is the thing that had to be checked.**
+The rewrite touched every tensor operand's annotation, so it is exactly the
+shape of change that reorders a kernarg. It did not: the parameter *names* are
+unchanged and so are their positions. `fx.Tensor` → `fx.Pointer` in place, six
+slots in the forward and nine in each backward.
+
+| | gfx950 | gfx1201 | |
+|---|---|---|---|
+| forward | 46, or **43** with `Workspace` / `BlockTable` / `block_table_stride` folded away | **43** | identical name-for-name *and* annotation-for-annotation |
+| backward dK/dV | **50** | **50** | identical name-for-name |
+| backward dQ/dB | **50** | **50** | identical name-for-name |
+
+**Zero `fx.Tensor`** survives in any of the three kernel defs or their
+launchers. Two *spellings* remain, both in `flash_attn_func_gfx950.py`:
+
+```python
+_WS_ANN = fx.Tensor if _WS_RUNTIME else fx.Constexpr   # _WS_RUNTIME = SPLITK or DEBUG_LAZY_COUNTS
+_BT_ANN = fx.Tensor if _BT_RUNTIME else fx.Constexpr   # _BT_RUNTIME = PAGED
+```
+
+Both resolve to `fx.Constexpr` for every build AOTriton makes — the descriptions
+pin `num_kv_splits=1` and no paging — which is the constexpr fold (item C) and
+is what folds 46 down to 43. That fold surviving the rewrite was an explicit
+obligation on the FlyDSL side; it did.
+
+**One upstream claim to read carefully.** The new comment above the kernarg says
+the forward is 296 bytes and is *not* byte-identical to
+`flash_attn_func_aiw_kernel`, which "carries `batch_size` on the wire" and puts
+`sm_scale` last. That is measured against the copy of
+`flash_attn_func_gfx1201_aiw.py` sitting on the **gfx950 branch**, which is the
+pre-`67a3ace0` 44-parameter version. Against the gfx1201 we actually vendor
+(`caee9257`, 43 parameters, no `batch_size`, `sm_scale` before the strides) the
+two agree exactly. Do not act on the upstream comment without checking which
+revision it is comparing to; the two branches carry different `aiw` files.
+
+296 vs the 292 quoted elsewhere for gfx1201 is padding, not a layout difference:
+the declared fields total 292 and `sm_scale` (f32) meets the fifteen i64 strides,
+so one 4-byte hole is inserted. Both kernels have it.
 
 ## Re-sync procedure
 
