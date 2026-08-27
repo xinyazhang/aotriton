@@ -80,41 +80,64 @@ FlycBwdDkdvContext::flyc_padded_head() const {
   return rounded != hdim_qk || rounded != hdim_vo;
 }
 
-// Grid shape, derived from the vendored kernel's own launcher -- `launch_bwd_dkdv`
-// in modules/flash/flyc/fmha_bwd_dkdv_gfx1201_kernel.py:
+// Grid shape. Unlike the forward and dQ, the two arches genuinely DISAGREE on
+// the axis order here -- this is not a formality, both are real, measured
+// launchers:
+//
+// gfx1201 (`launch_bwd_dkdv` in fmha_bwd_dkdv_gfx1201_kernel.py), TILE_FASTEST:
 //
 //   nseq_idx     = num_seqlens != 0 ? num_seqlens : batch_size
 //   num_kv_tiles = cdiv(max_seqlen_k, BLOCK_N)
 //   launcher.launch(grid=(num_kv_tiles, num_head_k, nseq_idx), block=(BLOCK_SIZE, 1, 1))
 //
-// Not the forward's axis order, and not the dQ kernel's either: dK/dV walks KV
-// tiles for a fixed Q range, so the tile count is x and the head axis is y, and
-// the head is num_head_K -- one workgroup per KV head, with the GQA query heads
-// summed inside. Writing (head, tile, seq) here as the forward does would run
-// the right number of workgroups over the wrong blocks.
+// gfx950 (`fmha_bwd_dkdv_gfx950_kernel`'s own `.launch(...)`), HEAD_FASTEST --
+// per that call's own comment, this was TRIED the other way and measured
+// 12-15% SLOWER at every rung (the eight XCDs have separate L2s, so sharing a
+// KV slab across concurrent workgroups duplicates it instead of spreading
+// distinct work):
 //
-// BLOCK_N, not BLOCK_M, and it is NOT one of resolve_knobs' outputs: the builder
-// derives it as `ROWS_PER_WAVE * NUM_TEAMS`. The ATI description recomputes it
-// from the knobs and puts it in the sidecar under 'block_n'; see the comment at
-// the bottom of modules/flash/aot/flyc_bwd_dkdv.py.
+//   num_kv_blocks = cdiv(max_seqlen_k, BLOCK_KV)
+//   launcher.launch(grid=(num_head_k, num_kv_blocks, bs_idx), block=(BLOCK_SIZE, 1, 1))
+//
+// So both orders below are real, not a forward-compatibility stub -- see
+// flyc_common.h's flyc_grid_axis_order for why this reads perf() rather than
+// assuming either.
+//
+// The KV tile size is also NOT spelled the same way on both arches. On
+// gfx1201 it is not a resolve_knobs output at all -- BLOCK_N, derived by this
+// file's own description as `ROWS_PER_WAVE * NUM_TEAMS` and put in the
+// sidecar under 'block_n' (see the comment at the bottom of
+// modules/flash/aot/flyc_bwd_dkdv.py). On gfx950 it IS a flat resolved field,
+// `BwdDkDvKnobs.block_kv`, mirrored verbatim under 'block_kv'. Rather than
+// force one Python-side name onto both, this reads whichever key the active
+// arch's sidecar actually populated.
 dim3
 FlycBwdDkdvContext::grid_calculator() const {
   const auto row = classify(*params);
+  const auto axis_order = flyc_grid_axis_order(perf(), "flyc dkdv");
 
-  const auto block_n_opt = perf().get_int("block_n");
-  if (!block_n_opt) {
-    AOTRITON_LOG(LOG_ERROR, "flyc dkdv grid_calculator: perf() is missing the 'block_n' key");
-    throw std::runtime_error("flyc dkdv grid_calculator: missing 'block_n' in perf()");
+  auto block_kv_opt = perf().get_int("block_kv");
+  if (!block_kv_opt) {
+    block_kv_opt = perf().get_int("block_n");
   }
-  const auto block_n = static_cast<uint32_t>(*block_n_opt);
+  if (!block_kv_opt) {
+    AOTRITON_LOG(LOG_ERROR,
+                 "flyc dkdv grid_calculator: perf() is missing both the 'block_kv' and 'block_n' keys");
+    throw std::runtime_error("flyc dkdv grid_calculator: missing 'block_kv'/'block_n' in perf()");
+  }
+  const auto block_kv = static_cast<uint32_t>(*block_kv_opt);
   const auto num_kv_tiles =
-      AOTRITON_NS::cdiv<uint32_t>(static_cast<uint32_t>(params->max_seqlen_k), block_n);
+      AOTRITON_NS::cdiv<uint32_t>(static_cast<uint32_t>(params->max_seqlen_k), block_kv);
+  const auto num_head_k = static_cast<uint32_t>(params->num_head_k);
+  const auto nseq_idx = static_cast<uint32_t>(row.nseq_idx());
 
-  return dim3 {
-    num_kv_tiles,
-    static_cast<uint32_t>(params->num_head_k),
-    static_cast<uint32_t>(row.nseq_idx()),
-  };
+  switch (axis_order) {
+    case kFlycGridAxisTileFastest:
+      return dim3 { num_kv_tiles, num_head_k, nseq_idx };
+    case kFlycGridAxisHeadFastest:
+      return dim3 { num_head_k, num_kv_tiles, nseq_idx };
+  }
+  throw std::runtime_error("flyc dkdv grid_calculator: unreachable GRID_AXIS_ORDER");
 }
 
 } // namespace AOTRITON_NS::v3::flash

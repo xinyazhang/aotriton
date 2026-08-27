@@ -24,6 +24,7 @@
 
 #include <aotriton/config.h>
 #include <aotriton/_internal/log.h>
+#include <aotriton/_internal/pon.h>
 
 #include "flyc_varlen.h"
 
@@ -154,6 +155,41 @@ flyc_round_up_rung(int32_t hdim, const int16_t* table, int count) {
     }
   }
   return -1;
+}
+
+// §4.4: the two axis orders a flyc grid can walk, mirrored (same names, same
+// integer values) from FlyDSL's fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST /
+// GRID_AXIS_TILE_FASTEST. Every flyc description (Phase C, §4.2) puts one of
+// these two values into its sidecar under 'GRID_AXIS_ORDER' -- gfx1201's by a
+// literal assignment (there is no upstream knob to carry it), gfx950's as a
+// flat field `resolve()` already produces -- so a grid_calculator() reads one
+// perf() key and switches, instead of assuming a fixed order that only held
+// for gfx1201 before gfx950 arrived with a different one for dK/dV.
+enum FlycGridAxisOrder : int64_t {
+  kFlycGridAxisHeadFastest = 0,
+  kFlycGridAxisTileFastest = 1,
+};
+
+// Reads GRID_AXIS_ORDER out of `perf()` once, so the three grid_calculator()s
+// log and throw identically on a missing or unrecognised value rather than
+// diverging in wording. `kernel_name` is only for the message.
+inline FlycGridAxisOrder
+flyc_grid_axis_order(const Pon& perf, const char* kernel_name) {
+  const auto opt = perf.get_int("GRID_AXIS_ORDER");
+  if (!opt) {
+    AOTRITON_LOG(LOG_ERROR,
+                 "%s grid_calculator: perf() is missing the 'GRID_AXIS_ORDER' key",
+                 kernel_name);
+    throw std::runtime_error("flyc grid_calculator: missing 'GRID_AXIS_ORDER' in perf()");
+  }
+  const int64_t v = *opt;
+  if (v != kFlycGridAxisHeadFastest && v != kFlycGridAxisTileFastest) {
+    AOTRITON_LOG(LOG_ERROR,
+                 "%s grid_calculator: unrecognised GRID_AXIS_ORDER=%lld",
+                 kernel_name, static_cast<long long>(v));
+    throw std::runtime_error("flyc grid_calculator: unrecognised GRID_AXIS_ORDER");
+  }
+  return static_cast<FlycGridAxisOrder>(v);
 }
 
 }  // namespace AOTRITON_NS::v3::flash

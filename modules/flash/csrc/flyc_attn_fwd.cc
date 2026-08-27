@@ -112,13 +112,19 @@ FlycAttnFwdContext::flyc_padded_head() const {
 // exactly the code this function replaces.
 //
 // Unlike Triton's grid_calculator(), there is no persistent variant and no
-// NUM_XCDS-dependent axis swap: flyc's forward grid is always (head, q_tile,
-// seq) in that order. `block` is not reproduced here -- the block size comes
-// from the aks2 directory entry (num_warps * warp_size), not from the caller;
-// see TritonKernel::invoke.
+// NUM_XCDS-dependent axis swap. `block` is not reproduced here -- the block
+// size comes from the aks2 directory entry (num_warps * warp_size), not from
+// the caller; see TritonKernel::invoke.
+//
+// §4.4: the axis order itself is not hardcoded -- both arches' descriptions
+// put HEAD_FASTEST in the sidecar for this kernel today (gfx1201 by literal
+// assignment, gfx950 as `Gfx950Knobs.GRID_AXIS_ORDER`, a flat resolved field),
+// but this reads perf() rather than assuming so, per flyc_common.h's
+// flyc_grid_axis_order.
 dim3
 FlycAttnFwdContext::grid_calculator() const {
   const auto row = classify(*params);
+  const auto axis_order = flyc_grid_axis_order(perf(), "flyc fwd");
 
   const auto block_m_opt = perf().get_int("block_m");
   if (!block_m_opt) {
@@ -127,12 +133,19 @@ FlycAttnFwdContext::grid_calculator() const {
   }
   const auto block_m = static_cast<uint32_t>(*block_m_opt);
   const auto num_q_tiles = AOTRITON_NS::cdiv<uint32_t>(static_cast<uint32_t>(params->Max_seqlen_q), block_m);
+  const auto num_head_q = static_cast<uint32_t>(params->Num_head_q);
+  const auto nseq_idx = static_cast<uint32_t>(row.nseq_idx());
 
-  return dim3 {
-    static_cast<uint32_t>(params->Num_head_q),
-    num_q_tiles,
-    static_cast<uint32_t>(row.nseq_idx()),
-  };
+  switch (axis_order) {
+    case kFlycGridAxisHeadFastest:
+      return dim3 { num_head_q, num_q_tiles, nseq_idx };
+    case kFlycGridAxisTileFastest:
+      // No knob set has ever asked the forward for this order; fail loudly
+      // rather than silently walk the axes in the wrong shape.
+      AOTRITON_LOG(LOG_ERROR, "flyc fwd grid_calculator: TILE_FASTEST is not implemented for this kernel");
+      throw std::runtime_error("flyc fwd grid_calculator: unsupported GRID_AXIS_ORDER (TILE_FASTEST)");
+  }
+  throw std::runtime_error("flyc fwd grid_calculator: unreachable GRID_AXIS_ORDER");
 }
 
 } // namespace AOTRITON_NS::v3::flash
