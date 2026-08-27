@@ -24,6 +24,14 @@ std::tuple<int, int>
 }
 
 
+// Item I (head-dim ladders, python/codegen/flyc.py) redirects flyc's
+// BLOCK_DMODEL/PADDED_HEAD reads from `args.` to `scratch_params.` inside
+// godel_number_calculation, reached from THIS function's flyc counterpart
+// (template/flyc.cc's lookup_optimal). Slim Affine kernels (aiter,
+// modules/flash/csrc/slim_affine.cc) never compute a godel number at all --
+// there is no autotune_table, no BLOCK_DMODEL/PADDED_HEAD axis, and no
+// binning step to redirect -- so aiter is neither helped nor broken by item
+// I; it is simply outside what item I touches.
 hipError_t
 [[context_class_name]]::lookup_optimal(Gpu gpu) {
     auto [arch_number, mod_number] = get_archmod_number(gpu);

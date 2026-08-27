@@ -230,8 +230,6 @@ PP_FUNC prepare_arguments[ [[pp_func_num]] ] = {
 };
 }
 
-[[define_compiled_in_features]]
-
 namespace flytune {
 
 const char [[shim_kernel_name]]_packed_string[] =
