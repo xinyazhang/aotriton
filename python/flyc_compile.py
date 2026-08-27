@@ -275,6 +275,7 @@ def _operand_for(param, desc=None):
     | `Float32` | `0.0` |
     | `Stream` | `fx.Stream(None)` |
     | `Tensor` | raise -- not supported yet, see below |
+    | `Constexpr` | `0` -- see below |
     | anything else | raise, naming the parameter and its annotation |
 
     `desc` is a `FakeTensor` descriptor, optional and unused in Phase 1 (every
@@ -302,6 +303,18 @@ def _operand_for(param, desc=None):
         return 0.0
     if name == 'Stream':
         return fx.Stream(None)
+    if name == 'Constexpr':
+        # gfx950's `Workspace`/`BlockTable`/`block_table_stride` resolve to
+        # this annotation whenever the build is paged=False/no-splitk (our
+        # permanent pin, see flash_attn_func_gfx950.py's `_WS_ANN`/`_BT_ANN`/
+        # `_BTS_ANN`): the compiler folds the parameter away entirely rather
+        # than passing a pointer or scalar, so the traced value is never
+        # read by the kernel body -- any constexpr-legal stand-in works.
+        # `0`, not `None`: the value becomes part of the JIT cache key
+        # through `Constexpr.value_signature` (FlyDSL 75553a16), which
+        # accepts int/bool/float/str/tuple/lambda and raises on anything
+        # else -- `None` is not in that list.
+        return 0
 
     tensor_note = ''
     if name == 'Tensor':
@@ -337,6 +350,16 @@ _KERNARG_TYPE_SIZE = {
     'Int32': 4,
     'Int64': 8,
     'Float32': 4,
+    # A folded parameter (see `_operand_for`'s `Constexpr` row): the compiler
+    # never gives it a kernarg slot, so it contributes 0 bytes here too. This
+    # is what makes item H load-bearing on gfx950 -- if a build's Constexpr
+    # fold silently stopped happening (an ABI regression upstream, or a
+    # description declaring the wrong parameters `options=`-constexpr), this
+    # size would undercount against the real ELF's `.kernarg_segment_size`
+    # and the mismatch check below would catch it. Do NOT give this a
+    # non-zero placeholder "to be safe" -- that would defeat exactly the
+    # check it exists for.
+    'Constexpr': 0,
 }
 
 
