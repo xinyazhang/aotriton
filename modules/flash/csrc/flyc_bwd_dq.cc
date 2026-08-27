@@ -87,9 +87,15 @@ FlycBwdDqContext::flyc_padded_head() const {
 //
 // `block_m` is a resolve_knobs output here, so unlike dK/dV's block_n it needs
 // no derivation on the description side.
+//
+// §4.4: as in the forward, the axis order is read from perf() rather than
+// assumed -- both arches' descriptions put HEAD_FASTEST in the sidecar for
+// this kernel today, but the switch below is what makes that a fact this
+// function checks rather than one it silently depends on.
 dim3
 FlycBwdDqContext::grid_calculator() const {
   const auto row = classify(*params);
+  const auto axis_order = flyc_grid_axis_order(perf(), "flyc dq");
 
   const auto block_m_opt = perf().get_int("block_m");
   if (!block_m_opt) {
@@ -99,12 +105,17 @@ FlycBwdDqContext::grid_calculator() const {
   const auto block_m = static_cast<uint32_t>(*block_m_opt);
   const auto num_q_tiles =
       AOTRITON_NS::cdiv<uint32_t>(static_cast<uint32_t>(params->max_seqlen_q), block_m);
+  const auto num_head_q = static_cast<uint32_t>(params->num_head_q);
+  const auto nseq_idx = static_cast<uint32_t>(row.nseq_idx());
 
-  return dim3 {
-    static_cast<uint32_t>(params->num_head_q),
-    num_q_tiles,
-    static_cast<uint32_t>(row.nseq_idx()),
-  };
+  switch (axis_order) {
+    case kFlycGridAxisHeadFastest:
+      return dim3 { num_head_q, num_q_tiles, nseq_idx };
+    case kFlycGridAxisTileFastest:
+      AOTRITON_LOG(LOG_ERROR, "flyc dq grid_calculator: TILE_FASTEST is not implemented for this kernel");
+      throw std::runtime_error("flyc dq grid_calculator: unsupported GRID_AXIS_ORDER (TILE_FASTEST)");
+  }
+  throw std::runtime_error("flyc dq grid_calculator: unreachable GRID_AXIS_ORDER");
 }
 
 } // namespace AOTRITON_NS::v3::flash
