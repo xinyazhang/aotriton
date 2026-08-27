@@ -86,6 +86,28 @@ class PerfDescription(ABC):
         L-shaped `{(s,s)} ∪ {(s,max)} ∪ {(max,s)}` pairs."""
 
     @abstractmethod
+    def entry_set_axes(self, name: str, arch: str, max_seqlen: int) -> dict:
+        """Axis values a named entry set supplies, keyed by ENTRY_CLASS field
+        name -- except that `(seqlen_q, seqlen_k)` appear as ONE `seqlen_qk`
+        axis of pairs.
+
+        The AXES are the ground truth for what gets dispatched; `--entry_set`
+        is a shortcut that supplies their values, and any axis the operator
+        names on the command line replaces what the set supplied. So a set is
+        a named bundle of defaults, not a fixed list of entries.
+
+        `seqlen_qk` is one axis and not two because no set crosses q with k:
+        the prime set walks the diagonal and coverage walks the L-shape
+        (`3n-2` pairs, not `n^2`). Two independent axes could not express
+        either without also generating pairs the sets deliberately exclude.
+        """
+
+    @abstractmethod
+    def entries_from_axes(self, axes: dict):
+        """Cross product of `axes` -> ENTRY_CLASS instances, in a stable
+        order (rev0 §5.7 makes perfmon's insert order load-bearing)."""
+
+    @abstractmethod
     def list_ifaces(self) -> list[str]:
         """Bare interface names this family measures end-to-end (op level
         only, D3), e.g. `['attn_fwd', 'attn_bwd']` for flash. Unlike tuning's

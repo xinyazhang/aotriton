@@ -284,14 +284,26 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
     conn_params = get_db_connection_params()
 
     # --preset SELECTS a subset of the configured presets; it does not
-    # validate one (dispatch-perfmon.md §3.4) -- given values are used
-    # as-is, never checked against available_presets().
-    presets = args.preset if args.preset else available_presets(workdir)
+    # validate that one is servable (dispatch-perfmon.md §3.4). argparse
+    # already restricted the values to what workers.db configures, plus
+    # 'all'; 'all' anywhere in the list means the whole configured set.
+    configured = available_presets(workdir)
+    if not args.preset or 'all' in args.preset:
+        presets = configured
+    else:
+        presets = args.preset
 
     print(f"Dispatching tasks to architecture(s): {', '.join(args.arch)}")
     print(f"Presets: {', '.join(presets)}")
 
-    source = PerfEntrySource(module_name, module_instance, args, presets=presets)
+    try:
+        source = PerfEntrySource(module_name, module_instance, args, presets=presets)
+    except ValueError as e:
+        # Axis values are parsed against the entry set's own types, which
+        # argparse cannot do for us (the set is not known when the flag is
+        # declared). Report it the way argparse would rather than as a
+        # traceback -- it is operator input, not an internal fault.
+        sys.exit(f"Error: {e}")
 
     if args.dry_run:
         print("perf_measure --dry_run: counts below are QUEUE ROWS (entries)"
@@ -300,24 +312,19 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
               "that is NOT known at dispatch time -- it depends on the GPU "
               "and even differs per AOTriton version (dispatch-perfmon.md "
               "§6).")
-        active = ', '.join(f'--{k} {" ".join(v)}' for k, v in source.filters.items())
-        if active:
-            print(f"Entry filters: {active}")
+        if source.overridden:
+            print("Axes replaced on the command line: "
+                  + ', '.join(f'--{a}' for a in source.overridden))
+        print(f"Axes ({args.entry_set} set, with any override applied):")
+        for axis, values in source.axes.items():
+            shown = ' '.join(f'{v[0]},{v[1]}' if axis == 'seqlen_qk' else str(v)
+                             for v in values)
+            print(f"  {axis:11} = {shown}")
         for preset in source.batches():
             for arch in args.arch:
                 count = sum(1 for entry in source.entries(preset, arch)
                             if source.validate_hw_feature(arch, entry)[0])
-                total = sum(1 for _ in source.generated(arch))
-                suffix = f"  (of {total} in the {args.entry_set} set)" if source.filters else ""
-                print(f"  {arch} / {preset}: {count} entries{suffix}")
-                # A filter that selects nothing is a typo far more often
-                # than a real empty intersection, so show what IS there
-                # rather than leaving the operator to guess.
-                if count == 0 and source.filters:
-                    avail = source.available_values(arch)
-                    print(f"    no entry matched. {args.entry_set} set for {arch} contains:")
-                    for name in source.filters:
-                        print(f"      --{name}: {' '.join(avail[name])}")
+                print(f"  {arch} / {preset}: {count} entries")
 
     return _driver.dispatch(source=source, arch_list=args.arch,
                              conn_params=conn_params, args=args,
@@ -359,7 +366,7 @@ def add_common_arguments(parser):
     parser.add_argument('-y', '--yes', action='store_true',
                         help='Skip confirmation prompt and proceed with dispatch')
 
-def build_module_parser(module_name, module_instance):
+def build_module_parser(module_name, module_instance, workdir):
     """Phase 2 (D09): the module's own parser, for everything after `--`.
 
     A standalone `ArgumentParser`, not a subparser -- Phase 1 no longer
@@ -391,14 +398,24 @@ def build_module_parser(module_name, module_instance):
     if not hasattr(module_instance, 'get_entry_choices'):
         # PerfDescription (D10): its own dispatch flags, not shared with
         # tuning's per-field cross product below.
+        # Choices are PROBED from this workdir's workers.db, which the
+        # two-phase parse makes possible: --workdir is a phase-1 argument,
+        # so it is already known by the time this phase-2 parser is built.
+        #
+        # Probing is for discoverability -- `-h` lists what this fleet is
+        # configured to measure, and a typo is caught at parse time instead
+        # of producing an empty run. It is NOT a servability check: every
+        # worker is expected to serve every preset (dispatch-perfmon.md
+        # §3.3), so there is nothing to validate against a fleet.
+        from .perfmon.presets import available_presets
+        _configured = available_presets(workdir)
         module_parser.add_argument(
             '--preset', type=str, nargs='+', default=None,
+            choices=_configured + ['all'],
             help="Preset(s) ('rocm<ver>+aotriton<tag>') to dispatch, "
-                 "repeatable. NARROWS the configured set for a partial "
-                 "run -- selects, does not validate that a preset is real "
-                 "or servable (dispatch-perfmon.md §3.4). Default: every "
-                 "preset this fleet is configured to measure "
-                 "(perfmon.presets.available_presets).")
+                 "repeatable, or 'all'. Narrows the configured set for a "
+                 "partial run. Default: 'all'. Configured here: "
+                 + (', '.join(_configured) if _configured else '(none)'))
         module_parser.add_argument(
             '--entry_set', choices=['prime', 'coverage'], default='prime',
             help="Which curated entry set to dispatch (default: %(default)s).")
@@ -408,28 +425,33 @@ def build_module_parser(module_name, module_instance):
                  "(default: no CLI override -- only each arch's own "
                  "measured ceiling, if any, applies).")
 
-        # Per-field filters over the curated set, for narrowing a debug run
-        # below what --entry_set can express.
+        # One flag per AXIS. These are the ground truth for what gets
+        # dispatched; --entry_set above is a shortcut that SUPPLIES their
+        # values, and naming one here replaces what the set supplied.
         #
-        # Same spelling as tuning's per-field flags, DIFFERENT semantics,
-        # and the difference is worth knowing: tuning's intersect per-field
-        # choice lists and then take a cross product, so they can name a
-        # combination nobody wrote down. These only SUBSET the curated set
-        # -- perfmon's entries are hand-chosen (rev0 §6), and a filter that
-        # matches nothing reports what the set does contain rather than
-        # fabricating an entry.
+        # Same spelling as tuning's per-field flags and now the same
+        # meaning: both define the entry space rather than filter a fixed
+        # one. What differs is only where the defaults come from -- tuning's
+        # from get_entry_choices(), perfmon's from --entry_set.
         #
         # No `choices=`: the legal values depend on --entry_set and
-        # --max_seqlen, which this same parser is still parsing, so they
-        # cannot be known here. Values are matched as normalised text, which
-        # is also what lets `--causal 1` match `causal=True` and
-        # `--hdim 64,128` match a `(64, 128)` tuple.
-        for field in fields(module_instance.ENTRY_CLASS):
+        # --max_seqlen, which this same parser is still parsing.
+        #
+        # seqlen_q/seqlen_k are ONE flag, --seqlen_qk, taking `<sq>,<sk>`
+        # pairs (a bare N means the diagonal). Neither set crosses q with k
+        # -- prime walks the diagonal, coverage the L-shape -- so two
+        # independent flags could not express either without also
+        # generating pairs the sets deliberately exclude.
+        for axis in ('dtype', 'hdim', 'causal', 'dropout_p', 'bias_type'):
             module_parser.add_argument(
-                f'--{field.name}', nargs='+', default=None, metavar='V',
-                help=f"Keep only entries whose {field.name} is one of these "
-                     f"(default: no filter). Subsets the curated set; never "
-                     f"extends it.")
+                f'--{axis}', nargs='+', default=None, metavar='V',
+                help=f"{axis} values to dispatch, replacing whatever "
+                     f"--entry_set supplies (default: the set's).")
+        module_parser.add_argument(
+            '--seqlen_qk', nargs='+', default=None, metavar='SQ,SK',
+            help="(seqlen_q, seqlen_k) pairs, e.g. --seqlen_qk 1024,4096 "
+                 "128,64. A bare N means the diagonal (N, N). Replaces "
+                 "whatever --entry_set supplies.")
         return module_parser
 
     all_choices = get_parameter_choices(module_instance)
@@ -582,7 +604,7 @@ def parse_cli(argv: list[str]):
 
     family, module_instance = resolve_module(base, args)
 
-    module_parser = build_module_parser(family, module_instance)
+    module_parser = build_module_parser(family, module_instance, args.workdir)
     mod_args = module_parser.parse_args(tail)
     for key, value in vars(mod_args).items():
         setattr(args, key, value)

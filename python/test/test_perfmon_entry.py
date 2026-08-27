@@ -28,15 +28,19 @@ def _perfdesc():
 def test_prime_set_size_at_max_seqlen_16384():
     pd = _perfdesc()
     entries = list(pd.prime_entries('gfx950', 16384))
-    # 6 hdims x 2 causal x 4 seqlens x 2 dtypes
-    assert len(entries) == 6 * 2 * 4 * 2 == 96
+    # 6 hdims x 2 causal x 11 seqlens x 2 dtypes.
+    # 11 = tuning's own seqlen ladder (10 values, modules/flash/tune/desc.py's
+    # get_entry_choices) plus 16384: perfmon exists to monitor the tuning
+    # table's entries, so its candidates are the shapes that table holds.
+    assert len(entries) == 6 * 2 * 11 * 2 == 264
 
 
 def test_prime_set_size_at_max_seqlen_4096():
     pd = _perfdesc()
     entries = list(pd.prime_entries('gfx950', 4096))
-    # 6 hdims x 2 causal x 3 seqlens (128/1024/4096; 16384 excluded) x 2 dtypes
-    assert len(entries) == 6 * 2 * 3 * 2 == 72
+    # 6 hdims x 2 causal x 9 seqlens (16..4096; 8192 and 16384 excluded)
+    # x 2 dtypes
+    assert len(entries) == 6 * 2 * 9 * 2 == 216
 
 
 def test_prime_set_excludes_seqlens_above_max_seqlen():

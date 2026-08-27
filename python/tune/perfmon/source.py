@@ -47,6 +47,45 @@ def norm_value(value) -> str:
     return str(value)
 
 
+def parse_axis_value(name: str, text: str, supplied: list):
+    """Coerce one command-line string to the axis's own value type.
+
+    The type comes from the value the entry set supplied for that axis, not
+    from a per-flag declaration, so a new ENTRY_CLASS field inherits parsing
+    from whatever its set already holds.
+
+    `seqlen_qk` is the one axis whose values are pairs, spelled `<sq>,<sk>`.
+    A bare `N` means the diagonal `(N, N)` -- what the prime set means by a
+    seqlen, and what an operator narrowing a prime run will type.
+    """
+    if name == 'seqlen_qk':
+        parts = text.split(',')
+        if len(parts) not in (1, 2):
+            raise ValueError("--seqlen_qk takes <sq>,<sk> (or a bare N for "
+                             f"the diagonal), got {text!r}")
+        try:
+            nums = [int(part) for part in parts]
+        except ValueError:
+            raise ValueError("--seqlen_qk takes integer seqlens, got "
+                             f"{text!r}") from None
+        return (nums[0], nums[-1])
+    proto = supplied[0] if supplied else text
+    if isinstance(proto, bool):
+        if text in ('0', 'false', 'False'):
+            return False
+        if text in ('1', 'true', 'True'):
+            return True
+        raise ValueError(f"--{name} takes 0/1, got {text!r}")
+    for kind, cast in ((int, int), (float, float)):
+        if isinstance(proto, kind):
+            try:
+                return cast(text)
+            except ValueError:
+                raise ValueError(
+                    f"--{name} takes {kind.__name__} values, got {text!r}") from None
+    return text
+
+
 def norm_text(text: str) -> str:
     """`norm_value` for a string off the command line, so `0.0` and `0`
     agree with each other and with the entry."""
@@ -86,65 +125,40 @@ class PerfEntrySource:
         # hw_feature` already treats `None` as "no limit from this source".
         module_instance.max_seqlen = args.max_seqlen
 
-        # Per-field debugging filters -- `--dtype`, `--hdim`, ... one per
-        # ENTRY_CLASS field. Absent (None) means "no constraint".
+        # --- axes: the ground truth for what gets dispatched ---------
         #
-        # These SUBSET the curated set; they never extend it. That is the
-        # whole difference from tuning's identically-spelled flags, which
-        # intersect per-field CHOICE LISTS and then take a cross product
-        # (dispatch-perfmon.md §5.2). Asking here for a dtype the prime set
-        # does not contain yields nothing, and says so, rather than
-        # inventing an entry nobody curated.
-        self.filters = {
-            f.name: [norm_text(v) for v in getattr(args, f.name)]
-            for f in fields(self.ENTRY_CLASS)
-            if getattr(args, f.name, None) is not None
-        }
-
-    def keeps(self, entry) -> bool:
-        """True if `entry` satisfies every active per-field filter."""
-        for name, wanted in self.filters.items():
-            if norm_value(getattr(entry, name)) not in wanted:
-                return False
-        return True
-
-    def generated(self, arch):
-        """The curated set BEFORE per-field filtering -- what `--dtype` and
-        friends select from.
-
-        `prime_entries`/`coverage_entries` require a concrete int bound
-        (entries above it are excluded at generation time, never shrunk --
-        `pdesc.py`'s docstrings). When `--max_seqlen` was not given,
-        generate everything and let `validate_hw_feature`'s own ceiling
-        (which DOES understand `None` as "unbounded") filter instead;
-        `sys.maxsize` here is just "no generation-time bound", not a real
-        seqlen anyone will request."""
-        max_seqlen = self.args.max_seqlen if self.args.max_seqlen is not None else sys.maxsize
-        if self.args.entry_set == 'coverage':
-            yield from self.module_instance.coverage_entries(arch, max_seqlen)
-        else:
-            yield from self.module_instance.prime_entries(arch, max_seqlen)
-
-    def available_values(self, arch) -> dict[str, list[str]]:
-        """Distinct value of each field present in the UNFILTERED set, for
-        the "your filter matched nothing, here is what exists" message."""
-        seen: dict[str, list[str]] = {f.name: [] for f in fields(self.ENTRY_CLASS)}
-        for entry in self.generated(arch):
-            for name in seen:
-                v = norm_value(getattr(entry, name))
-                if v not in seen[name]:
-                    seen[name].append(v)
-        return seen
+        # `--entry_set` SUPPLIES VALUES to the axes; any axis named on the
+        # command line replaces what it supplied. A set is a named bundle of
+        # defaults, not a fixed list of entries, so a combination outside
+        # every set is still reachable for a one-off debug run:
+        #
+        #   --entry_set prime                   the whole prime set
+        #   --entry_set prime --dtype bfloat16  prime, one dtype
+        #   --seqlen_qk 1024,4096 --hdim 128    in no set; exactly this
+        #
+        # This is the inverse of the first implementation, where the curated
+        # generators were authoritative and flags could only subset their
+        # output -- which left a combination outside the sets unreachable.
+        #
+        # `seqlen_qk` is ONE axis of (q, k) pairs; see PerfDescription.
+        # entry_set_axes' docstring for why it is not two.
+        self.axes = module_instance.entry_set_axes(
+            args.entry_set, arch=None,
+            max_seqlen=args.max_seqlen if args.max_seqlen is not None else sys.maxsize)
+        self.overridden = []
+        for name, supplied in list(self.axes.items()):
+            given = getattr(args, name, None)
+            if given is None:
+                continue
+            self.axes[name] = [parse_axis_value(name, v, supplied) for v in given]
+            self.overridden.append(name)
 
     def batches(self):
         yield from self.presets
 
     def entries(self, batch, arch):
-        """The curated set for `arch`, minus anything an active per-field
-        filter excludes."""
-        for entry in self.generated(arch):
-            if self.keeps(entry):
-                yield entry
+        """The cross product of the resolved axes (see __init__)."""
+        yield from self.module_instance.entries_from_axes(self.axes)
 
     def validate_hw_feature(self, arch, entry):
         return self.module_instance.validate_hw_feature(arch, entry)

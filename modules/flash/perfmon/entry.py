@@ -65,7 +65,22 @@ FlashInputMetadata = _flash_entry_module.FlashInputMetadata
 
 PRIME_HDIMS = (64, 128, 192, 256, 384, 512)
 PRIME_CAUSAL = (False, True)
-PRIME_SEQLENS = (128, 1024, 4096, 16384)
+
+# Tuning's own seqlen ladder (modules/flash/tune/desc.py's
+# get_entry_choices()), plus 16384.
+#
+# Perfmon exists to monitor the performance of TUNING TABLE ENTRIES, so its
+# candidates have to be the shapes the tuning table actually holds -- a
+# seqlen nobody tuned has no table entry whose performance could be tracked.
+# An earlier, invented ladder (128, 1024, 4096, 16384) sampled four points
+# that mostly are tuned but skipped everything below 128 and every step
+# between, so most of the table went unmonitored.
+#
+# 16384 is the deliberate exception: it is past the top of tuning's range,
+# kept because rev0 §6.1 wants a point beyond what is tuned, and it is the
+# one candidate `max_seqlen` most often excludes on a small-VRAM part.
+TUNING_SEQLENS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+PRIME_SEQLENS = TUNING_SEQLENS + (16384,)
 PRIME_DTYPES = ('bfloat16', 'float16')
 
 
@@ -76,27 +91,10 @@ def seqlens_for(max_seqlen: int) -> list[int]:
 
 
 def prime_entries(max_seqlen: int):
-    """rev0 §6.1: hdim × causal × {sq==sk seqlens <= max_seqlen} × dtype,
-    every other field at its feature-off default. Independent of `iface` --
-    the caller crosses this generator's output with `list_ifaces()`.
-
-    Yields `FlashEntry` (the QUEUED shape, D03): `N_HEADS`/`BATCH`/
-    `storage_flip` are not dispatch-time choices -- the GPU worker resolves
-    them (D05's `resolve_entry()`), against its own VRAM."""
-    seqlens = seqlens_for(max_seqlen)
-    for hdim in PRIME_HDIMS:
-        for causal in PRIME_CAUSAL:
-            for seqlen in seqlens:
-                for dtype in PRIME_DTYPES:
-                    yield FlashEntry(
-                        dtype=dtype,
-                        hdim=hdim,
-                        seqlen_q=seqlen,
-                        seqlen_k=seqlen,
-                        causal=causal,
-                        dropout_p=0.0,
-                        bias_type=0,
-                    )
+    """rev0 §6.1, as the cross product of `prime_axes()`. Kept as a named
+    generator because tests and any caller that wants the set without going
+    through the CLI still ask for it by name."""
+    yield from entries_from_axes(prime_axes(max_seqlen))
 
 
 # --- rev0 §6.2 coverage set ---------------------------------------------------
@@ -125,25 +123,72 @@ def l_shape_seqlen_pairs(seqlens: list[int]) -> list[tuple[int, int]]:
 
 
 def coverage_entries(max_seqlen: int):
-    """rev0 §6.2: full functional cross-product over the axes that actually
-    exist on `FlashEntry` today (dtype × dropout_p × bias_type -- see the
-    module docstring's "KNOWN GAPS" for GQA/storage_flip/SWA/varlen, none of
-    which are queued-entry fields), crossed with the L-shaped seqlen pair
-    set.
+    """rev0 §6.2, as the cross product of `coverage_axes()`."""
+    yield from entries_from_axes(coverage_axes(max_seqlen))
 
-    Yields `FlashEntry` (the QUEUED shape, D03) -- see `prime_entries()`."""
-    seqlens = seqlens_for(max_seqlen)
-    pairs = l_shape_seqlen_pairs(seqlens)
-    for seqlen_q, seqlen_k in pairs:
-        for dtype in COVERAGE_DTYPES:
-            for dropout_p in COVERAGE_DROPOUT_P:
-                for bias_type in COVERAGE_BIAS_TYPE:
-                    yield FlashEntry(
-                        dtype=dtype,
-                        hdim=COVERAGE_HDIM,
-                        seqlen_q=seqlen_q,
-                        seqlen_k=seqlen_k,
-                        causal=COVERAGE_CAUSAL,
-                        dropout_p=dropout_p,
-                        bias_type=bias_type,
-                    )
+
+# --- entry-set axes: the ground truth is the AXES, not the generators -------
+#
+# `--dtype`, `--hdim`, `--seqlen_qk`, ... are what define the entry space.
+# `--entry_set` is a shortcut that SUPPLIES VALUES to them, and any axis the
+# operator names explicitly replaces what the set supplied. That is the
+# inverse of the first implementation, where the curated generators were
+# authoritative and the flags could only subset their output -- which made a
+# combination outside the set unreachable even for a one-off debug run.
+#
+# `seqlen_qk` is ONE axis of (seqlen_q, seqlen_k) pairs, not two independent
+# axes, because neither set crosses them: prime walks the diagonal and
+# coverage walks the L-shape (`3n-2` pairs, not `n^2`). Two independent axes
+# could not express either without also generating pairs the sets
+# deliberately exclude.
+
+def prime_axes(max_seqlen: int) -> dict:
+    """rev0 §6.1's axis values. Every field of FlashEntry appears, so the
+    cross product of this dict IS the prime set."""
+    return {
+        'dtype': list(PRIME_DTYPES),
+        'hdim': list(PRIME_HDIMS),
+        'seqlen_qk': [(s, s) for s in seqlens_for(max_seqlen)],
+        'causal': list(PRIME_CAUSAL),
+        'dropout_p': [0.0],
+        'bias_type': [0],
+    }
+
+
+def coverage_axes(max_seqlen: int) -> dict:
+    """rev0 §6.2's axis values -- the functional cross product over the axes
+    FlashEntry actually has, crossed with the L-shaped seqlen pairs."""
+    return {
+        'dtype': list(COVERAGE_DTYPES),
+        'hdim': [COVERAGE_HDIM],
+        'seqlen_qk': l_shape_seqlen_pairs(seqlens_for(max_seqlen)),
+        'causal': [COVERAGE_CAUSAL],
+        'dropout_p': list(COVERAGE_DROPOUT_P),
+        'bias_type': list(COVERAGE_BIAS_TYPE),
+    }
+
+
+ENTRY_SETS = {'prime': prime_axes, 'coverage': coverage_axes}
+
+
+def entries_from_axes(axes: dict):
+    """Cross product of `axes` -> FlashEntry, one per combination.
+
+    Field order is fixed here rather than taken from the dict so the
+    emitted order is stable across runs and across Python versions --
+    dispatch inserts in this order, and rev0 §5.7 makes insert order
+    load-bearing for perfmon.
+    """
+    import itertools
+    for dtype, hdim, (sq, sk), causal, dropout_p, bias_type in itertools.product(
+            axes['dtype'], axes['hdim'], axes['seqlen_qk'],
+            axes['causal'], axes['dropout_p'], axes['bias_type']):
+        yield FlashEntry(
+            dtype=dtype,
+            hdim=hdim,
+            seqlen_q=sq,
+            seqlen_k=sk,
+            causal=causal,
+            dropout_p=dropout_p,
+            bias_type=bias_type,
+        )
