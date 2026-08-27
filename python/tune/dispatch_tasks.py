@@ -300,11 +300,24 @@ def dispatch_perf_tasks(workdir: Path, module_name: str, module_instance, args):
               "that is NOT known at dispatch time -- it depends on the GPU "
               "and even differs per AOTriton version (dispatch-perfmon.md "
               "§6).")
+        active = ', '.join(f'--{k} {" ".join(v)}' for k, v in source.filters.items())
+        if active:
+            print(f"Entry filters: {active}")
         for preset in source.batches():
             for arch in args.arch:
                 count = sum(1 for entry in source.entries(preset, arch)
                             if source.validate_hw_feature(arch, entry)[0])
-                print(f"  {arch} / {preset}: {count} entries")
+                total = sum(1 for _ in source.generated(arch))
+                suffix = f"  (of {total} in the {args.entry_set} set)" if source.filters else ""
+                print(f"  {arch} / {preset}: {count} entries{suffix}")
+                # A filter that selects nothing is a typo far more often
+                # than a real empty intersection, so show what IS there
+                # rather than leaving the operator to guess.
+                if count == 0 and source.filters:
+                    avail = source.available_values(arch)
+                    print(f"    no entry matched. {args.entry_set} set for {arch} contains:")
+                    for name in source.filters:
+                        print(f"      --{name}: {' '.join(avail[name])}")
 
     return _driver.dispatch(source=source, arch_list=args.arch,
                              conn_params=conn_params, args=args,
@@ -394,6 +407,29 @@ def build_module_parser(module_name, module_instance):
             help="Override the seqlen ceiling validate_hw_feature enforces "
                  "(default: no CLI override -- only each arch's own "
                  "measured ceiling, if any, applies).")
+
+        # Per-field filters over the curated set, for narrowing a debug run
+        # below what --entry_set can express.
+        #
+        # Same spelling as tuning's per-field flags, DIFFERENT semantics,
+        # and the difference is worth knowing: tuning's intersect per-field
+        # choice lists and then take a cross product, so they can name a
+        # combination nobody wrote down. These only SUBSET the curated set
+        # -- perfmon's entries are hand-chosen (rev0 §6), and a filter that
+        # matches nothing reports what the set does contain rather than
+        # fabricating an entry.
+        #
+        # No `choices=`: the legal values depend on --entry_set and
+        # --max_seqlen, which this same parser is still parsing, so they
+        # cannot be known here. Values are matched as normalised text, which
+        # is also what lets `--causal 1` match `causal=True` and
+        # `--hdim 64,128` match a `(64, 128)` tuple.
+        for field in fields(module_instance.ENTRY_CLASS):
+            module_parser.add_argument(
+                f'--{field.name}', nargs='+', default=None, metavar='V',
+                help=f"Keep only entries whose {field.name} is one of these "
+                     f"(default: no filter). Subsets the curated set; never "
+                     f"extends it.")
         return module_parser
 
     all_choices = get_parameter_choices(module_instance)
