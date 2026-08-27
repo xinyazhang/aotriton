@@ -694,3 +694,22 @@ unusable through the public API. `JitFunction.__call__` early-returns correctly;
 No lld output, no mention of the path. A pre-flight check for
 `<toolkit>/llvm/bin/ld.lld` with a real message would have saved the entire
 investigation recorded in `python/flyc_bootstrap.py`'s `resolve_rocm_path`.
+
+### 4. `fmha_tuning_gfx950.py:110-127`'s "96 is deliberately absent" comment is stale
+
+The prose immediately above `LADDER = (32, 64, 96, ..., 512)` says 96 "computes
+the wrong answer" and that head_dim 65-128 rounds to the 128 tile -- both false
+today. `dfac5de5` ("family S -- granule-32 staging") wrote that comment when it
+was true; the same day, `98493cc7` ("fix the head_dim 96 wait-state hazard, 579
+-> 932 TF") fixed the bug, added 96 to `LADDER`, and left the prose behind.
+`98493cc7` is an ancestor of `7cd69444` (vendored here), so the tuple is
+authoritative and the comment is the leftover -- confirmed by asking upstream
+via the coordinator before trusting either side. `98493cc7`'s own message
+records the fix (`s_nop 1` after the QK burst in `ParityGemmHelper.qk`) as
+correct-but-incompletely-explained: the exact wait-state hazard was never
+pinned down, only that `amdgpu-snop-padding=1` makes 96 correct and that
+stripping the nops from both builds yields identical instructions/registers, so
+timing rather than arithmetic/addressing/allocation was the defect.
+`modules/flash/aot/flyc_attn_fwd.py`'s `FLYC_HEAD_DIMS` (gfx950 branch) mirrors
+`LADDER` verbatim, 96 included, on this basis. Retire this note once upstream
+cleans up the comment (flagged upstream as cheap to fix).
