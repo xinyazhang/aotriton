@@ -217,10 +217,17 @@ const std::vector<{infotype}>& {meta_class}::get_{tp.repr_name}_choices()
                     f'match the independently recomputed not-disabled set '
                     f'({expected}) -- functionals passed to write_shim_source '
                     f'diverged from is_functional_disabled')
-                assert surviving, (
-                    f'flyc kernel {kdesc.NAME!r}: no surviving {tp.repr_name!r} '
-                    f'value on {target_arch!r} -- every functional is disabled '
-                    f'(this kernel cannot round anything to a compiled rung there)')
+                # No non-emptiness check here on purpose: these flyc kernels'
+                # own `@ati.disable` predicates reject every arch but their
+                # one home arch unconditionally (e.g. `f.arch != 'gfx1201':
+                # return True`), so in any REAL multi-arch build `surviving`
+                # is legitimately empty for every other arch_number -- that
+                # is not a bug, it is autotune_table's null row restated for
+                # this table. It is still safe at runtime: a helper reading
+                # an empty row can only feed a wrong digit into
+                # godel_number(), and godel_number() on that arch already
+                # maps every digit to a null tune_func (same predicate), so
+                # there is no godel number a wrong rounding could alias into.
                 row_name = f'{context_class_name}_compiled_{lname}_{arch_number}'
                 row_names.append(row_name)
                 literal = ', '.join(str(v) for v in surviving)

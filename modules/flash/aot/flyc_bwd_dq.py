@@ -86,6 +86,18 @@ def _flyc_bwd_dq_disabled(f):
 @ati.scalar('hdim_qk',    'i32',  wires_to='hdim_qk')
 @ati.scalar('hdim_vo',    'i32',  wires_to='hdim_vo')
 @ati.scalar('sm_scale',   'fp32', wires_to='sm_scale')
+#
+# --- item I: functional-axis markers, NOT kernel arguments --------------------
+#
+# See flyc_attn_fwd.py for the full rationale (same mechanism, same reason:
+# this backend's compiled ladder, FLYC_BWD_DQ_HEAD_DIMS, is a strict subset of
+# the operator's BLOCK_DMODEL axis). Kept out of the ordered kernarg block
+# above -- BLOCK_DMODEL/PADDED_HEAD are not part of `bwd_dq_kernel`'s signature
+# at all, they are build-time Python values the operator owns.
+@ati.scalar('BLOCK_DMODEL', options=sorted(FLYC_BWD_DQ_HEAD_DIMS),
+            wires_to=ati.context_helper('flyc_block_dmodel'))
+@ati.scalar('PADDED_HEAD', options=[False, True],
+            wires_to=ati.context_helper('flyc_padded_head'))
 @ati.flyc.hints(FlycBwdHints)
 @ati.flyc.kernel()
 def flyc_bwd_dq(arch, choices, hints):
