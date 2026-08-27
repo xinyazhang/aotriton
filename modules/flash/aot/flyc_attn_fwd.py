@@ -101,6 +101,27 @@ class FlycFwdHints:
 # drift here fails loudly at build rather than silently emitting the wrong kernel.
 FLYC_HEAD_DIMS = frozenset({16, 32, 48, 64, 80, 96, 128, 160, 192, 224, 256, 384, 512})
 
+# gfx950's ladder, from fmha_tuning_gfx950.LADDER -- a literal for the same reason
+# as FLYC_HEAD_DIMS above. Narrower than gfx1201's: no 16/48/80 (PV_MFMA_N is 32,
+# so only multiples of 32 are compiled -- see the exec plan's item I (g)). 96 IS
+# included, matching upstream's LADDER verbatim: a comment right above that tuple
+# in fmha_tuning_gfx950.py claims 96 "computes the wrong answer", but that is
+# stale prose left behind when the bug it described was fixed the same day
+# (upstream `98493cc7`, an ancestor of the vendored `7cd69444`) -- see
+# modules/flash/flyc/UPSTREAM.md #4 for the full history. Do not re-derive this
+# by excluding 96 "to be safe": that would silently give up a rung upstream
+# measured at 932 TF against 579 for the 128-tile fallback, on the strength of a
+# comment its own repository had already superseded.
+FLYC_GFX950_HEAD_DIMS = frozenset({32, 64, 96, 128, 160, 192, 224, 256, 384, 512})
+
+# Per-arch ladder lookup, keyed the same way the disable predicate and the
+# builder branch below are. Also what `_flyc_fwd_disabled` uses to decide which
+# arches this backend serves at all -- `f.arch in _FLYC_FWD_LADDERS`.
+_FLYC_FWD_LADDERS = {
+    'gfx1201': FLYC_HEAD_DIMS,
+    'gfx950': FLYC_GFX950_HEAD_DIMS,
+}
+
 
 def _flyc_fwd_disabled(f):
     """Everything this backend cannot serve, in one predicate.
@@ -109,18 +130,23 @@ def _flyc_fwd_disabled(f):
     more exclusion among several, and splitting it across two mechanisms means two
     places to look when a functional unexpectedly has no flyc kernel. (`aiter_fwd.py`
     uses @ati.affine.arch; that predates `f.arch` being available to predicates.)
+
+    Two arches now (Phase C): `_FLYC_FWD_LADDERS` maps each served arch to its own
+    compiled ladder, and everything else about the predicate -- the WMMA dtype
+    restriction, the cited flash_disabled() call -- is arch-independent.
     """
-    if f.arch != 'gfx1201':
+    if f.arch not in _FLYC_FWD_LADDERS:
         return True
     if flash_disabled(f):
         return True
     # f16/bf16 WMMA only.
     if '*fp32' in check_value(f, ['Q']):
         return True
-    # Off-ladder head dims are rejected outright by `resolve_knobs`, not rounded:
-    # rounding is the *interface*'s job, because it also has to arrange the runtime
-    # extent and the padded-head contract that make the rounding safe.
-    if check_value(f, ['BLOCK_DMODEL']) not in FLYC_HEAD_DIMS:
+    # Off-ladder head dims are rejected outright by `resolve_knobs`/`resolve()`,
+    # not rounded: rounding is the *interface*'s job, because it also has to
+    # arrange the runtime extent and the padded-head contract that make the
+    # rounding safe.
+    if check_value(f, ['BLOCK_DMODEL']) not in _FLYC_FWD_LADDERS[f.arch]:
         return True
     return False
 
@@ -128,10 +154,13 @@ def _flyc_fwd_disabled(f):
 @ati.start
 # Overriding drops nothing: the cited disable is the WEAKER of the two, despite
 # the kwarg's name. It is flash_disabled(f, gfx950_bad_hdims={16}); this
-# predicate calls flash_disabled(f) and rejects every arch but gfx1201, which
-# leaves the cited predicate's other two branches (gfx11+hdim>256, gfx950+hdim
-# ==16) unreachable. Measured: of 576 gfx1201 functionals it disables 144, and
-# all 144 are disabled here too. Widening the gfx1201 gate above expires this.
+# predicate calls flash_disabled(f) unconditionally and only narrows further
+# (arch membership, the WMMA dtype restriction, the per-arch ladder), so every
+# functional the cited predicate disables is disabled here too -- gfx950 head_dim
+# 16 in particular is excluded via _FLYC_FWD_LADDERS['gfx950'] (see the ladder's
+# own comment), which is a strict superset of the cited predicate's {16} on that
+# axis alone. Measured on gfx1201 pre-Phase-C: of 576 functionals it disables
+# 144, and all 144 were disabled here too.
 @ati.disable(when=_flyc_fwd_disabled,
              I_understand_this_overrides_cited_disable=True)
 # `cite` fills the GAPS: any argument below that this description does not fully
@@ -188,6 +217,33 @@ def _flyc_fwd_disabled(f):
 @ati.tensor('seqinfo_q1', '*i32:16', rank=1, wires_to='seq_strides_q')
 @ati.tensor('seqinfo_k0', '*i32:16', rank=1, wires_to='cu_seqlens_k')
 @ati.tensor('seqinfo_k1', '*i32:16', rank=1, wires_to='seq_strides_k')
+#
+# --- item C: gfx950-only folded constexpr real arguments ----------------------
+#
+# `Workspace`, `BlockTable` and `block_table_stride` are real, named parameters
+# of `flash_attn_func_gfx950_kernel` -- unlike BLOCK_DMODEL/PADDED_HEAD below,
+# they DO appear in that kernel's AST-parsed `real_param_order` (item D), at
+# their own real positions (Workspace/BlockTable sit right after LSE;
+# block_table_stride is the very last parameter, after every stride). They do
+# NOT exist at all in gfx1201's `flash_attn_func_aiw_kernel` signature, so on
+# gfx1201 `real_param_order` never contains these three names and this
+# declaration is simply never consulted -- one line serves both arches.
+#
+# `options=[0]` is what makes them constexpr (item C): our builds pin
+# `paged=False, num_kv_splits=1` everywhere on gfx950 (asserted below), which is
+# the configuration under which FlyDSL's own `_WS_ANN`/`_BT_ANN`/`_BTS_ANN`
+# annotations collapse these three to Constexpr in the compiled ABI --
+# `kdesc.pp_arg_doc` reads this declaration to fold their pp_args entries
+# rather than re-deriving that fact from FlyDSL's own annotations (see that
+# method's docstring for why the two are deliberately independent).
+#
+# One combined declaration, not three, and its position in this decorator
+# stack does not matter: `iter_launch_arguments` walks the REAL kernel's
+# parameter order (arch-specific) and looks each name up in `self.scalars` by
+# name, not by where in this file the name was declared -- so the two
+# non-adjacent real positions (7-8 and the very last) are found correctly
+# regardless.
+@ati.scalar(['Workspace', 'BlockTable', 'block_table_stride'], options=[0])
 #
 # --- the two arguments that are not a rename ---------------------------------
 #
@@ -320,7 +376,13 @@ def _flyc_fwd_disabled(f):
 # comes from the OPERATOR's axis via `axis_of_arg`, not from this marker), but
 # stating this kernel's own ladder here is free documentation, not a second
 # source of truth: `_flyc_fwd_disabled` above is what actually enforces it.
-@ati.scalar('BLOCK_DMODEL', options=sorted(FLYC_HEAD_DIMS),
+# One shared marker declaration for both arches (like the Workspace/BlockTable
+# declaration above, this decorator stack does not vary by arch), so its
+# `options=` is the UNION of both ladders rather than either one alone --
+# neither ladder is a subset of the other (gfx1201 also has 16/48/80; gfx950's
+# is otherwise identical), so a single arch's ladder would under-document the
+# other's compiled rungs.
+@ati.scalar('BLOCK_DMODEL', options=sorted(FLYC_HEAD_DIMS | FLYC_GFX950_HEAD_DIMS),
             wires_to=ati.context_helper('flyc_block_dmodel'))
 @ati.scalar('PADDED_HEAD', options=[False, True],
             wires_to=ati.context_helper('flyc_padded_head'))
@@ -375,60 +437,140 @@ def flyc_attn_fwd(arch, choices, hints):
     at its default. The parameter exists so that stops being an API change — and the
     packaging is already N-capable, so neither is the artifact layout.
 
-    `resolve_knobs`, NOT `plan`: `plan()` is the JIT entry point, which takes a
-    *real* head_dim and rounds it up the ladder, deriving `padded_head` on the way.
-    AOT already knows the tile — it IS `BLOCK_DMODEL` — and `PADDED_HEAD` is its own
-    functional axis, so `plan()` would silently re-derive an axis the operator has
-    already fixed. The builder's own keyword front end draws the same distinction.
+    `resolve_knobs`/`fmha_knobs(...).resolve`, NOT `plan`: `plan()` is the JIT
+    entry point, which takes a *real* head_dim and rounds it up the ladder,
+    deriving `padded_head` on the way. AOT already knows the tile — it IS
+    `BLOCK_DMODEL` — and `PADDED_HEAD` is its own functional axis, so `plan()`
+    would silently re-derive an axis the operator has already fixed. The
+    builder's own keyword front end draws the same distinction on both arches.
+
+    Item J invariant (exec plan §4.3): `meta` here is a pure function of
+    `choices` alone on both arches — every field either comes straight off a
+    `choices.NAME` read or is a fixed pin (`num_heads=1`). That must stay true:
+    `knobs.build_traits(meta)` is re-run from `meta` at build time, in a
+    different process (`aotriton.flyc_compile`) than the one that computed
+    `asdict(knobs)` for the psel here, and nothing downstream would notice the
+    two falling out of step — the psel is what the C++ side reads for the grid.
     """
-    # ONLY the flydsl-free tuning module at call time. The FlyDSL-bearing import
-    # lives inside `build()` below, so the code generator -- which calls this
-    # function but never the callable -- never imports flydsl.
-    from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
+    if arch == 'gfx1201':
+        # ONLY the flydsl-free tuning module at call time. The FlyDSL-bearing
+        # import lives inside `build()` below, so the code generator -- which
+        # calls this function but never the callable -- never imports flydsl.
+        from fmha_tuning_gfx1201 import FmhaInputMetadata, FmhaKnobs, resolve_knobs
 
-    tile = choices.BLOCK_DMODEL
-    meta = FmhaInputMetadata(
-        # `num_heads` reaches the emitted kernel ONLY through STRIDE_TOKEN, which is
-        # read exclusively under STRIDES_CONSTEXPR — a dense-only diagnostic arm the
-        # AOT path never selects (see the knob below). Pinning it to 1 keeps it out
-        # of the functional space. Asserted, not assumed: this is a property of
-        # today's kernel, not a contract it owes us.
-        num_heads=1,
-        head_dim=tile,
-        # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
-        # 2 bottom-right / 3 window), and the kernel only ever emits {0, 3} — the
-        # same pair the operator's CAUSAL_TYPE axis offers. 1:1, no mapping.
-        causal=choices.CAUSAL_TYPE != 0,
-        causal_type=choices.CAUSAL_TYPE,
-        dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
-        bias=bool(choices.BIAS_TYPE),
-        dropout=bool(choices.ENABLE_DROPOUT),
-    )
-    # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with choices.BLOCK_DMODEL
-    knobs = resolve_knobs(meta, FmhaKnobs(
-        block_dmodel=tile,
-        padded_head=choices.PADDED_HEAD,
-        # AOT cannot bake strides: one binary must serve every layout. This is also
-        # what makes `num_heads` above irrelevant to the emitted code.
-        strides_constexpr=False,
-    ))
-    assert not knobs.strides_constexpr, \
-        'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
+        tile = choices.BLOCK_DMODEL
+        meta = FmhaInputMetadata(
+            # `num_heads` reaches the emitted kernel ONLY through STRIDE_TOKEN,
+            # which is read exclusively under STRIDES_CONSTEXPR — a dense-only
+            # diagnostic arm the AOT path never selects (see the knob below).
+            # Pinning it to 1 keeps it out of the functional space. Asserted,
+            # not assumed: this is a property of today's kernel, not a
+            # contract it owes us.
+            num_heads=1,
+            head_dim=tile,
+            # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
+            # 2 bottom-right / 3 window), and the kernel only ever emits {0, 3} — the
+            # same pair the operator's CAUSAL_TYPE axis offers. 1:1, no mapping.
+            causal=choices.CAUSAL_TYPE != 0,
+            causal_type=choices.CAUSAL_TYPE,
+            dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
+            bias=bool(choices.BIAS_TYPE),
+            dropout=bool(choices.ENABLE_DROPOUT),
+        )
+        # Supply FmhaKnobs to resolve_knobs to make sure knobs.block_dmodel align with choices.BLOCK_DMODEL
+        knobs = resolve_knobs(meta, FmhaKnobs(
+            block_dmodel=tile,
+            padded_head=choices.PADDED_HEAD,
+            # AOT cannot bake strides: one binary must serve every layout. This is also
+            # what makes `num_heads` above irrelevant to the emitted code.
+            strides_constexpr=False,
+        ))
+        assert not knobs.strides_constexpr, \
+            'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
 
-    def build():
-        """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
-        so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
-        from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
-        return build_flash_attn_func_aiw_module_primary(meta, knobs)
+        def build():
+            """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
+            return build_flash_attn_func_aiw_module_primary(meta, knobs)
 
-    # Two plain strings (item D): the vendored file, relative to
-    # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
-    # Set here (arch is gfx1201-only today, but this is where a future arch
-    # branch would pick a different pair) rather than at decoration time,
-    # because only the builder -- not `@ati.flyc.kernel()` -- ever resolves a
-    # concrete `arch`. Read by codegen/flytune.py and flyc_compile.py off the
-    # `build` closure WITHOUT ever calling it.
-    build.flyc_source = 'flash_attn_func_gfx1201_aiw.py'
-    build.flyc_kernel_name = 'flash_attn_func_aiw_kernel'
+        # Two plain strings (item D): the vendored file, relative to
+        # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
+        # Read by codegen/flytune.py and flyc_compile.py off the `build`
+        # closure WITHOUT ever calling it.
+        build.flyc_source = 'flash_attn_func_gfx1201_aiw.py'
+        build.flyc_kernel_name = 'flash_attn_func_aiw_kernel'
 
-    return build, asdict(knobs)
+        # gfx1201's own knob class has no GRID_AXIS_ORDER field (§4.2): the
+        # grid has always walked (head, q_tile, seq) here, i.e. HEAD_FASTEST,
+        # which csrc's grid_calculator() hardcoded until §4.4. Supply the key
+        # by hand so both arches' sidecars carry it uniformly.
+        sidecar = asdict(knobs)
+        sidecar['GRID_AXIS_ORDER'] = 0  # HEAD_FASTEST; fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST
+        return build, sidecar
+
+    elif arch == 'gfx950':
+        # Same flydsl-free-at-call-time rule as the gfx1201 branch above.
+        from fmha_tuning_gfx950 import FmhaInputMetadata as Gfx950InputMetadata, fmha_knobs
+
+        tile = choices.BLOCK_DMODEL
+        meta = Gfx950InputMetadata(
+            # See the gfx1201 branch: not a functional axis, unread by
+            # resolve() for the same reason (STRIDE_TOKEN sits behind
+            # strides_constexpr, pinned False below).
+            num_heads=1,
+            head_dim=tile,
+            # gfx950's FmhaInputMetadata has no `causal_type` field — only
+            # `causal`/`window` (window requires causal: "a left bound *on
+            # top of* the causal one"). The kernel only ever compiles
+            # CAUSAL_TYPE in {0, 3} (checked by _flyc_fwd_disabled's cited
+            # flash_disabled + the operator's own axis, which offers no
+            # other value here), so this is 1:1, no mapping, exactly like
+            # the gfx1201 branch's causal_type line.
+            causal=choices.CAUSAL_TYPE != 0,
+            window=choices.CAUSAL_TYPE != 0,
+            dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
+            bias=bool(choices.BIAS_TYPE),
+            dropout=bool(choices.ENABLE_DROPOUT),
+        )
+        knobs = fmha_knobs(
+            arch,
+            block_dmodel=tile,
+            padded_head=choices.PADDED_HEAD,
+            # AOT cannot bake strides: one binary must serve every layout.
+            strides_constexpr=False,
+            # Pinned, not left to the policy (§4.1): this pin is what makes
+            # the Workspace/BlockTable/block_table_stride `options=[0]`
+            # declaration above true. Asserted below, not just assumed.
+            paged=False,
+            num_kv_splits=1,
+        ).resolve(meta)
+        assert knobs.block_dmodel == tile, (
+            f'resolve() returned block_dmodel={knobs.block_dmodel} for '
+            f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
+        assert not knobs.strides_constexpr, \
+            'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
+        assert not knobs.paged and knobs.num_kv_splits == 1, (
+            'AOT gfx950 only ever pins paged=False, num_kv_splits=1 -- that pin '
+            'is what makes the Workspace/BlockTable/block_table_stride constexpr '
+            'fold (options=[0], item C) true; resolve() must not have overridden it')
+
+        def build():
+            """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            from flash_attn_func_gfx950 import build_flash_attn_func_gfx950_module_primary
+            return build_flash_attn_func_gfx950_module_primary(meta, knobs)
+
+        build.flyc_source = 'flash_attn_func_gfx950.py'
+        build.flyc_kernel_name = 'flash_attn_func_gfx950_kernel'
+
+        # Gfx950Knobs.GRID_AXIS_ORDER is a flat resolved field already (§4.2,
+        # FlyDSL 70b2dbc5 made the class POD) -- no mirroring needed, unlike
+        # the gfx1201 branch above.
+        return build, asdict(knobs)
+
+    else:
+        # Unreachable: _flyc_fwd_disabled only lets gfx1201/gfx950 functionals
+        # through _FLYC_FWD_LADDERS. Fail loudly rather than silently building
+        # nothing if that ever stops being true.
+        assert False, f'flyc_attn_fwd: no builder branch for arch {arch!r}'

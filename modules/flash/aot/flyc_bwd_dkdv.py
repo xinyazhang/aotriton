@@ -34,9 +34,20 @@ from ._flyc_common import FlycBwdHints, flyc_bwd_disabled
 FLYC_BWD_DKDV_HEAD_DIMS = frozenset({16, 32, 48, 64, 80, 96, 128, 160, 192, 224,
                                      256, 320, 384, 448, 512})
 
+# gfx950's ladder, from fmha_tuning_bwd_dkdv_gfx950.LADDER (that module's own
+# copy, NOT imported from fmha_tuning_gfx950 -- see that file's header). A
+# literal for the same reason as FLYC_BWD_DKDV_HEAD_DIMS above -- including 96,
+# per the forward's UPSTREAM.md #4 note (the same tuple, same ruling).
+FLYC_GFX950_BWD_DKDV_HEAD_DIMS = frozenset({32, 64, 96, 128, 160, 192, 224, 256, 384, 512})
+
+_FLYC_BWD_DKDV_HEAD_DIMS_BY_ARCH = {
+    'gfx1201': FLYC_BWD_DKDV_HEAD_DIMS,
+    'gfx950': FLYC_GFX950_BWD_DKDV_HEAD_DIMS,
+}
+
 
 def _flyc_bwd_dkdv_disabled(f):
-    return flyc_bwd_disabled(f, head_dims=FLYC_BWD_DKDV_HEAD_DIMS)
+    return flyc_bwd_disabled(f, head_dims=_FLYC_BWD_DKDV_HEAD_DIMS_BY_ARCH)
 
 
 @ati.start
@@ -148,7 +159,12 @@ def _flyc_bwd_dkdv_disabled(f):
 # of the operator's BLOCK_DMODEL axis). Kept out of the ordered kernarg block
 # above -- BLOCK_DMODEL/PADDED_HEAD are not part of `bwd_dkdv_kernel`'s
 # signature at all, they are build-time Python values the operator owns.
-@ati.scalar('BLOCK_DMODEL', options=sorted(FLYC_BWD_DKDV_HEAD_DIMS),
+#
+# One shared marker for both arches (this decorator stack does not vary by
+# arch), so `options=` is the union of both ladders -- see flyc_attn_fwd.py's
+# BLOCK_DMODEL marker for why a single arch's ladder would under-document.
+@ati.scalar('BLOCK_DMODEL',
+            options=sorted(FLYC_BWD_DKDV_HEAD_DIMS | FLYC_GFX950_BWD_DKDV_HEAD_DIMS),
             wires_to=ati.context_helper('flyc_block_dmodel'))
 @ati.scalar('PADDED_HEAD', options=[False, True],
             wires_to=ati.context_helper('flyc_padded_head'))
@@ -161,74 +177,136 @@ def flyc_bwd_dkdv(arch, choices, hints):
     flydsl — never by the generator, which only reads the decorators above and
     the `knobs` half of this function's return. See `flyc_attn_fwd.py` for the
     full account of `choices` (a `ChoiceView`, backed by a real `Functional`
-    generator-side and by parsed `--signature` text driver-side) and `hints`.
+    generator-side and by parsed `--signature` text driver-side) and `hints`,
+    and for the item J invariant this owes (`meta` a pure function of `choices`
+    alone) -- true here on both arches for the same reason it is there.
     """
-    # ONLY the flydsl-free tuning module at call time. The FlyDSL-bearing import
-    # lives inside `build()` below, so the code generator -- which calls this
-    # function but never the callable -- never imports flydsl.
-    from fmha_tuning_bwd_dkdv_gfx1201 import (
-        ROWS_PER_WAVE, BwdDkDvKnobs, BwdDkDvMetadata, resolve_knobs,
-    )
+    if arch == 'gfx1201':
+        # ONLY the flydsl-free tuning module at call time. The FlyDSL-bearing
+        # import lives inside `build()` below, so the code generator -- which
+        # calls this function but never the callable -- never imports flydsl.
+        from fmha_tuning_bwd_dkdv_gfx1201 import (
+            ROWS_PER_WAVE, BwdDkDvKnobs, BwdDkDvMetadata, resolve_knobs,
+        )
 
-    tile = choices.BLOCK_DMODEL
-    meta = BwdDkDvMetadata(
-        # `num_heads` is not a functional axis. The forward pins it to 1 for a
-        # reason specific to its STRIDE_TOKEN/STRIDES_CONSTEXPR arm; here it is
-        # simply unread by resolve_knobs, whose policy keys on head_dim,
-        # head_dim_v and causal only.
-        num_heads=1,
-        head_dim=tile,
-        # AOTriton has ONE BLOCK_DMODEL axis, so the compiled QK and VO widths
-        # are the same; the real extents ride as runtime hdim_qk/hdim_vo.
-        head_dim_v=tile,
-        # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
-        # 2 bottom-right / 3 window), and the operator's axis offers {0, 3}.
-        causal=choices.CAUSAL_TYPE != 0,
-        causal_type=choices.CAUSAL_TYPE,
-        dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
-        bias=bool(choices.BIAS_TYPE),
-        dropout=bool(choices.ENABLE_DROPOUT),
-        # philox_width left at None -- Philox.for_arch(), which is what the
-        # forward compiled against. The backward must reproduce the forward's
-        # mask exactly, so this is the one setting that is not a free choice.
-    )
-    knobs = resolve_knobs(meta, BwdDkDvKnobs(
-        block_dmodel=tile,
-        block_dmodel_v=tile,
-        padded_head=choices.PADDED_HEAD,
-    ))
-    assert knobs.block_dmodel == tile, (
-        f'resolve_knobs returned block_dmodel={knobs.block_dmodel} for '
-        f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
+        tile = choices.BLOCK_DMODEL
+        meta = BwdDkDvMetadata(
+            # `num_heads` is not a functional axis. The forward pins it to 1 for a
+            # reason specific to its STRIDE_TOKEN/STRIDES_CONSTEXPR arm; here it is
+            # simply unread by resolve_knobs, whose policy keys on head_dim,
+            # head_dim_v and causal only.
+            num_heads=1,
+            head_dim=tile,
+            # AOTriton has ONE BLOCK_DMODEL axis, so the compiled QK and VO widths
+            # are the same; the real extents ride as runtime hdim_qk/hdim_vo.
+            head_dim_v=tile,
+            # FlyDSL's causal_type IS AOTriton's CAUSAL_TYPE (0 none / 1 top-left /
+            # 2 bottom-right / 3 window), and the operator's axis offers {0, 3}.
+            causal=choices.CAUSAL_TYPE != 0,
+            causal_type=choices.CAUSAL_TYPE,
+            dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
+            bias=bool(choices.BIAS_TYPE),
+            dropout=bool(choices.ENABLE_DROPOUT),
+            # philox_width left at None -- Philox.for_arch(), which is what the
+            # forward compiled against. The backward must reproduce the forward's
+            # mask exactly, so this is the one setting that is not a free choice.
+        )
+        knobs = resolve_knobs(meta, BwdDkDvKnobs(
+            block_dmodel=tile,
+            block_dmodel_v=tile,
+            padded_head=choices.PADDED_HEAD,
+        ))
+        assert knobs.block_dmodel == tile, (
+            f'resolve_knobs returned block_dmodel={knobs.block_dmodel} for '
+            f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
 
-    def build():
-        """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
-        so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
-        from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
-        return build_bwd_dkdv_module_primary(meta, knobs)
+        def build():
+            """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
+            return build_bwd_dkdv_module_primary(meta, knobs)
 
-    # Two plain strings (item D): the vendored file, relative to
-    # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
-    # Read by codegen/flytune.py and flyc_compile.py off the `build` closure
-    # WITHOUT ever calling it.
-    build.flyc_source = 'fmha_bwd_dkdv_gfx1201_kernel.py'
-    build.flyc_kernel_name = 'bwd_dkdv_kernel'
+        # Two plain strings (item D): the vendored file, relative to
+        # modules/flash/flyc/, and the `@flyc.kernel` def's own name inside it.
+        # Read by codegen/flytune.py and flyc_compile.py off the `build`
+        # closure WITHOUT ever calling it.
+        build.flyc_source = 'fmha_bwd_dkdv_gfx1201_kernel.py'
+        build.flyc_kernel_name = 'bwd_dkdv_kernel'
 
-    sidecar = asdict(knobs)
-    # BLOCK_N is what the grid's x extent divides Max_seqlen_k by, and unlike
-    # the dQ kernel's it is NOT a knob: fmha_bwd_dkdv_gfx1201_kernel.py derives
-    # it inside the builder as `ROWS_PER_WAVE * NUM_TEAMS`, which would leave
-    # grid_calculator() with no way to ask for it.
-    #
-    # Mirrored here from that derivation, whose three inputs ARE all knobs:
-    #
-    #     TEAM_WAVES = 2 * CONTRACTION_SHARDS if SPLIT_HEAD_DIM else 1
-    #     NUM_TEAMS  = NUM_WAVES // TEAM_WAVES
-    #     BLOCK_N    = ROWS_PER_WAVE * NUM_TEAMS
-    #
-    # A divergence between the two copies is a wrong grid rather than a build
-    # failure, so this is a real coupling to the vendored file -- check it on
-    # every re-sync, the same way the kernarg order is checked.
-    team_waves = 2 * knobs.contraction_shards if knobs.split_head_dim else 1
-    sidecar['block_n'] = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
-    return build, sidecar
+        sidecar = asdict(knobs)
+        # BLOCK_N is what the grid's x extent divides Max_seqlen_k by, and unlike
+        # the dQ kernel's it is NOT a knob: fmha_bwd_dkdv_gfx1201_kernel.py derives
+        # it inside the builder as `ROWS_PER_WAVE * NUM_TEAMS`, which would leave
+        # grid_calculator() with no way to ask for it.
+        #
+        # Mirrored here from that derivation, whose three inputs ARE all knobs:
+        #
+        #     TEAM_WAVES = 2 * CONTRACTION_SHARDS if SPLIT_HEAD_DIM else 1
+        #     NUM_TEAMS  = NUM_WAVES // TEAM_WAVES
+        #     BLOCK_N    = ROWS_PER_WAVE * NUM_TEAMS
+        #
+        # A divergence between the two copies is a wrong grid rather than a build
+        # failure, so this is a real coupling to the vendored file -- check it on
+        # every re-sync, the same way the kernarg order is checked.
+        team_waves = 2 * knobs.contraction_shards if knobs.split_head_dim else 1
+        sidecar['block_n'] = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
+        # gfx1201's own knob class has no GRID_AXIS_ORDER field (§4.2): unlike
+        # the forward and dQ, this kernel walks (tile, head, seq) --
+        # TILE_FASTEST -- because it is one workgroup per KV head with the GQA
+        # query heads summed inside; see grid_calculator()'s own comment.
+        sidecar['GRID_AXIS_ORDER'] = 1  # TILE_FASTEST; fmha_tuning_gfx950.GRID_AXIS_TILE_FASTEST
+        return build, sidecar
+
+    elif arch == 'gfx950':
+        from fmha_tuning_bwd_dkdv_gfx950 import BwdDkDvInputMetadata, bwd_dkdv_knobs
+
+        tile = choices.BLOCK_DMODEL
+        meta = BwdDkDvInputMetadata(
+            num_heads=1,
+            head_dim=tile,
+            head_dim_v=tile,
+            causal=choices.CAUSAL_TYPE != 0,
+            window=choices.CAUSAL_TYPE != 0,
+            dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
+            bias=bool(choices.BIAS_TYPE),
+            dropout=bool(choices.ENABLE_DROPOUT),
+            # varlen/lse_layout_th left at their False defaults: AOTriton's
+            # varlen encoding is a runtime bit either way (flyc_varlen_bits),
+            # and lse_layout_th is a build axis this operator never asks for
+            # ((H, T) only) -- see BwdDkDvInputMetadata's own docstring.
+        )
+        knobs = bwd_dkdv_knobs(
+            arch,
+            block_dmodel=tile,
+            block_dmodel_v=tile,
+            padded_head=choices.PADDED_HEAD,
+            strides_constexpr=False,
+            # NOTE: unlike Gfx950Knobs (forward, dQ), BwdDkDvKnobs is a
+            # standalone dataclass with no `paged`/`num_kv_splits` fields at
+            # all -- there is nothing to pin here. This kernel's real
+            # signature also carries no folded constexpr parameter (only the
+            # forward does), so §4.1's pin has no counterpart in this file.
+        ).resolve(meta)
+        assert knobs.block_dmodel == tile, (
+            f'resolve() returned block_dmodel={knobs.block_dmodel} for '
+            f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
+
+        def build():
+            """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            from fmha_bwd_dkdv_gfx950 import build_fmha_bwd_dkdv_gfx950_module_primary
+            return build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs)
+
+        build.flyc_source = 'fmha_bwd_dkdv_gfx950.py'
+        build.flyc_kernel_name = 'fmha_bwd_dkdv_gfx950_kernel'
+
+        # block_kv and GRID_AXIS_ORDER are flat resolved fields on BwdDkDvKnobs
+        # already (§4.2) -- no mirroring needed, unlike the gfx1201 branch
+        # above. Note the field name mismatch this hands to csrc: gfx1201's
+        # sidecar spells the tile-size knob 'block_n' (there is no such field
+        # to rename), gfx950's spells it 'block_kv' -- grid_calculator() reads
+        # whichever name matches GRID_AXIS_ORDER's arch (see flyc_bwd_dkdv.cc).
+        return build, asdict(knobs)
+
+    else:
+        assert False, f'flyc_bwd_dkdv: no builder branch for arch {arch!r}'
