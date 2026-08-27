@@ -128,6 +128,34 @@ flyc_dropout_scale_of(bool enable_dropout, float dropout_p) {
   return 1.0f / (1.0f - dropout_p);
 }
 
+// Item I sub-step (f): find the smallest COMPILED rung >= `hdim` in the
+// arch-indexed table codegen_compiled_rung_table_defs (python/codegen/flyc.py)
+// generates on each FlycXXXContext (`compiled_block_dmodel` /
+// `compiled_block_dmodel_count`, both static). Mirrors
+// <aotriton/_internal/util.h>'s round_value -- used at the OPERATOR's own
+// BLOCK_DMODEL binning site, attn_fwd.cc / attn_bwd.cc, BEFORE a backend is
+// chosen -- but over a raw (pointer, count) pair rather than a
+// std::vector<int32_t>, since that is what the generated static arrays are.
+//
+// Returns -1, the same "not found" sentinel round_value uses, when `table`
+// is empty (this arch compiles nothing for this kernel -- e.g. gfx950 for a
+// gfx1201-only flyc kernel, see codegen/flyc.py's comment on why that row is
+// legitimately empty) or when `hdim` exceeds every compiled rung. -1 is never
+// a valid BLOCK_DMODEL choice, so it reaches godel_number()'s digit-compare
+// unchanged, is rejected there with a logged "Unsupported" message, and
+// lookup_optimal() returns hipErrorNotSupported -- the same graceful
+// rejection shape as any other out-of-range functional value, not a crash
+// and not a silently wrong kernel.
+inline int16_t
+flyc_round_up_rung(int32_t hdim, const int16_t* table, int count) {
+  for (int i = 0; i < count; ++i) {
+    if (table[i] >= hdim) {
+      return table[i];
+    }
+  }
+  return -1;
+}
+
 }  // namespace AOTRITON_NS::v3::flash
 
 #endif

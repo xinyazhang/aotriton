@@ -53,6 +53,53 @@ FlycAttnFwdContext::flyc_dropout_scale() const {
   return flyc_dropout_scale_of(params->ENABLE_DROPOUT, params->dropout_p);
 }
 
+// Item I sub-step (f). Rounds from the TRUE head dims (params->Hdim_qk /
+// Hdim_vo), not from params->BLOCK_DMODEL -- that field already holds the
+// OPERATOR's (Triton) rounding from attn_fwd.cc's own binning site, and
+// re-rounding a value already on a SUPERSET ladder against this backend's
+// SUBSET ladder is equivalent to rounding the true head dim directly only
+// because the subset property holds; going straight to the true head dims
+// avoids relying on that equivalence at every call site. See flyc_common.h's
+// flyc_round_up_rung for the -1-on-nothing-compiled/nothing-fits contract.
+//
+// `get_archmod_number(current_gpu)` is how a helper reaches the arch index:
+// it takes no arguments by design (flyc.h), and lookup_optimal() evaluates
+// every context helper before it computes its OWN arch_number/mod_number
+// pair (see the item I comment at that call site) -- so this cannot reuse a
+// local, it must ask again.
+int16_t
+FlycAttnFwdContext::flyc_block_dmodel() const {
+  const auto [arch_number, mod_number] = get_archmod_number(current_gpu);
+  (void)mod_number;
+  const int32_t hdim = std::max(params->Hdim_qk, params->Hdim_vo);
+  if (arch_number < 0) {
+    // No compiled rung table for this GPU at all. lookup_optimal() rejects
+    // the launch (hipErrorNoBinaryForGpu) right after context helpers run,
+    // using the same get_archmod_number(gpu) call, so this value is never
+    // actually consulted -- return the true, unrounded max rather than
+    // fabricate a rung.
+    return static_cast<int16_t>(hdim);
+  }
+  return flyc_round_up_rung(hdim, compiled_block_dmodel[arch_number], compiled_block_dmodel_count[arch_number]);
+}
+
+// Must follow flyc_block_dmodel()'s own rounding decision, not re-derive one:
+// a kernel re-rounded to a wider rung with PADDED_HEAD left false is a
+// silent wrong answer (padding is never applied even though the compiled
+// tile is wider than the true head dim), not a build error. Calls
+// flyc_block_dmodel() itself rather than reading
+// scratch_params.flyc_block_dmodel -- context helpers are evaluated in
+// declaration order in lookup_optimal(), so that member IS already populated
+// by the time this runs today, but relying on that order is exactly the
+// silent-failure mode flyc.h's context_helper_evaluate comment warns about.
+bool
+FlycAttnFwdContext::flyc_padded_head() const {
+  const int32_t hdim_qk = params->Hdim_qk;
+  const int32_t hdim_vo = params->Hdim_vo;
+  const int16_t rounded = flyc_block_dmodel();
+  return rounded != hdim_qk || rounded != hdim_vo;
+}
+
 // Grid shape, derived from the vendored kernel's own launcher --
 // `launch_flash_attn_aiw` in modules/flash/flyc/flash_attn_func_gfx1201_aiw.py:
 //

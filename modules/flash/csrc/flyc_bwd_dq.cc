@@ -48,6 +48,32 @@ FlycBwdDqContext::flyc_dropout_scale() const {
   return flyc_dropout_scale_of(params->ENABLE_DROPOUT, params->dropout_p);
 }
 
+// Item I sub-step (f). See flyc_attn_fwd.cc for the full rationale (same
+// mechanism: round the TRUE head dims against this kernel's own compiled
+// ladder, not against params->BLOCK_DMODEL, which already holds the
+// OPERATOR's rounding from attn_bwd.cc's binning site).
+int16_t
+FlycBwdDqContext::flyc_block_dmodel() const {
+  const auto [arch_number, mod_number] = get_archmod_number(current_gpu);
+  (void)mod_number;
+  const int32_t hdim = std::max(params->hdim_qk, params->hdim_vo);
+  if (arch_number < 0) {
+    return static_cast<int16_t>(hdim);
+  }
+  return flyc_round_up_rung(hdim, compiled_block_dmodel[arch_number], compiled_block_dmodel_count[arch_number]);
+}
+
+// Must follow flyc_block_dmodel()'s own rounding decision -- see
+// flyc_attn_fwd.cc for why this recomputes rather than reading
+// scratch_params.flyc_block_dmodel.
+bool
+FlycBwdDqContext::flyc_padded_head() const {
+  const int32_t hdim_qk = params->hdim_qk;
+  const int32_t hdim_vo = params->hdim_vo;
+  const int16_t rounded = flyc_block_dmodel();
+  return rounded != hdim_qk || rounded != hdim_vo;
+}
+
 // Grid shape, derived from the vendored kernel's own launcher -- `launch_bwd_dq`
 // in modules/flash/flyc/fmha_bwd_dq_gfx1201_kernel.py:
 //
