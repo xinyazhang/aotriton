@@ -102,6 +102,8 @@ from fmha_dualwave_gfx950 import (
     ParityQLoader,
     ParitySoftmaxHelper,
     ParityStoreHelper,
+    wire_ptr,
+    wire_view,
 )
 from fmha_tuning_gfx950 import FmhaInputMetadata, fmha_knobs
 from fmha_wide_gfx950 import (
@@ -237,8 +239,22 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
     # because the slots sit *between* `LSE` and `seqinfo_q0`, so leaving them
     # occupied would shift every later argument two positions away from
     # gfx1201's layout -- a consumer that hardcodes the kernarg block reads the
-    # wrong slots no matter what the pointers contain. With them gone the
-    # forward's kernarg is byte-identical to `flash_attn_func_aiw_kernel`'s.
+    # wrong slots no matter what the pointers contain.
+    #
+    # With them gone, and the six tensor operands now pointers, the forward's
+    # kernarg is 296 bytes: 292 of declared fields plus one 4-byte hole, where
+    # `sm_scale` (f32, offset 172) meets the fifteen i64 strides that need
+    # 8-byte alignment. No tensor descriptor remains: 536 -> 296 at a fixed
+    # configuration, and **240 is exactly six 40-byte descriptors**, which is
+    # what says the conversion recovered all of them and nothing else moved.
+    #
+    # It is **not** byte-identical to `flash_attn_func_aiw_kernel` and this
+    # comment used to claim it was. That kernel models to 300 bytes and its
+    # field order diverges from slot 3 on: it carries `batch_size` on the wire,
+    # which this one recovers from the grid, and it puts `sm_scale` last rather
+    # than before the strides. Matching them is an ABI decision with a caller on
+    # the other end, not a cleanup; the sizes are recorded here so whoever makes
+    # it starts from measurements.
     #
     # The annotation can be a per-build choice because this `def` executes on
     # every build and the module has no `from __future__ import annotations`,
@@ -256,12 +272,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
 
     @flyc.kernel(known_block_size=[traits.BLOCK_SIZE, 1, 1])
     def flash_attn_func_gfx950_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        B: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
-        LSE: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        B: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
+        LSE: fx.Pointer,
         Workspace: _WS_ANN,
         BlockTable: _BT_ANN,
         seqinfo_q0: fx.Pointer,
@@ -303,6 +319,19 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         stride_b_seq_q: fx.Int64,
         block_table_stride: _BTS_ANN,
     ):
+        # The six tensor operands arrive as bare pointers -- see `wire_ptr` in
+        # `fmha_dualwave_gfx950.py` for why, and `wire_view` for why they are
+        # wrapped back up here rather than at each use. Doing it once, at the
+        # boundary, is what leaves the addressing code below untouched: every
+        # extent it needs is a wire scalar already, so the only thing the
+        # production helpers ever wanted from a tensor was `fx.get_iter`, and
+        # that is exactly what survives the round trip.
+        Q = wire_view(Q)
+        K = wire_view(K)
+        V = wire_view(V)
+        B = wire_view(B)
+        O = wire_view(O)  # noqa: E741
+        LSE = wire_view(LSE)
         ctx = (WideKernelContext if WIDE else ParityKernelContext)(
             traits,
             strides=(
@@ -885,6 +914,51 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         if const_expr(traits.SPLITK):
             output_store.store_empty_split()
 
+    # Split-K combine. Carried from the production kernel, not part of the
+    # parity surface -- see the plan's split-K note. Unchanged.
+    COMBINE_BLOCK = 256
+    COMBINE_LANES_PER_ROW = traits.HEAD_DIM // 4
+    COMBINE_ROWS_PER_BLOCK = COMBINE_BLOCK // COMBINE_LANES_PER_ROW
+
+    @flyc.kernel(known_block_size=[COMBINE_BLOCK, 1, 1])
+    def flash_attn_splitk_combine_kernel(
+        # `O` and `LSE` follow the main kernel's operands onto the wire as
+        # pointers, because the launcher hands it the same two values. `WS`
+        # does not: the workspace is only ever allocated by the launcher, never
+        # by an external caller, so nothing gains from shrinking its slot, and
+        # under a non-split-K build it is `Constexpr` and has no slot at all.
+        O: fx.Pointer,  # noqa: E741
+        WS: fx.Tensor,
+        LSE: fx.Pointer,
+        batch_size: fx.Int32,
+        seq_len: fx.Int32,
+        # `fx.Int64`, and named for the axis like every other stride here. It
+        # was `stride_q_n: fx.Int32`, which was wrong twice over: the argument
+        # handed in is O's *sequence* stride, an i64, so every launch warned
+        # that the annotation did not match and was ignored; and `stride_q_n`
+        # is the production kernel's name for the BSHD token pitch, which is
+        # the very conflation that makes this kernel alias heads onto tokens on
+        # a BHSD output. See the guard in `_args`.
+        stride_o_seq: fx.Int64,
+    ):
+        ctx = dualwave.DualwaveSplitKCombineContext(
+            traits, wire_view(O), WS, batch_size, seq_len, stride_o_seq, LSE=wire_view(LSE)
+        )
+        ctx.init_types_and_constants()
+        ctx.init_runtime_indices()
+        ctx.init_thread_mapping(COMBINE_ROWS_PER_BLOCK, COMBINE_LANES_PER_ROW)
+        ctx.init_workspace()
+        ctx.init_descriptors()
+
+        combine = dualwave.DualwaveSplitKCombineHelper(ctx)
+        m_s, l_s = combine.load_ml_rows()
+        m_max = combine.reduce_m_max(m_s)
+        acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        if const_expr(traits.RETURN_LSE):
+            combine.store_lse(m_max, den)
+        o_pack = combine.pack_output(acc, den)
+        combine.store_output(o_pack)
+
     def _resolve_window_args(window):
         """`(window_left, window_right)` for the wire, as signed i32.
 
@@ -925,12 +999,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
 
     @flyc.jit
     def launch_flash_attn_func_gfx950(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,  # noqa: E741
-        LSE: fx.Tensor,
-        Bias: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,  # noqa: E741
+        LSE: fx.Pointer,
+        Bias: fx.Pointer,
         Workspace: _WS_ANN,
         BlockTable: _BT_ANN,
         batch_size: fx.Int32,
@@ -1060,6 +1134,13 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             block=(traits.BLOCK_SIZE, 1, 1),
             stream=stream,
         )
+        if const_expr(traits.SPLITK):
+            combine_rows = bs_idx * fx.Index(num_head_q) * sl_idx
+            flash_attn_splitk_combine_kernel(O, Workspace, LSE, batch_size, max_seqlen_q, stride_q_seq).launch(
+                grid=(combine_rows // COMBINE_ROWS_PER_BLOCK, 1, 1),
+                block=(COMBINE_BLOCK, 1, 1),
+                stream=stream,
+            )
 
     def _args(
         Q,
@@ -1097,7 +1178,12 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
             [("Q", Q), ("K", K), ("V", V), ("O", O)],
             q_heads=("O",),
         )
-        del ptrs  # gfx950 addresses through buffer descriptors, so it wants the tensors
+        # `prep_tensors` is used for the checks and the strides, not its
+        # pointers: those are `fx.Uint8`, and a byte pointer carries alignment
+        # 1. `wire_ptr` below types each operand from its own tensor instead,
+        # which is what keeps the alignment identical to the `fx.Tensor` path
+        # this replaced.
+        del ptrs
         num_head_q, num_head_k, hdim_qk, hdim_vo = shape_meta
 
         # **The 8-element D pitch is the alignment contract.** Loads and stores
@@ -1262,12 +1348,17 @@ def build_flash_attn_func_gfx950_module_primary(meta, knobs):
         _vl = abi.varlen_args(STRIDES_CONSTEXPR, varlen, seqlen_q, seqlen_k, Q, batch_size, num_seqlens)
 
         return (
-            Q,
-            K,
-            V,
-            O,
-            lse_out,
-            bias_t,
+            # Six pointers, not six tensors. `wire_ptr` types each one from the
+            # tensor it came from so the alignment the JIT assumes is the one
+            # the `fx.Tensor` path assumed; LSE is pinned to f32 rather than
+            # read off `lse_out`, because that name falls back to `O` when the
+            # build returns no LSE and the slot's type should not depend on it.
+            wire_ptr(Q),
+            wire_ptr(K),
+            wire_ptr(V),
+            wire_ptr(O),
+            wire_ptr(lse_out, fx.Float32),
+            wire_ptr(bias_t),
             ws,
             bt,
             batch_size,
