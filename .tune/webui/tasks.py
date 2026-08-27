@@ -209,6 +209,12 @@ def _merge_progress_rows(progress_rows, speed_rows, stale_rows):
 _PROGRESS_SECTIONS = (
     ('Kernel', 'tune_kernel', 'kernel'),
     ('Op', 'tune_kernel', 'op'),
+    # subclass MUST be '', not 'perfmon' or 'kernel' -- task_queue's CHECK
+    # constraint (python/tune/pq/schema.sql) pins perf_measure to subclass
+    # '' exactly. Any other pairing can never match a row (see af7653c2,
+    # which fixed this same mistake in the PG reader), so the section would
+    # silently render zero rows forever instead of erroring.
+    ('Perfmon', 'perf_measure', ''),
 )
 
 
