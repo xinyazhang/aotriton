@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 # Build Docker image on one host
-# Usage: build_image.sh <workdir> <hostname> [--follow]
+# Usage: build_image.sh <workdir> <hostname> [--workload <name>] [--follow]
 
 set -e
 
@@ -15,18 +15,38 @@ TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 WORKDIR="$1"
 HOSTNAME="$2"
+shift 2 || true
 FOLLOW=""
+WORKLOAD="kernel"
 
-# Parse optional --follow flag
-if [ "$3" = "--follow" ]; then
-  FOLLOW="true"
-fi
+# Flags are order-independent; both are optional.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --follow)   FOLLOW="true"; shift ;;
+    --workload)
+      if [ -z "$2" ]; then
+        echo "Error: --workload needs a value (kernel|op|perfmon)" >&2
+        exit 1
+      fi
+      WORKLOAD="$2"; shift 2 ;;
+    *) echo "Error: unrecognized argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+case "$WORKLOAD" in
+  kernel|op|perfmon) ;;
+  *) echo "Error: unknown workload '$WORKLOAD' (expected kernel|op|perfmon)" >&2; exit 1 ;;
+esac
 
 if [ -z "$WORKDIR" ] || [ -z "$HOSTNAME" ]; then
-  echo "Usage: $0 <workdir> <hostname> [--follow]" >&2
+  echo "Usage: $0 <workdir> <hostname> [--workload <name>] [--follow]" >&2
   echo "" >&2
   echo "  Submit a Docker image build job via tsp on <hostname>." >&2
-  echo "  --follow  Tail the build output in real-time (blocks until done)." >&2
+  echo "  --workload <name>  kernel (default) | op | perfmon." >&2
+  echo "                     kernel and op share the tuning worker image;" >&2
+  echo "                     perfmon builds its own, per-arch, image. Generate" >&2
+  echo "                     it with: prepwkdir <workdir> --workload perfmon" >&2
+  echo "  --follow           Tail the build output in real-time (blocks)." >&2
   echo "  Without --follow, the job runs in background; check with tsp on the host." >&2
   exit 1
 fi
@@ -53,14 +73,105 @@ fi
 
 WORKER_WORKDIR="${workdir_override:-$DEFAULT_WORKDIR}"
 
+# Which Dockerfile to build. The tuning worker image and the perfmon image are
+# NOT interchangeable: create_dockerfile.sh assumes a base that already ships
+# python3 and ROCm (ubuntu + distro ROCm), while the perfmon image starts from a
+# bare debian and installs TheRock into a venv itself. Building the former on a
+# debian base fails at `python3: not found`, which is what this flag exists to
+# avoid.
+if [ "$WORKLOAD" = "perfmon" ]; then
+  if [ -z "$arch" ]; then
+    echo "Error: --workload perfmon needs the target host's architecture, but" >&2
+    echo "       $HOSTNAME is not registered as a worker in $WORKDIR/workers.db." >&2
+    exit 1
+  fi
+
+  # Generate the Dockerfile NOW, from this server's state, and ship it with the
+  # build. What the perfmon image contains is decided entirely by its
+  # Dockerfile -- it has zero COPY/ADD, so the build context contributes
+  # nothing -- and that Dockerfile is generated here from workers.db
+  # (perfmon::default_rocm) plus config.rc.
+  #
+  # Building from a previously synced copy would make the result depend on when
+  # the workdir was last deployed: change the ROCm on the PerfmonConfig tab,
+  # press build, and you would silently get an image built to the old value
+  # with no indication anything was stale. The server is the only authority on
+  # what this image is, so it must not be possible to build a different one.
+  # The image bakes a build user, and that user must be the REMOTE host's --
+  # not this server's. The Dockerfile is generated here, so `id -u` here would
+  # bake the server's uid (e.g. 1000) into an image that runs on a node where
+  # the same person is a different uid (e.g. 1045). The venv would then be
+  # owned by a uid the container never runs as, and every write into it fails
+  # with EACCES.
+  #
+  # PERFMON_BUILD_UID/GID already existed as overrides in the generator; this
+  # is the caller that always should have set them.
+  REMOTE_IDS=$(ssh "$HOSTNAME" 'printf "%s:%s" "$(id -u)" "$(id -g)"')
+  PERFMON_BUILD_UID="${REMOTE_IDS%%:*}"
+  PERFMON_BUILD_GID="${REMOTE_IDS##*:}"
+  case "$PERFMON_BUILD_UID:$PERFMON_BUILD_GID" in
+    [0-9]*:[0-9]*) ;;
+    *)
+      echo "Error: could not read uid:gid from $HOSTNAME (got '$REMOTE_IDS')." >&2
+      exit 1
+      ;;
+  esac
+  echo "Build user on $HOSTNAME: ${PERFMON_BUILD_UID}:${PERFMON_BUILD_GID}"
+  export PERFMON_BUILD_UID PERFMON_BUILD_GID
+
+  DOCKERFILE_REL="image.build/Dockerfile.$WORKLOAD.$arch"
+  if ! bash "$TUNE_ROOT/lib/create_perfmon_dockerfile.sh" "$WORKDIR" "$arch"; then
+    echo "Error: could not generate $DOCKERFILE_REL" >&2
+    exit 1
+  fi
+
+  # Push it, then build with image.build/ as the context: it holds only
+  # generated Dockerfiles and the requirements files staged beside them, so the
+  # upload is negligible, whereas the full workdir would be sent for a build
+  # that reads none of it.
+  BUILD_CONTEXT="$WORKER_WORKDIR/image.build"
+  ssh "$HOSTNAME" "mkdir -p '$BUILD_CONTEXT' && cat > '$WORKER_WORKDIR/$DOCKERFILE_REL'" \
+    < "$WORKDIR/$DOCKERFILE_REL"
+
+  # The Dockerfile COPYs requirements/, so it has to reach the far side too.
+  # tar, not a second `cat`, because this is a directory whose contents are
+  # create_perfmon_dockerfile.sh's to decide -- whatever it staged there is what
+  # gets sent, with no list to keep in sync here. Only that subdirectory is
+  # sent: the sibling Dockerfiles in image.build/ belong to other arches and to
+  # the tuning image, and overwriting a remote one from here would be a
+  # surprising side effect of building this one.
+  tar -C "$WORKDIR/image.build" -cf - requirements \
+    | ssh "$HOSTNAME" "tar -C '$BUILD_CONTEXT' -xf -"
+
+  # Tag by workload AND arch. Workload because two images that serve different
+  # DAGs must not share a name; arch because the perfmon image bakes an
+  # arch-specific ROCm payload, so on a multi-arch fleet a shared tag would let
+  # the second build silently overwrite the first, leaving an image whose name
+  # says nothing about which GPU it can serve.
+  IMAGE_TAG="${CELERY_WORKER_IMAGE}-${WORKLOAD}_${arch}"
+  echo "Workload $WORKLOAD: $DOCKERFILE_REL -> $IMAGE_TAG (generated and pushed just now)"
+else
+  # kernel and op share the tuning worker image: same DAG, same container. The
+  # workload axis is finer than the image axis, so it does not appear here.
+  #
+  # This one is NOT regenerated-and-pushed: it COPYs config.rc, image.scripts
+  # and files from aotriton.src, so it genuinely needs the synced workdir as
+  # its build context and cannot be made independent of the deploy.
+  DOCKERFILE_REL="image.build/Dockerfile"
+  BUILD_CONTEXT="$WORKER_WORKDIR"
+  IMAGE_TAG="$CELERY_WORKER_IMAGE"
+fi
+
 # Certain nodes need --network=host to access internet
 if [ -n "$FOLLOW" ]; then
   # Use tsp -t to tail/follow output in real-time
-  ssh "$HOSTNAME" bash -s "$WORKER_WORKDIR" "$CELERY_WORKER_IMAGE" <<'EOF'
+  ssh "$HOSTNAME" bash -s "$WORKER_WORKDIR" "$IMAGE_TAG" "$DOCKERFILE_REL" "$BUILD_CONTEXT" <<'EOF'
 WORKER_WORKDIR="$1"
-CELERY_WORKER_IMAGE="$2"
+IMAGE_TAG="$2"
+DOCKERFILE_REL="$3"
+BUILD_CONTEXT="$4"
 
-jobid=$(tsp docker build --network=host -f $WORKER_WORKDIR/image.build/Dockerfile -t $CELERY_WORKER_IMAGE $WORKER_WORKDIR)
+jobid=$(tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $BUILD_CONTEXT)
 echo "Job ID: $jobid"
 if [ "$(tsp -s "$jobid")" = "queued" ]; then
   echo "Waiting for tsp job $jobid to start..."
@@ -69,5 +180,5 @@ fi
 tsp -t $jobid
 EOF
 else
-  ssh -n "$HOSTNAME" "tsp docker build --network=host -f $WORKER_WORKDIR/image.build/Dockerfile -t $CELERY_WORKER_IMAGE $WORKER_WORKDIR"
+  ssh -n "$HOSTNAME" "tsp docker build --network=host -f $WORKER_WORKDIR/$DOCKERFILE_REL -t $IMAGE_TAG $BUILD_CONTEXT"
 fi

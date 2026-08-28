@@ -3,17 +3,29 @@
 # SPDX-License-Identifier: MIT
 
 # Sync workdir to one host (main files + architecture-specific files)
-# Usage: sync_workdir.sh <workdir> <hostname> [--remote_workdir <path>|--buildnode]
+# Usage: sync_workdir.sh <workdir> <hostname> [--remote_workdir <path>] [--workload <name>]
 #
 # --remote_workdir <path>
 #   Override the remote workdir instead of looking it up from workers.db.
 #   When set, arch is treated as ALL (sync all installed/ subdirs).
 #   Use this for hosts not registered as GPU workers (e.g. build nodes).
 #
-# --buildnode
-#   Look up buildnode::workdir_override (falling back to default_workdir) from
-#   workers.db config table. Sets SUBDIR to 'database' so only installed/database/
-#   is synced to the remote (the build node needs the sharded DB, not GPU binaries).
+# --workload <name>
+#   Which workload this host serves; selects the installed/ subtree to ship.
+#   Replaces the old one-flag-per-node-kind scheme (--buildnode/--testnode),
+#   which could not express a third kind without a third boolean.
+#
+#     build            installed/database    the sharded DB, not GPU binaries
+#     tune | kernel    installed/<arch>      tuning libraries (default)
+#     test | op        installed/test/<arch> op tuning needs the testing build
+#     perfmon          installed/perfmon/<arch>   measurement subjects
+#
+#   Both vocabularies are accepted because the WebUI speaks kernel|op|perfmon
+#   (the Workload selector) while the node-kind names here are build|tune|test.
+#   `build` additionally resolves the remote path from buildnode::workdir_override.
+#
+# --buildnode / --testnode
+#   Deprecated aliases for --workload build / --workload test.
 
 set -e
 
@@ -28,16 +40,22 @@ HOSTNAME="$2"
 shift 2
 
 REMOTE_WORKDIR_OVERRIDE=""
-BUILDNODE_MODE=0
-TESTNODE_MODE=0
+WORKLOAD="tune"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --remote_workdir) REMOTE_WORKDIR_OVERRIDE="$2"; shift 2 ;;
-    --buildnode)      BUILDNODE_MODE=1; shift ;;
-    --testnode)       TESTNODE_MODE=1; shift ;;
+    --workload)       WORKLOAD="$2"; shift 2 ;;
+    --buildnode)      WORKLOAD="build"; shift ;;   # deprecated alias
+    --testnode)       WORKLOAD="test";  shift ;;   # deprecated alias
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+case "$WORKLOAD" in
+  build|tune|kernel|test|op|perfmon) ;;
+  *) echo "Unknown workload '$WORKLOAD' (expected build|tune|kernel|test|op|perfmon)" >&2
+     exit 1 ;;
+esac
 
 if [ -z "$WORKDIR" ] || [ -z "$HOSTNAME" ]; then
   echo "Usage: $0 <workdir> <hostname> [--remote_workdir <path>]" >&2
@@ -46,6 +64,7 @@ if [ -z "$WORKDIR" ] || [ -z "$HOSTNAME" ]; then
   echo "  Excludes build/, run/, scratch/, secrets/. Uses --delete on installed/ and aotriton.src/." >&2
   echo "" >&2
   echo "  --remote_workdir <path>  Override remote workdir (skips workers.db lookup, syncs all installed/)." >&2
+  echo "  --workload <name>        build|tune|kernel|test|op|perfmon; picks the installed/ subtree." >&2
   exit 1
 fi
 
@@ -54,7 +73,7 @@ load_config "$WORKDIR"
 if [ -n "$REMOTE_WORKDIR_OVERRIDE" ]; then
   arch="ALL"
   WORKER_WORKDIR="$REMOTE_WORKDIR_OVERRIDE"
-elif [ "$BUILDNODE_MODE" -eq 1 ]; then
+elif [ "$WORKLOAD" = "build" ]; then
   WORKER_WORKDIR="$(get_buildnode_workdir "$WORKDIR")"
 else
   # Get arch and workdir_override for this hostname
@@ -81,15 +100,12 @@ rsync -az --checksum --info=progress2 \
 # --exclude '*.pyc' prevents deleting bytecode (may be root-owned from container)
 # We minimize rsync calls since some deployments have long SSH authentication time
 # TODO: Re-use SSH connection between multiple rsyncs (e.g., SSH ControlMaster)
-if [ "$BUILDNODE_MODE" -eq 1 ]; then
-  SUBDIR="/database"
-elif [ "$TESTNODE_MODE" -eq 1 ]; then
-  SUBDIR="/test/$arch"
-elif [ "$arch" = "ALL" ]; then
-  SUBDIR=""
-else
-  SUBDIR="/$arch"
-fi
+case "$WORKLOAD" in
+  build)        SUBDIR="/database" ;;
+  test|op)      SUBDIR="/test/$arch" ;;
+  perfmon)      SUBDIR="/perfmon/$arch" ;;
+  *)            if [ "$arch" = "ALL" ]; then SUBDIR=""; else SUBDIR="/$arch"; fi ;;
+esac
 
 # Always use --delete so aotriton.src is an exact copy.
 # When SUBDIR is empty (ALL), protect installed/ from deletion so remote

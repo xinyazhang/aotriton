@@ -7,21 +7,30 @@
 # Reads build node config from <workdir>/workers.db (config table):
 #   buildnode::enable          1 = remote build enabled, 0 = local
 #   buildnode::hostname        SSH hostname of the build node
-#   buildnode::workdir_override  Remote workdir (handled by sync_workdir --buildnode)
+#   buildnode::workdir_override  Remote workdir (handled by sync_workdir --workload build)
 #
 # When build node is enabled, workdir is synced to the remote node via
-# sync_workdir.sh --buildnode (which resolves the remote workdir from workers.db)
+# sync_workdir.sh --workload build (which resolves the remote workdir from workers.db)
 # and the build runs there via SSH+docker (tsp-tracked to survive disconnects).
 # When disabled, builds run locally.
 #
-#   --tuning (default)  Build tuning version (calls libbld).
-#   --test              Build testing version (docker run testbld inside
+#   --workload tune | kernel (default)
+#                       Build tuning version (calls libbld).
+#   --workload test | op
+#                       Build testing version (docker run testbld inside
 #                       CELERY_WORKER_IMAGE container).
 #
+#   Both vocabularies are accepted, as elsewhere: the WebUI speaks
+#   kernel|op|perfmon while the node-kind names are build|tune|test.
+#   `--workload perfmon` is rejected -- subjects are not built here, see
+#   .tune/single/build_perfmon.sh.
+#
+#   --tuning / --test are deprecated aliases for --workload tune / test.
+#
 # Usage:
-#   remotebld <workdir>           # tuning build (default)
-#   remotebld <workdir> --test    # testing build
-#   remotebld --test <workdir>    # same, order-independent
+#   remotebld <workdir>                      # tuning build (default)
+#   remotebld <workdir> --workload test      # testing build
+#   remotebld --workload test <workdir>      # same, order-independent
 
 set -euo pipefail
 
@@ -33,8 +42,9 @@ SOURCE_DB=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --test)        MODE="test"; shift ;;
-    --tuning)      MODE="tuning"; shift ;;
+    --workload)    MODE="$2"; shift 2 ;;
+    --test)        MODE="test"; shift ;;     # deprecated alias
+    --tuning)      MODE="tuning"; shift ;;   # deprecated alias
     --sync)        DO_SYNC=1; shift ;;
     --single_arch) ARCH_SELECTION="$2"; shift 2 ;;
     --source_db)   SOURCE_DB=1; shift ;;
@@ -42,21 +52,35 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+case "$MODE" in
+  tune|kernel|tuning) MODE="tuning" ;;
+  test|op)            MODE="test" ;;
+  perfmon)
+    echo "Error: remotebld does not build perfmon subjects." >&2
+    echo "       Use .tune/single/build_perfmon.sh <workdir> <arch> <tag>..." >&2
+    echo "       -- subjects are per-(arch, tag) and build in the perfmon" >&2
+    echo "       image, neither of which this script's two modes describe." >&2
+    exit 1 ;;
+  *)
+    echo "Error: unknown workload '$MODE' (expected tune|kernel|test|op)" >&2
+    exit 1 ;;
+esac
+
 if [ -z "$WORKDIR" ]; then
   cat >&2 <<EOF
-Usage: $0 <workdir> [--tuning|--test] [--sync] [--single_arch <arch>]
+Usage: $0 <workdir> [--workload tune|test] [--sync] [--single_arch <arch>]
 
-  --tuning (default)    Build tuning version of AOTriton (calls libbld).
-  --test                Build testing version of AOTriton (calls testbld
+  --workload tune (default)  Build tuning version of AOTriton (calls libbld).
+  --workload test            Build testing version of AOTriton (calls testbld
                         inside CELERY_WORKER_IMAGE container).
   --sync                Sync workdir to the build node before building
-                        (calls sync_workdir --buildnode).
+                        (calls sync_workdir --workload build).
   --single_arch <arch>  Build only the specified arch (--test mode only).
 
 Build node config (workers.db config table):
   buildnode::enable           1 = remote build; 0 = local.
   buildnode::hostname         SSH hostname of the build node.
-  buildnode::workdir_override Remote workdir (resolved by sync_workdir --buildnode).
+  buildnode::workdir_override Remote workdir (resolved by sync_workdir --workload build).
 EOF
   exit 1
 fi
@@ -87,14 +111,14 @@ if [ "$BUILD_NODE_ENABLE" = "1" ] && [ -n "$BUILD_NODE_HOST" ]; then
 fi
 
 if [ "$USE_REMOTE" -eq 1 ]; then
-  # Resolve the remote workdir the same way sync_workdir --buildnode does
+  # Resolve the remote workdir the same way sync_workdir --workload build does
   REMOTE_WORKDIR="$(get_buildnode_workdir "$ABSWORKDIR")"
   echo "Build node: $BUILD_NODE_HOST (remote workdir: $REMOTE_WORKDIR)"
 
   if [ "$DO_SYNC" -eq 1 ]; then
     # Sync workdir to the build node; sync_workdir resolves buildnode::workdir_override
     echo "Syncing workdir to $BUILD_NODE_HOST..."
-    "$TUNE_ROOT/single/sync_workdir.sh" "$ABSWORKDIR" "$BUILD_NODE_HOST" --buildnode
+    "$TUNE_ROOT/single/sync_workdir.sh" "$ABSWORKDIR" "$BUILD_NODE_HOST" --workload build
   fi
 
   echo "Pre-building Triton wheel on $BUILD_NODE_HOST via tsp"
