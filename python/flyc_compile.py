@@ -24,12 +24,15 @@ from the launcher's own signature (`synthesise_args`) and calls it directly
 — no host marshalling, no fabricated tensors, no kernel-specific shapes.
 """
 
+import ast
 import dataclasses
 import importlib.util
+import inspect
 import json
 import re
 import subprocess
 import sys
+import textwrap
 import types
 from argparse import ArgumentParser
 from multiprocessing import Process, Queue
@@ -264,13 +267,13 @@ class FakeTensor:
         return 0
 
 
-def _operand_for(param, desc=None):
+def _operand_for(param, desc=None, alignment=None):
     """The AOT value for one launcher parameter, derived from its annotation
     alone -- the whole of this driver's kernel knowledge.
 
     | annotation | value |
     |---|---|
-    | `Pointer` | `flyc.from_c_void_p(desc.dtype if desc else fx.Uint8, 0)` |
+    | `Pointer` | `flyc.from_c_void_p(desc.dtype if desc else fx.Uint8, 0, assumed_align=alignment)` |
     | `Int32`, `Int64` | `0` |
     | `Float32` | `0.0` |
     | `Stream` | `fx.Stream(None)` |
@@ -280,10 +283,39 @@ def _operand_for(param, desc=None):
 
     `desc` is a `FakeTensor` descriptor, optional and unused in Phase 1 (every
     gfx1201 operand is `fx.Pointer`, so `flyc.from_c_void_p(fx.Uint8, 0)`
-    suffices -- the pointer element type is provably inert, see `FakeTensor`'s
+    suffices -- the pointer element *type* is provably inert, see `FakeTensor`'s
     docstring). It exists for the `fx.Tensor` row, which needs `desc.dtype`
     (and, once implemented, `desc`'s rank/shape/strides) rather than a bare
     default.
+
+    ---------------------------------------------------------------------
+    `alignment`: the one part of a pointer operand that is NOT inert
+    ---------------------------------------------------------------------
+
+    `alignment` is the declared byte alignment of the pointer -- AOTriton's
+    `:16` divisibility suffix, resolved by `_pointer_alignments`. `None` means
+    "not declared", and leaves FlyDSL's own default in place
+    (`PointerJitArg._trivial_alignment_bytes`: the element type's byte width,
+    so 1 for the `fx.Uint8` stand-in).
+
+    This is a separate parameter from `desc` on purpose. The element type is
+    inert because it reaches only the discarded host function signature; the
+    alignment is not, because it reaches the *device* IR through
+    `PointerType.get(elem_ty, address_space, alignment)`. gfx950 is where the
+    difference became visible: `flash_attn_utils._make_rebased_view` rebases
+    Q/K/V/O onto a buffer view built with `alignment=base_iter.alignment` and
+    the kernel's own bf16 element type, and `PointerType` rejects an alignment
+    that is not a multiple of the element byte size --
+
+        ValueError: alignment must be a positive multiple of element byte
+        size (2), got 1
+
+    -- so the `fx.Uint8` stand-in's trivial alignment of 1 is not merely
+    pessimistic there, it is a hard compile failure. Under-declaring is a
+    silent performance loss on any kernel that vectorises its global loads;
+    over-declaring is a correctness bug. Hence: take the number from the ATI
+    declaration, which is the same promise the Triton backend already compiles
+    against, rather than picking a constant here.
 
     This is also the loud-stop this driver owes a launcher it cannot honestly
     synthesise for -- folded in here rather than kept as a separate
@@ -296,7 +328,7 @@ def _operand_for(param, desc=None):
     name = getattr(param.annotation, '__name__', str(param.annotation))
     if name == 'Pointer':
         dtype = desc.dtype if desc is not None else fx.Uint8
-        return flyc.from_c_void_p(dtype, 0)
+        return flyc.from_c_void_p(dtype, 0, assumed_align=alignment)
     if name in ('Int32', 'Int64'):
         return 0
     if name == 'Float32':
@@ -331,14 +363,160 @@ def _operand_for(param, desc=None):
     )
 
 
-def synthesise_args(jf):
-    """The positional argument list for one traced call of `jf`, built purely
-    from `jf`'s own signature -- no functional, no choices, no shapes. See
-    `_operand_for` for the per-parameter rule; Phase 1 passes `desc=None`
-    everywhere, since every gfx1201 launcher parameter is `fx.Pointer` or a
-    plain scalar/stream.
+def _divisibility_of(ati_dtype):
+    """The `:N` divisibility suffix of a literal ATI type string, or `None`.
+
+    `'*bf16:16'` -> 16, `'*u64'` -> None. The suffix means exactly what it
+    means in a Triton signature -- "this value is a multiple of N" (see
+    `ir/typed_choice.py`'s note on `u64:16`) -- which for a pointer is a
+    statement about its address, i.e. its alignment in bytes.
+
+    A rank suffix (`'*fp32:16[2]'`, see `typed_choice.parse`) is stripped
+    first: it describes the operand's arity, not its address.
     """
-    return [_operand_for(p) for p in _launcher_signature(jf).parameters.values()]
+    if not isinstance(ati_dtype, str):
+        return None
+    head = ati_dtype.split('[', 1)[0]
+    _, _, suffix = head.rpartition(':')
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _pointer_alignments(node, choices):
+    """`{KERNEL parameter name: declared byte alignment}` for every pointer
+    the ATI description declares -- the promise AOTriton already makes to the
+    Triton backend, restated for FlyDSL.
+
+    The keys are kernel parameter names (`@ati.tensor`'s `wires_to`), NOT
+    launcher parameter names: the two are different name spaces and gfx950
+    renames between them. `_launcher_alignments` is what rekeys this map onto
+    the signature `synthesise_args` actually builds against.
+
+    Only `@ati.tensor` operands appear. A parameter absent from the result
+    (every stride, scalar, and the stream) has no declared alignment and gets
+    FlyDSL's default; see `_operand_for`'s `alignment` note for why the
+    distinction matters.
+
+    Two kinds of `@ati.tensor` dtype have to be resolved differently:
+
+    * A **literal** (`'*fp32:16'`, `'*u64'`) carries its own divisibility, so
+      `_divisibility_of` reads it straight off the declaration.
+    * A **type variable** (`T_io`) does not: the concrete string lives in the
+      functional, and reaches this driver only through `--signature`, keyed by
+      the variable's `signature_name` (`@ati.type_var('T_io', ...,
+      signature_name='Q')`). `node.dtype_vars` is empty here -- this is the
+      *parser* node, and type variables are attached by the linker, which this
+      driver never runs -- so the signature name cannot be looked up directly.
+      What is available is that `signature_name` always names one of the
+      tensors the variable governs, and every tensor in a group shares the one
+      resolved string. So: probe the group's own argument names against
+      `choices`, and the key that is present is the signature name.
+
+    A group with no key in `choices` is not an error -- it is a variable the
+    functional does not vary, e.g. `T_u64` for the philox pointers, which
+    carries no divisibility suffix anyway and would resolve to `None`.
+    """
+    groups = {}
+    for t in node.tensors:
+        groups.setdefault(t.dtype, []).append(t)
+
+    alignments = {}
+    for dtype, tensors in groups.items():
+        resolved = dtype
+        if not _is_literal_ati_dtype(dtype):
+            resolved = None
+            for t in tensors:
+                try:
+                    resolved = choices.arg(t.arg_name)
+                except KeyError:
+                    continue
+                break
+        align = _divisibility_of(resolved)
+        if align is None:
+            continue
+        for t in tensors:
+            for aname in t.arg_names:
+                alignments[aname] = align
+    return alignments
+
+
+def _is_literal_ati_dtype(dtype):
+    """Whether an `@ati.tensor` dtype is a literal type string rather than the
+    name of a type variable. `TensorSpec.is_literal_dtype` is the same test;
+    it is re-expressed here because this driver reads the parser node, where
+    that property is computed from the same leading `'*'`."""
+    return isinstance(dtype, str) and dtype.startswith('*')
+
+
+def _launcher_to_kernel_names(jf, kf):
+    """`{launcher parameter name: kernel parameter name}`, read off the one
+    call the launcher makes to its kernel.
+
+    The two signatures are different name spaces, and nothing in the ATI
+    description bridges them: `@ati.tensor(..., wires_to='B')` names the
+    *kernel* parameter, while `synthesise_args` builds values for the
+    *launcher* parameters (`_launcher_signature`). On gfx1201 the bridge is the
+    identity and the distinction is invisible; gfx950's launcher takes `Bias`
+    and passes it to the kernel's `B`, so a map keyed by one name space silently
+    misses that operand when applied to the other -- for alignment that is an
+    under-declaration, not a build failure, which is exactly the kind of gap
+    that survives a green build.
+
+    The call site is the only place the correspondence is written down, so read
+    it from there rather than keeping a rename table here: a table would be
+    per-arch kernel knowledge in a driver whose whole point is not to have any,
+    and it would go stale silently the next time a vendored launcher renames a
+    parameter.
+
+    Positional arguments only, and only those that are a bare name -- an
+    argument that is any other expression is not a launcher parameter and has
+    no entry. Keyword arguments are skipped too: at both call sites they carry
+    compiler attributes (`value_attrs=`), not operands.
+    """
+    kernel_name = kf._func.__name__
+    src = textwrap.dedent(inspect.getsource(jf.func))
+    calls = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == kernel_name]
+    if len(calls) != 1:
+        raise RuntimeError(
+            f'_launcher_to_kernel_names: expected exactly one call to '
+            f'{kernel_name!r} in {jf.func.__name__!r}, found {len(calls)}. '
+            f'The launcher-to-kernel parameter correspondence is read off that '
+            f'call; with none there is nothing to read, and with several there '
+            f'is no single answer.')
+    call = calls[0]
+
+    kernel_params = list(inspect.signature(kf._func).parameters)
+    if len(call.args) > len(kernel_params):
+        raise RuntimeError(
+            f'_launcher_to_kernel_names: {jf.func.__name__!r} passes '
+            f'{len(call.args)} positional arguments to {kernel_name!r}, which '
+            f'declares {len(kernel_params)} parameters.')
+    return {a.id: kernel_params[i] for i, a in enumerate(call.args)
+            if isinstance(a, ast.Name)}
+
+
+def _launcher_alignments(jf, kf, node, choices):
+    """`_pointer_alignments` rekeyed from kernel names onto launcher names, so
+    it can be looked up by `synthesise_args`. A kernel parameter the launcher
+    does not forward by name simply has no entry, same as an undeclared one."""
+    kernel_alignments = _pointer_alignments(node, choices)
+    return {launcher_name: kernel_alignments[kernel_name]
+            for launcher_name, kernel_name
+            in _launcher_to_kernel_names(jf, kf).items()
+            if kernel_name in kernel_alignments}
+
+
+def synthesise_args(jf, alignments=None):
+    """The positional argument list for one traced call of `jf`, built from
+    `jf`'s own signature plus the pointer alignments the ATI description
+    declares -- no shapes, no functional beyond those. See `_operand_for` for
+    the per-parameter rule; `desc` is `None` everywhere, since every launcher
+    parameter is `fx.Pointer` or a plain scalar/stream/constexpr.
+    """
+    alignments = alignments or {}
+    return [_operand_for(p, alignment=alignments.get(p.name))
+            for p in _launcher_signature(jf).parameters.values()]
 
 
 # Natural (unpacked, no interleaving/padding) byte size of each annotation
@@ -742,7 +920,7 @@ def do_compile(args):
     # name -- true here, since this driver compiles exactly one kernel per
     # invocation.
     kf._name = args.kernel_name
-    launch_args = synthesise_args(jf)
+    launch_args = synthesise_args(jf, _launcher_alignments(jf, kf, node, choices))
     jf(*launch_args)  # COMPILE_ONLY=1 -> traces and compiles, returns None, launches nothing
     hsaco = _extract_hsaco(jf)
     # BLOCK_SIZE is a *declared* value (`@flyc.kernel(known_block_size=...)`),
