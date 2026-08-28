@@ -510,6 +510,12 @@ build_one_subject() {
 # The original default, /opt/perfmon/rocm-<ver>, was a path nothing in this
 # repo ever writes, so it could only fail -- which is what the build node
 # reported.
+# TODO (long term, not scheduled): the rocm-${ROCM} level here exists only
+# because perfmon_core links HIP as one indivisible library. Once it is split
+# into ROCm-dependent and CPU-only halves (see perfmon/core/CMakeLists.txt),
+# one install can serve several ROCm versions at once and this key goes away --
+# along with the requirement that anything looking for a core install must
+# first know which ROCm version it wants.
 PERFMON_CORE_ROOT="${PERFMON_CORE_ROOT:-${INSTALL_PREFIX}${ARCH}/core/rocm-${ROCM}}"
 
 # Build it if it is not there: leaving it a manual prerequisite meant a

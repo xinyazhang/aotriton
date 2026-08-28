@@ -63,10 +63,32 @@ logger = logging.getLogger(__name__)
 CURRENT_FILE_PATH = Path(__file__).resolve()
 AOTRITON_ROOT = CURRENT_FILE_PATH.parent.parent.parent.absolute()
 
-# R05's shim, which resolves the preset, sets HIP_VISIBLE_DEVICES/ROCM_PATH
-# and exec()s the C++ runner. Spawning the shim rather than the binary keeps
-# GPU selection and environment setup out of both the runner and this file.
-PERFMON_LAUNCHER = AOTRITON_ROOT / 'perfmon' / 'launch_runner.sh'
+
+def perfmon_launcher() -> Path:
+    """R05's shim: it resolves the preset, sets HIP_VISIBLE_DEVICES/ROCM_PATH
+    and exec()s the C++ runner. Spawning the shim rather than the binary keeps
+    GPU selection and environment setup out of both the runner and this file.
+
+    `AOTRITON_PERFMON_ROOT` is REQUIRED -- no fallback, by design. perfmon/ is
+    source beside the package and is never installed with it, so nothing this
+    file can compute from its own location is an answer: the previous fallback,
+    `Path(__file__).parent.parent.parent / 'perfmon'`, silently produced
+    <site-packages>/perfmon on any non-editable install and turned a missing
+    configuration into a confusing ENOENT at spawn time. Whoever starts the
+    worker knows where the checkout is; .tune/remote/worker_service.sh exports
+    it.
+
+    Read per call, not at import, so a variable set after this module is
+    imported still takes effect.
+    """
+    root = os.environ.get('AOTRITON_PERFMON_ROOT')
+    if not root:
+        raise RuntimeError(
+            'AOTRITON_PERFMON_ROOT is not set. It must point at the perfmon/ '
+            'directory of an aotriton checkout (the launcher shim lives there '
+            'and is never installed with the package). '
+            '.tune/remote/worker_service.sh exports it for workers it starts.')
+    return Path(root) / 'launch_runner.sh'
 
 
 def first(line, sep=" "):
@@ -388,7 +410,7 @@ class ExaidPerfmonWorker(ExaidWorker):
             raise RuntimeError('ExaidPerfmonWorker: use_profile() must be called '
                                'before the runner can be launched -- the shim '
                                'needs a preset to resolve a subject.')
-        return [PERFMON_LAUNCHER.as_posix(),
+        return [perfmon_launcher().as_posix(),
                 '--preset', str(self._pending_profile),
                 '--module', self._module_name,
                 '--gpu', str(self._gpu_id)]

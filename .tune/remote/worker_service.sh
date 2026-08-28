@@ -16,6 +16,15 @@ TUNE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # $AOTRITON_ROOT/modules via registry.default_modules_dir()'s cwd fallback)
 cd "$AOTRITON_ROOT"
 
+# perfmon/ is source beside the package, never installed with it, so an
+# installed aotriton cannot find it from its own location -- exaid.py spawning
+# the launcher shim reached <site-packages>/perfmon/launch_runner.sh and
+# failed. This script is where the checkout's path is known, so it says so
+# rather than leaving the worker to infer it. Set for every workload: it costs
+# nothing, and a variable that is only sometimes present is worse to reason
+# about than one that always is.
+export AOTRITON_PERFMON_ROOT="$AOTRITON_ROOT/perfmon"
+
 BROKER_MODULE="aotriton.tune.localq.broker_main"
 GPU_WORKER_MODULE="aotriton.tune.localq.gpu_worker_socket"
 PG_READER_MODULE="aotriton.tune.localq.pg_reader_worker"

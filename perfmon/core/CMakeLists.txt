@@ -168,6 +168,28 @@ perfmon_assert_no_aotriton_includes(perfmon_core)
 # `cmake -DCMAKE_INSTALL_PREFIX=/opt/perfmon/rocm-<ver> ...` -- and every
 # subject built against that ROCm column (T13's build_subject.sh) links the
 # one shared install instead of rebuilding this library per subject.
+# TODO (long term, not scheduled): split this library in two -- the half that
+# needs ROCm, and the half that does not.
+#
+# Today perfmon_core is ONE library that links HIP, so the whole thing is keyed
+# on a ROCm version and the install prefix has to carry it
+# (<install_prefix><arch>/core/rocm-<ver>, build_subject.sh). Everything in
+# here that is pure CPU work -- the line protocol, stats, timing bookkeeping --
+# is dragged along for the ride and rebuilt per ROCm column for no reason.
+#
+# Splitting it would let one build serve several ROCm versions at once, which
+# is the actual goal: measuring the same AOTriton tag across ROCm versions
+# currently means a separate core install per version, and anything that wants
+# to FIND a core install must therefore know the version first. That is a real
+# ordering problem, not a tidiness one -- an attempt to install
+# launch_runner.sh into this prefix (d275246c) was reverted because the shim is
+# what parses the ROCm version out of the preset, so locating the shim under
+# rocm-<ver>/ required the answer the shim exists to produce.
+#
+# This is the same split AOTriton itself wants for libaotriton.so (a CPU-only
+# part and a ROCm-dependent part), and the two should be done as one piece of
+# work rather than twice with different seams.
+
 include(GNUInstallDirs)
 install(TARGETS perfmon_core
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

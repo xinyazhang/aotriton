@@ -217,6 +217,12 @@ if [ "$WORKLOAD" = "perfmon" ]; then
   # production use; repointing it would change where its caches live for no
   # benefit here.
   DOCKER_USER_ARGS+=(-e "HOME=/wkdir/scratch/home")
+  # The arch is a property of the node, and launch_runner.sh needs it to pick a
+  # subject. It prefers this variable and falls back to asking the GPU with
+  # rocm_agent_enumerator, which is right for a hand-run but needless here: the
+  # node's arch is already known, and on a mixed-arch host the fallback answers
+  # for whichever agent enumerates first.
+  DOCKER_USER_ARGS+=(-e "PERFMON_ARCH=$ARCH")
   # A non-root process needs the render group to open /dev/kfd and
   # /dev/dri/renderD*; root did not. Added by GID, and only if the host has
   # such a group, since --group-add on a name that does not exist is a hard
