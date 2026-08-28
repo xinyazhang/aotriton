@@ -97,6 +97,28 @@ if [ "$WORKLOAD" = "perfmon" ]; then
   # press build, and you would silently get an image built to the old value
   # with no indication anything was stale. The server is the only authority on
   # what this image is, so it must not be possible to build a different one.
+  # The image bakes a build user, and that user must be the REMOTE host's --
+  # not this server's. The Dockerfile is generated here, so `id -u` here would
+  # bake the server's uid (e.g. 1000) into an image that runs on a node where
+  # the same person is a different uid (e.g. 1045). The venv would then be
+  # owned by a uid the container never runs as, and every write into it fails
+  # with EACCES.
+  #
+  # PERFMON_BUILD_UID/GID already existed as overrides in the generator; this
+  # is the caller that always should have set them.
+  REMOTE_IDS=$(ssh "$HOSTNAME" 'printf "%s:%s" "$(id -u)" "$(id -g)"')
+  PERFMON_BUILD_UID="${REMOTE_IDS%%:*}"
+  PERFMON_BUILD_GID="${REMOTE_IDS##*:}"
+  case "$PERFMON_BUILD_UID:$PERFMON_BUILD_GID" in
+    [0-9]*:[0-9]*) ;;
+    *)
+      echo "Error: could not read uid:gid from $HOSTNAME (got '$REMOTE_IDS')." >&2
+      exit 1
+      ;;
+  esac
+  echo "Build user on $HOSTNAME: ${PERFMON_BUILD_UID}:${PERFMON_BUILD_GID}"
+  export PERFMON_BUILD_UID PERFMON_BUILD_GID
+
   DOCKERFILE_REL="image.build/Dockerfile.$WORKLOAD.$arch"
   if ! bash "$TUNE_ROOT/lib/create_perfmon_dockerfile.sh" "$WORKDIR" "$arch"; then
     echo "Error: could not generate $DOCKERFILE_REL" >&2
