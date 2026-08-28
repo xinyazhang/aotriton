@@ -10,7 +10,7 @@ specs/operator.py OperatorDecl):
 
 `ati.describe(kernel, *specs)` is the canonical primitive: it introspects the
 kernel's parameter list, validates that the specs claim every argument exactly
-once, and attaches a KernelDecl sidecar (`kernel.__ati_node__`). The stacked-@ form
+once, and attaches a KernelDecl to the kernel (`kernel.__ati_node__`). The stacked-@ form
 lowers to the same path — each `@ati.tensor(...)` returns a spec and the eventual
 `@triton.jit`-adjacent collection is replayed through describe() — so the two
 authoring modes share one implementation and produce an identical KernelDecl.

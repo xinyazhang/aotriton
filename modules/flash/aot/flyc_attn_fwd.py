@@ -348,7 +348,7 @@ def _flyc_fwd_disabled(f):
 # `(num_head_q, cdiv(max_seqlen_q, BLOCK_M), batch)` with block `(BLOCK_SIZE, 1, 1)`.
 # Open question: BLOCK_M/BLOCK_SIZE are FlyDSL KNOBS, and flyc declares no perf axes,
 # so they are not perf fields on the context. They have to reach it some other way —
-# the JSON sidecar folded into the compiled-in metadata is the obvious candidate.
+# the JSON knobs folded into the compiled-in metadata is the obvious candidate.
 #
 # --- item I: functional-axis markers, NOT kernel arguments --------------------
 #
@@ -394,8 +394,8 @@ def flyc_attn_fwd(arch, choices, hints):
 
     Executed by `aotriton.flyc_compile` at build time, in a venv that has flydsl —
     never by the generator, which only reads the decorators above. Returns
-    `(built, sidecar)`: `built` is whatever the builder returns (the driver drives
-    it to a code object), and `sidecar` is a JSON-serialisable dict of whatever
+    `(built, knobs)`: `built` is whatever the builder returns (the driver drives
+    it to a code object), and `knobs` is a JSON-serialisable dict of whatever
     this description wants recorded alongside the hsaco. Here that is
     `asdict(knobs)` — `resolve_knobs` is the only place `block_m` (and everything
     else `flyc_compile`'s Task 3d output needs bar `block_size`, which the driver
@@ -488,9 +488,14 @@ def flyc_attn_fwd(arch, choices, hints):
         assert not knobs.strides_constexpr, \
             'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
 
-        def build():
+        def build(knobs=knobs):
             """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
-            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this.
+
+            `knobs` is bound here as a default rather than captured: the name is
+            rebound to the JSON knob dict below, and a live closure would follow
+            it and hand a `dict` to a function expecting the knob dataclass. The
+            driver calls this with no arguments."""
             from flash_attn_func_gfx1201_aiw import build_flash_attn_func_aiw_module_primary
             return build_flash_attn_func_aiw_module_primary(meta, knobs)
 
@@ -504,10 +509,10 @@ def flyc_attn_fwd(arch, choices, hints):
         # gfx1201's own knob class has no GRID_AXIS_ORDER field (§4.2): the
         # grid has always walked (head, q_tile, seq) here, i.e. HEAD_FASTEST,
         # which csrc's grid_calculator() hardcoded until §4.4. Supply the key
-        # by hand so both arches' sidecars carry it uniformly.
-        sidecar = asdict(knobs)
-        sidecar['GRID_AXIS_ORDER'] = 0  # HEAD_FASTEST; fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST
-        return build, sidecar
+        # by hand so both arches' knob dicts carry it uniformly.
+        knobs = asdict(knobs)  # past here `knobs` is the dict, not the dataclass
+        knobs['GRID_AXIS_ORDER'] = 0  # HEAD_FASTEST; fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST
+        return build, knobs
 
     elif arch == 'gfx950':
         # Same flydsl-free-at-call-time rule as the gfx1201 branch above.

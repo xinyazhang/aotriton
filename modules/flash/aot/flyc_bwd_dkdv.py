@@ -17,8 +17,8 @@ What differs from the forward, beyond the operand list:
   for. AOTriton's Triton `bwd_preprocess` computes exactly that, in fp32, so
   the backend is a metro (`metro_bwd_flyc` in `__init__.py`) that runs the
   Triton preprocess and then this kernel and `flyc_bwd_dq`.
-* **The tile-width sidecar key is derived, not resolved, on this arch.** See
-  the sidecar note at the bottom.
+* **The tile-width knob is derived, not resolved, on this arch.** See the knob
+  note at the bottom.
 """
 
 from dataclasses import asdict
@@ -221,9 +221,14 @@ def flyc_bwd_dkdv(arch, choices, hints):
             f'resolve_knobs returned block_dmodel={knobs.block_dmodel} for '
             f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
 
-        def build():
+        def build(knobs=knobs):
             """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
-            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this.
+
+            `knobs` is bound here as a default rather than captured: the name is
+            rebound to the JSON knob dict below, and a live closure would follow
+            it and hand a `dict` to a function expecting `BwdDkDvKnobs`. The
+            driver calls this with no arguments."""
             from fmha_bwd_dkdv_gfx1201_kernel import build_bwd_dkdv_module_primary
             return build_bwd_dkdv_module_primary(meta, knobs)
 
@@ -234,7 +239,6 @@ def flyc_bwd_dkdv(arch, choices, hints):
         build.flyc_source = 'fmha_bwd_dkdv_gfx1201_kernel.py'
         build.flyc_kernel_name = 'bwd_dkdv_kernel'
 
-        sidecar = asdict(knobs)
         # BLOCK_N is what the grid's x extent divides Max_seqlen_k by, and unlike
         # the dQ kernel's it is NOT a knob: fmha_bwd_dkdv_gfx1201_kernel.py derives
         # it inside the builder as `ROWS_PER_WAVE * NUM_TEAMS`, which would leave
@@ -256,13 +260,18 @@ def flyc_bwd_dkdv(arch, choices, hints):
         # 'block_kv' field for the same concept (see the gfx950 branch below)
         # -- so grid_calculator() reads one key regardless of arch.
         team_waves = 2 * knobs.contraction_shards if knobs.split_head_dim else 1
-        sidecar['block_kv'] = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
+        block_kv = ROWS_PER_WAVE * (knobs.num_waves // team_waves)
+        # Past this line `knobs` is the JSON dict, not BwdDkDvKnobs -- which is
+        # why `build()` above binds the dataclass as a default argument, and why
+        # every field read off it happens before here.
+        knobs = asdict(knobs)
+        knobs['block_kv'] = block_kv
         # gfx1201's own knob class has no GRID_AXIS_ORDER field (§4.2): unlike
         # the forward and dQ, this kernel walks (tile, head, seq) --
         # TILE_FASTEST -- because it is one workgroup per KV head with the GQA
         # query heads summed inside; see grid_calculator()'s own comment.
-        sidecar['GRID_AXIS_ORDER'] = 1  # TILE_FASTEST; fmha_tuning_gfx950.GRID_AXIS_TILE_FASTEST
-        return build, sidecar
+        knobs['GRID_AXIS_ORDER'] = 1  # TILE_FASTEST; fmha_tuning_gfx950.GRID_AXIS_TILE_FASTEST
+        return build, knobs
 
     elif arch == 'gfx950':
         from fmha_tuning_bwd_dkdv_gfx950 import BwdDkDvInputMetadata, bwd_dkdv_knobs
@@ -311,8 +320,8 @@ def flyc_bwd_dkdv(arch, choices, hints):
         # already (§4.2) -- no mirroring needed, unlike the gfx1201 branch
         # above. The two arches derive this value differently (gfx950 resolves
         # it as a real knob; gfx1201 has no such field and derives it from
-        # three others, see the sidecar note there), but both land on the same
-        # 'block_kv' sidecar key, so grid_calculator() reads one key regardless
+        # three others, see the note there), but both land on the same
+        # 'block_kv' knob, so grid_calculator() reads one key regardless
         # of arch (see flyc_bwd_dkdv.cc).
         return build, asdict(knobs)
 

@@ -117,7 +117,7 @@ FlycAttnFwdContext::flyc_padded_head() const {
 // the caller; see TritonKernel::invoke.
 //
 // §4.4: the axis order itself is not hardcoded -- both arches' descriptions
-// put HEAD_FASTEST in the sidecar for this kernel today (gfx1201 by literal
+// put HEAD_FASTEST in the knobs for this kernel today (gfx1201 by literal
 // assignment, gfx950 as `Gfx950Knobs.GRID_AXIS_ORDER`, a flat resolved field),
 // but this reads perf() rather than assuming so, per flyc_common.h's
 // flyc_grid_axis_order.

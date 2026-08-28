@@ -89,7 +89,7 @@ FlycBwdDqContext::flyc_padded_head() const {
 // no derivation on the description side.
 //
 // §4.4: as in the forward, the axis order is read from perf() rather than
-// assumed -- both arches' descriptions put HEAD_FASTEST in the sidecar for
+// assumed -- both arches' descriptions put HEAD_FASTEST in the knobs for
 // this kernel today, but the switch below is what makes that a fact this
 // function checks rather than one it silently depends on.
 dim3
