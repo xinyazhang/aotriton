@@ -160,7 +160,7 @@ flyc_round_up_rung(int32_t hdim, const int16_t* table, int count) {
 // §4.4: the two axis orders a flyc grid can walk, mirrored (same names, same
 // integer values) from FlyDSL's fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST /
 // GRID_AXIS_TILE_FASTEST. Every flyc description (Phase C, §4.2) puts one of
-// these two values into its sidecar under 'GRID_AXIS_ORDER' -- gfx1201's by a
+// these two values into its knobs under 'GRID_AXIS_ORDER' -- gfx1201's by a
 // literal assignment (there is no upstream knob to carry it), gfx950's as a
 // flat field `resolve()` already produces -- so a grid_calculator() reads one
 // perf() key and switches, instead of assuming a fixed order that only held

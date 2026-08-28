@@ -238,7 +238,7 @@ class RootGenerator(object):
             #
             # `hsacos` here is the same shape as Triton's `ksg.this_repo.get_data('hsaco')`
             # above ({functional: [ksig, ...]}), populated by FlycTuneCodeGenerator via
-            # HsacoRegistry -- flyc's KernelSignature already carries the sidecar-derived
+            # HsacoRegistry -- flyc's KernelSignature already carries the knob-derived
             # perf() string (Task 2/3), so no separate FlycKernelSignature construction is
             # needed here any more. Disabled functionals never reach this dict: they are
             # filtered out in FlycShimGenerator.create_sub_generator (the description's

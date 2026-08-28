@@ -106,8 +106,8 @@ FlycBwdDkdvContext::flyc_padded_head() const {
 // The KV tile size is also NOT resolved the same way on both arches -- on
 // gfx1201 it is not a resolve_knobs output at all, but BLOCK_N derived by
 // this file's own description as `ROWS_PER_WAVE * NUM_TEAMS` (see the
-// sidecar note in modules/flash/aot/flyc_bwd_dkdv.py); on gfx950 it IS a flat
-// resolved field, `BwdDkDvKnobs.block_kv`. Both land under the same sidecar
+// knob note in modules/flash/aot/flyc_bwd_dkdv.py); on gfx950 it IS a flat
+// resolved field, `BwdDkDvKnobs.block_kv`. Both land under the same knob
 // key, 'block_kv', normalised in Python (the derivation differs; the wire
 // concept and its name do not), so this reads exactly one key.
 dim3

@@ -23,7 +23,7 @@ nothing else can supply. Its description uses the stacked-@ form:
         ...
         build.flyc_source = 'flash_attn_func_gfx1201_aiw.py'   # relative to modules/flash/flyc/
         build.flyc_kernel_name = 'flash_attn_func_aiw_kernel'  # the @flyc.kernel def's own name
-        return build, sidecar
+        return build, knobs
 
 These produce passive spec records; specs/flyc.py collects them into a FlycDecl.
 Phase 1: no build, no codegen — the description exists so `aotriton.flyc_compile`

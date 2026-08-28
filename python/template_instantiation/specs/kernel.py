@@ -20,7 +20,7 @@ from .node import BuildableDecl
 
 @dataclass(kw_only=True)
 class KernelDecl(BuildableDecl):
-    """The ATI sidecar attached to a Triton kernel as `kernel.__ati_node__`.
+    """The ATI node attached to a Triton kernel as `kernel.__ati_node__`.
 
     Adds NOTHING to `BuildableDecl` (specs/node.py) — a Triton description's
     fields are exactly the set both backends share, which is why the base holds

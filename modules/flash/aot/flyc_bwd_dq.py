@@ -155,9 +155,14 @@ def flyc_bwd_dq(arch, choices, hints):
             f'resolve_knobs returned block_dmodel={knobs.block_dmodel} for '
             f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
 
-        def build():
+        def build(knobs=knobs):
             """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
-            so ONLY `aotriton.flyc_compile` (run by ninja) may call this."""
+            so ONLY `aotriton.flyc_compile` (run by ninja) may call this.
+
+            `knobs` is bound here as a default rather than captured: the name is
+            rebound to the JSON knob dict below, and a live closure would follow
+            it and hand a `dict` to a function expecting `BwdDqKnobs`. The driver
+            calls this with no arguments."""
             from fmha_bwd_dq_gfx1201_kernel import build_bwd_dq_module_primary
             return build_bwd_dq_module_primary(meta, knobs)
 
@@ -168,14 +173,14 @@ def flyc_bwd_dq(arch, choices, hints):
         build.flyc_source = 'fmha_bwd_dq_gfx1201_kernel.py'
         build.flyc_kernel_name = 'bwd_dq_kernel'
 
-        # `block_m` is already a knob here, so the sidecar needs nothing added
-        # for it -- unlike flyc_bwd_dkdv.py, which has to re-derive its grid's
+        # `block_m` is already a knob here, so the dict needs nothing added for
+        # it -- unlike flyc_bwd_dkdv.py, which has to re-derive its grid's
         # block_n. `GRID_AXIS_ORDER` still needs supplying by hand though:
         # gfx1201's BwdDqKnobs has no such field (§4.2), and this kernel walks
         # (head, q_tile, seq) -- HEAD_FASTEST -- same as the forward.
-        sidecar = asdict(knobs)
-        sidecar['GRID_AXIS_ORDER'] = 0  # HEAD_FASTEST; fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST
-        return build, sidecar
+        knobs = asdict(knobs)  # past here `knobs` is the dict, not BwdDqKnobs
+        knobs['GRID_AXIS_ORDER'] = 0  # HEAD_FASTEST; fmha_tuning_gfx950.GRID_AXIS_HEAD_FASTEST
+        return build, knobs
 
     elif arch == 'gfx950':
         from fmha_tuning_bwd_dq_gfx950 import bwd_dq_knobs

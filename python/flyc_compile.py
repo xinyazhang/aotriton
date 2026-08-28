@@ -16,7 +16,7 @@ Invoked as `python -m aotriton.flyc_compile`:
 
 **Kernel-agnostic by construction.** This module drives *any*
 `@ati.flyc.kernel` description through `fn.__ati_node__` (`source_path`,
-`hints()`) and the plain `fn(arch, choices, hints) -> (build, sidecar)` call
+`hints()`) and the plain `fn(arch, choices, hints) -> (build, knobs)` call
 — it does not import a specific kernel family's tuning module, and nothing
 here names a specific kernel. It enters at the `@flyc.jit` `JitFunction`
 `build()` produces (`jit_function_of`), synthesises typed dummy arguments
@@ -905,8 +905,8 @@ def do_compile(args):
     # method it grows must be answered by both backings.
     choices = MappingChoiceView(parse_pon(args.signature, sep=' '))
     hints = _build_hints(node, args.hints)
-    # The description body returns (built, sidecar): `built` is the FlyDSL
-    # builder's result (driven to a code object below); `sidecar` is a
+    # The description body returns (built, knobs): `built` is the FlyDSL
+    # builder's result (driven to a code object below); `knobs` is a
     # JSON-serialisable dict of whatever it wants recorded alongside the hsaco
     # (for flyc_attn_fwd, asdict(knobs) -- including block_m). The driver stays
     # kernel-agnostic: it serialises the dict without knowing what is in it.
@@ -916,7 +916,7 @@ def do_compile(args):
     # `args.target` is the builder's first argument (item F): every flyc
     # description takes (arch, choices, hints), arch arriving first, not
     # smuggled into choices.
-    build, sidecar = fn(args.target, choices, hints)
+    build, knobs = fn(args.target, choices, hints)
     built = build()
 
     jf = jit_function_of(built)
@@ -969,7 +969,7 @@ def do_compile(args):
     warp_size = AOTRITON_ARCH_WARPSIZE[args.target]
     assert block_size % warp_size == 0, (
         f'block_size={block_size} is not a multiple of warp_size={warp_size}; '
-        f'cannot derive num_warps for the aks2 sidecar (aotriton.aks2 needs '
+        f'cannot derive num_warps for the aks2 entry (aotriton.aks2 needs '
         f"j['num_warps'] * j['warp_size'] == block_threads)."
     )
     num_warps = block_size // warp_size
@@ -1004,12 +1004,12 @@ def do_compile(args):
         'static_lds': meta['shared'],
         'signature': args.signature,
         'hints': args.hints,
-        'sidecar': sidecar,
-        # block_m rides in the sidecar dict (it is resolved and used by the
+        'knobs': knobs,
+        # block_m rides in the knob dict (it is resolved and used by the
         # builder already; it just needed forwarding -- see flyc_attn_fwd.py).
-        # block_size is NOT in the sidecar/knobs; it is the `@flyc.kernel`'s
-        # declared known_block_size, read off the KernelFunction above.
-        'block_m': sidecar.get('block_m') if isinstance(sidecar, dict) else None,
+        # block_size is NOT a knob; it is the `@flyc.kernel`'s declared
+        # known_block_size, read off the KernelFunction above.
+        'block_m': knobs.get('block_m') if isinstance(knobs, dict) else None,
         'block_size': block_size,
     }
     with open(out_path.with_suffix('.json'), 'w') as f:

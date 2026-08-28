@@ -33,7 +33,7 @@ class KernelStub:
     author wrote on the PLACEHOLDER def below @ati.source (e.g. `def attn_fwd(dropout_p:
     'fp32')`), which the finalizer turns into ScalarSpecs. `source_path` is the resolved
     path to the Triton source file (consumed by KernelDecl). `__ati_pending__` / `__ati_node__`
-    are the stacked-@ sidecars describe.py sets on the kernel object (the pending spec
+    are the stacked-@ records describe.py sets on the kernel object (the pending spec
     list during stacking, then the finalized KernelDecl).
 
     The Triton SOURCE file's own annotations are intentionally NOT read — only the
