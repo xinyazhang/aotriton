@@ -220,33 +220,6 @@ RUN su -s /bin/bash ${BUILD_USER} -c '\\
       rocm-sdk init; \\
       echo "Resolved ROCM_PATH=\$(rocm-sdk path --root)"'
 
-# Make the bind-mounted checkout importable as \`aotriton\`, at BUILD time.
-#
-# worker_service.sh launches \`python -m aotriton.tune.localq.*\`, so the
-# package has to be importable or the broker dies at once with
-#     ModuleNotFoundError: No module named 'aotriton'
-#
-# setup.py maps it with package_dir {'aotriton': 'python'}, so a bare
-# PYTHONPATH cannot express it -- the importable name and the directory name
-# differ. A symlink named \`aotriton\` inside site-packages expresses exactly
-# that mapping, which is what an editable install would have written.
-#
-# It is a symlink and not \`pip install -e\` for one reason: this image's build
-# context is image.build/ alone (build_image.sh keeps it COPY-free so the
-# image depends only on the server, never on when the workdir was last
-# deployed), so the source is simply not present at build time for pip to read
-# metadata from. The link is dangling while the image is built and resolves
-# the moment /wkdir is mounted -- and because it points into the mount rather
-# than a copy, a later \`sync_workdir\` is picked up with no rebuild.
-#
-# Deliberately NOT done at container start: that would put a pip run on every
-# worker launch, and would need the venv writable by the runtime user.
-RUN su -s /bin/bash ${BUILD_USER} -c '\\
-      set -eux; \\
-      SP=\$(${VENV}/bin/python -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \\
-      ln -sfn /wkdir/aotriton.src/python "\$SP/aotriton"; \\
-      ls -l "\$SP/aotriton"'
-
 # Auto-activate the venv and derive ROCm's location for every \`docker run\`.
 ENV VIRTUAL_ENV=${VENV}
 ENV PATH="${VENV}/bin:\${PATH}"

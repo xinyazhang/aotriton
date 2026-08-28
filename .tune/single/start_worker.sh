@@ -183,6 +183,46 @@ if [ "$WORKLOAD" = "perfmon" ]; then
   fi
 fi
 
+# --- making `import aotriton` work inside the container -----------------
+#
+# worker_service.sh launches `python -m aotriton.tune.localq.*`, so the
+# package must be importable or the broker dies at once with
+#     Error while finding module specification for
+#     'aotriton.tune.localq.broker_main' (ModuleNotFoundError: No module
+#     named 'aotriton')
+#
+# setup.py maps it with package_dir {'aotriton': 'python'} -- the importable
+# name and the directory name differ -- so PYTHONPATH cannot express it and
+# only an install will do.
+#
+# Done HERE, at container launch, and deliberately NOT baked into the image:
+# aotriton.src arrives as a bind mount, so it does not exist when the image is
+# built, and the perfmon image's build context is image.build/ alone (kept
+# COPY-free so the image depends only on the server, never on when the workdir
+# was last deployed). Installing at launch is also what keeps the container
+# tracking the mounted checkout rather than a copy frozen at build time.
+#
+# Guarded by an import check, so a restart on an existing container costs
+# nothing; an editable install keeps pointing at the mount, so a later
+# sync_workdir needs no reinstall.
+#
+# --no-deps is load-bearing: the perfmon venv is deliberately torch-free
+# (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
+# exactly how torch would come back.
+#
+# This works only because the venv is owned by the uid the container runs as
+# -- the image bakes the REMOTE host's uid (build_image.sh) and --user passes
+# the same one below. With the server's uid baked in, as it was, pip would
+# fail with EACCES inside site-packages.
+#
+# perfmon only. The tuning image installs its requirements at build time and
+# works today; adding a pip step there would be an untested change to a path
+# in production use.
+PKG_SETUP=""
+if [ "$WORKLOAD" = "perfmon" ]; then
+  PKG_SETUP="{ python -c 'import aotriton' 2>/dev/null || python -m pip install -q -e . --no-deps ; } && "
+fi
+
 set -x
 WORKER_CONTAINER_ID=$(docker run -d \
   --init \
@@ -198,7 +238,7 @@ WORKER_CONTAINER_ID=$(docker run -d \
   -e PYTHONPYCACHEPREFIX=/wkdir/run/pycache \
   --mount type=bind,source=$(realpath $WORKER_WORKDIR),target=/wkdir \
   "$WORKER_IMAGE" \
-  bash -c "source /wkdir/config.rc && source \$(dirname \$CELERY_WORKER_PYTHON)/activate && cd /wkdir/aotriton.src && bash .tune/remote/worker_service.sh start /wkdir $ARCH ${EXTRA_ARGS[*]} && exec sleep infinity")
+  bash -c "source /wkdir/config.rc && source \$(dirname \$CELERY_WORKER_PYTHON)/activate && cd /wkdir/aotriton.src && ${PKG_SETUP}bash .tune/remote/worker_service.sh start /wkdir $ARCH ${EXTRA_ARGS[*]} && exec sleep infinity")
 
 if [ -z "$WORKER_CONTAINER_ID" ]; then
   echo "Failed to start container" >&2
