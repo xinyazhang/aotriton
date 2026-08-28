@@ -1755,19 +1755,39 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 init_args.append(zero_acc)
             group_results = init_args
 
-            # **The trip count is the build's, not the argument's.** The group
-            # size is a trait, `_args` checks the runtime head counts against
-            # it, and taking it from there is what keeps MHA free: a bound of
-            # `[0, 1)` is a single-iteration `scf.for` that the canonicaliser
-            # promotes away, so an MHA build emits the pre-B7 body with no
-            # outer loop at all. Built from the runtime `num_head_q //
-            # num_head_k` instead, every MHA caller would pay a loop that
-            # cannot be proven to run once.
+            # **The trip count is the argument's, not the build's** -- the one
+            # place this vendored copy departs from upstream.
+            #
+            # Upstream reads `traits.GQA_GROUP_SIZE`, because it compiles a
+            # kernel per head-count pair: a bound of `[0, 1)` is a
+            # single-iteration `scf.for` the canonicaliser promotes away, so an
+            # MHA build emits the pre-B7 body with no outer loop at all, and
+            # `_args` rejects a launch whose runtime counts disagree with the
+            # build.
+            #
+            # AOTriton has neither half of that. `num_head_q` and `num_head_k`
+            # are kernel arguments, not functional axes, so `flyc_bwd_dkdv.py`
+            # passes `num_heads=1` with no `num_kv_heads` and every compiled
+            # kernel carries `GQA_GROUP_SIZE == 1`; and `_args` is a host-side
+            # launch wrapper the C++ launcher never calls, so nothing catches
+            # the disagreement. The build-time bound therefore folds the loop
+            # away and each workgroup sums only the *first* query head of its
+            # group -- dK and dV short by the rest of the group, dQ untouched
+            # (it is one program per query head and never folds).
+            #
+            # Runtime is what the rest of the parity path already assumes:
+            # `ParityKernelContext.init_thread_mapping` re-derives `gqa_group`
+            # as `num_head_q // num_head_k` for exactly this reason, and
+            # `gqa_q_head_base` -- the head this loop walks from -- is its
+            # answer. Taking the bound from anywhere else is what let the two
+            # drift.
             #
             # Not `range_constexpr`: that would unroll the whole tile loop
             # `group` times, which is 8 copies of the largest region in the
             # kernel at MQA and would put the wide rungs through the build cap.
-            for g, group_args in range(fx.Index(0), fx.Index(traits.GQA_GROUP_SIZE), fx.Index(1), init=init_args):
+            # It is also no longer available -- the bound is not a constant.
+            gqa_group = fx.Index(ctx.num_head_q) // fx.Index(ctx.num_head_k)
+            for g, group_args in range(fx.Index(0), gqa_group, fx.Index(1), init=init_args):
                 # Point the query side at this head. K, V, dK and dV do not
                 # move, and neither do the accumulators.
                 ctx.retarget_q_head(g)
@@ -1793,13 +1813,29 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 # it: 0.2-0.4% at group 8, once per head against a whole q
                 # walk. A wrong guess here costs a silently zeroed q tile.
                 #
-                # `const_expr`, because at group size 1 there is no previous
-                # head at all -- and that guard is not cosmetic: left
-                # unconditional it measured **1.5% at head_dim 64**, where the
-                # kernel is shortest and a fixed prologue cost shows most.
-                # Every wider rung was within noise, which is exactly the shape
-                # of a constant added to the prologue.
-                if const_expr(traits.GQA_GROUP_SIZE > 1):
+                # Upstream guards this on `const_expr(traits.GQA_GROUP_SIZE >
+                # 1)`, because at group size 1 there is no previous head at all
+                # -- and that guard is not cosmetic: left unconditional it
+                # measured **1.5% at head_dim 64**, where the kernel is
+                # shortest and a fixed prologue cost shows most. Every wider
+                # rung was within noise, which is exactly the shape of a
+                # constant added to the prologue.
+                #
+                # The guard has to follow the trip count it was reading: with
+                # the bound now runtime (see above) there is no build-time
+                # group size to fold against. So it becomes the *exact*
+                # condition rather than a conservative approximation of it --
+                # "is there a previous head", `g != 0`, which is true one
+                # iteration less often than the trait test was and skips the
+                # drain on MHA the same way. `_stagger_extra_barrier_if_one`
+                # in `flash_attn_utils.py` is the same shape, an `scf.if` on a
+                # runtime scalar around `sched_barrier` + `s_barrier`.
+                #
+                # `g` is the `scf.for` induction variable, so the branch is
+                # workgroup-uniform and every wave reaches the same
+                # `s_barrier` -- which is the property a barrier under a branch
+                # needs and the reason this one is safe.
+                if fx.Int32(g) != fx.Int32(0):
                     dualwave._waitcnt_vm_n(0)
                     dualwave._sched_barrier(0)
                     dualwave._s_barrier()

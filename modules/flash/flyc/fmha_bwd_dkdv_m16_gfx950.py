@@ -351,10 +351,35 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(ACC16)]
         if const_expr(bias2 is not None):
             scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(ACC16)]
-        return [
+        out = [
             dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
             for r in range_constexpr(ACC16)
         ]
+        # **A wait state, and this one really is one** -- unlike the `_s_nop(1)`
+        # the two `qk` helpers carry, which the lore file records as perturbing
+        # register allocation rather than supplying a delay.
+        #
+        # `v_exp_f32` is a quarter-rate transcendental: it retires 16 lanes a
+        # cycle, so a VALU consumer issued in the very next slot reads a
+        # partially written destination. CDNA requires one wait state there and
+        # `GCNHazardRecognizer` does not insert it for gfx950, so the schedule
+        # is free to land `v_exp_f32 vN, ..` immediately before the
+        # `v_cvt_pk_bf16_f32` in `_bf16_trunc_pack_v8` that reads `vN` -- and
+        # when it does, that element of the B operand carries the *pre-exp*
+        # score into the dV MFMA. Only the lanes the trans unit had not reached
+        # are wrong, which is why it shows as `kv % 8 < 4` and only for the one
+        # packed element whose producer lost the race.
+        #
+        # `_s_nop` is side-effecting inline asm, so it is an ordering point for
+        # the scheduler: every consumer of these eight results is placed after
+        # it and the gap can no longer be zero. One per score sub-block, which
+        # is eight per loop iteration against 128 MFMAs.
+        #
+        # Found at `block_dmodel=128, mfma_rows=16`, bf16, `BIAS_TYPE=1`, where
+        # the schedule that hits it appears once per iteration: dV came out
+        # about five times the reference on the odd tile's second q group.
+        dualwave._s_nop(1)
+        return out
 
     def dscores(self, p_list, v_dp, delta, keep=None):
         """`dS = P * (dP - delta)`. `dP` is unscaled; `sm_scale` belongs to dK.
