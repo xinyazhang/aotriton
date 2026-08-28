@@ -21,10 +21,15 @@ reuses it for all operations.
 
 Methods:
 
-  `fetch_tasks(arch, batch_size=10, tuning_mode='kernel')`
+  `fetch_tasks(arch, batch_size=10, *, klass, subklass)`
     Atomically claim batch_size pending tasks for arch using SELECT FOR
-    UPDATE SKIP LOCKED.  tuning_mode='op' fetches operator tasks (module
-    LIKE '%_op'); default fetches kernel tasks.  Returns list[Task].
+    UPDATE SKIP LOCKED.  `klass`/`subklass` are the generic queue selectors
+    matched against task_queue.class/.subclass; both are required. The pairs
+    schema.sql permits are ('tune_kernel', 'kernel'), ('tune_kernel', 'op')
+    and ('perf_measure', ''); any other pair can never match.
+    There is no default: a worker must never claim work it cannot execute,
+    so omitting either raises TypeError at the call site.  Returns
+    list[Task].
 
   `mark_completed(task_id, arch)`
     Transition task to 'completed'.

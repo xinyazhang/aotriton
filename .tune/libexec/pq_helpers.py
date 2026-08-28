@@ -82,7 +82,7 @@ def reset_to_pending(conn, row_ids: list[int], tuning_level: str, *,
     Thin wrapper over aotriton.tune.pq.queue.TaskQueue.reset_to_pending, which
     owns the SQL. delete_results stays keyword-only and required here too --
     forwarding it with a default would hide from this layer's callers that it
-    can drop their tuning_results / most_accurate_tuning_results rows.
+    can drop their task_reports / most_accurate_tuning_results rows.
     """
     return TaskQueue(conn).reset_to_pending(row_ids, tuning_level,
                                             delete_results=delete_results)

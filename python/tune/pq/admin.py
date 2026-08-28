@@ -79,15 +79,21 @@ class QueueAdmin:
         """
         List all existing task_queue partitions.
 
+        Partitions live in the `shards` schema, not `public` -- see
+        `create_arch_partition()` in schema.sql. Both the per-arch partitions
+        (`task_queue_<arch>`, themselves partitioned by class) and their
+        per-class leaves (`task_queue_<arch>_<class>`) are returned, ordered
+        so a leaf follows its parent.
+
         Returns:
-            List of partition names
+            List of schema-qualified partition names
         """
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT tablename
+                    SELECT schemaname || '.' || tablename
                     FROM pg_tables
-                    WHERE schemaname = 'public'
+                    WHERE schemaname = 'shards'
                       AND tablename LIKE 'task_queue_%'
                     ORDER BY tablename
                 """)

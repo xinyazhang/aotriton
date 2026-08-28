@@ -75,7 +75,7 @@ def test_load_tune_module_flash_op_no_longer_exists():
 
 # --- Phase 2 step 14 (modular-tune.md): ImplSelector DSL + fetch_tasks -------
 #     highest-risk-area coverage (op.attn_fwd=1 is surface syntax only,
-#     iface_name collisions across levels, fetch_tasks tuning_mode required).
+#     iface_name collisions across levels, fetch_tasks class/subclass required).
 
 def test_implselector_parse_text_roundtrip_prefixed():
     from aotriton.tune.tdesc import ImplSelector
@@ -223,8 +223,8 @@ def test_schema_sql_ddl_parses_and_iface_name_columns_carry_tuning_level():
 
     for name, sql in (('schema.sql', schema_sql), ('materialized_views.sql', mat_views_sql)):
         # Lexical sanity: parens balance (ignoring $$ plpgsql bodies' own
-        # dollar-quoting is not needed here -- schema.sql's only $$ body,
-        # create_arch_partition, is itself paren-balanced).
+        # dollar-quoting is not needed here -- schema.sql's $$ bodies, the
+        # pre-rev2 guard and create_arch_partition, are each paren-balanced).
         assert sql.count('(') == sql.count(')'), f'{name}: unbalanced parentheses'
 
     # CREATE TABLE blocks: split on 'CREATE TABLE' and check each block up to
@@ -255,36 +255,45 @@ def test_schema_sql_ddl_parses_and_iface_name_columns_carry_tuning_level():
                     f'tuning_level:\n{stmt}')
 
 
-def test_fetch_tasks_requires_tuning_mode_keyword():
+def test_fetch_tasks_requires_class_and_subclass_keywords():
     # F16 (modular-tune.md): a kernel worker must never claim an op task and
-    # vice versa. fetch_tasks() must have NO default for tuning_mode so a
-    # caller that forgets to pass it fails fast at the call site instead of
-    # silently defaulting to 'kernel'.
+    # vice versa. fetch_tasks() must have NO default for either selector so a
+    # caller that forgets one fails fast at the call site instead of silently
+    # defaulting to 'kernel'.
+    #
+    # The parameters are named with the GENERIC queue terms class/subclass,
+    # not `tuning_mode`: the queue also carries perf_measure rows, which have
+    # no tuning mode. `tuning_mode` belongs to tuning-specific code only.
     pytest.importorskip('psycopg')
     import inspect
     from aotriton.tune.pq.queue import TaskQueue
 
     sig = inspect.signature(TaskQueue.fetch_tasks)
-    tuning_mode_param = sig.parameters['tuning_mode']
-    assert tuning_mode_param.kind == inspect.Parameter.KEYWORD_ONLY
-    assert tuning_mode_param.default is inspect.Parameter.empty
+    assert 'tuning_mode' not in sig.parameters
+    for name in ('klass', 'subklass'):
+        param = sig.parameters[name]
+        assert param.kind == inspect.Parameter.KEYWORD_ONLY, name
+        assert param.default is inspect.Parameter.empty, name
 
     # A conn is never touched before the missing-keyword TypeError fires.
     task_queue = TaskQueue(conn=None)
     with pytest.raises(TypeError):
         task_queue.fetch_tasks('gfx942', batch_size=1)
+    with pytest.raises(TypeError):
+        task_queue.fetch_tasks('gfx942', batch_size=1, klass='tune_kernel')
 
 
-def test_fetch_tasks_sql_filters_on_tuning_level():
-    # The SQL itself must filter on the denormalized tuning_level column
-    # (not a `module LIKE '%_op'` string-suffix pattern -- the pre-Phase-2
-    # anti-pattern this replaces).
+def test_fetch_tasks_sql_filters_on_subclass_column():
+    # The SQL itself must filter on the denormalized subclass column (the
+    # task_queue column formerly named tuning_level, renamed under perfmon
+    # rev2 R01) -- not a `module LIKE '%_op'` string-suffix pattern -- the
+    # pre-Phase-2 anti-pattern this replaces.
     pytest.importorskip('psycopg')
     import inspect
     from aotriton.tune.pq.queue import TaskQueue
 
     source = inspect.getsource(TaskQueue.fetch_tasks)
-    assert 'tuning_level = %s' in source
+    assert 'subclass = %s' in source
     assert "LIKE '%_op'" not in source
     assert "NOT LIKE '%_op'" not in source
 
@@ -608,10 +617,13 @@ def test_entry_filter_is_the_only_clause_builder():
     assert sql == "task_config->'entry'->'hdim' = %s::jsonb"
     assert params == ['[64, 128]']
 
-    # Optional row filters lead, in a fixed order.
+    # Optional row filters lead, in a fixed order. The `tuning_level=`
+    # keyword argument is unchanged (workload-facing name); only the
+    # underlying task_queue column it targets was renamed to `subclass`
+    # under perfmon rev2 R01.
     sql, params = entry_filter({'hdim': 64}, arch='gfx942',
                                tuning_level='op', module='flash')
-    assert sql.startswith("task_config->>'arch' = %s AND tuning_level = %s "
+    assert sql.startswith("task_config->>'arch' = %s AND subclass = %s "
                           "AND module = %s AND ")
     assert params[:3] == ['gfx942', 'op', 'flash']
 
@@ -624,7 +636,7 @@ def test_no_raw_tuning_db_sql_outside_pq():
     # the point of the tool, not a bypass of the pq layer.
     EXEMPT = {'.tune/bin/psql'}
     offenders = []
-    pat = re.compile(r"FROM (task_queue|tuning_results|best_tuning_results"
+    pat = re.compile(r"FROM (task_queue|task_reports|best_tuning_results"
                      r"|most_accurate_tuning_results)\b|task_config->'entry'")
     for sub in ('webui', 'libexec', 'bin', 'remote'):
         d = _REPO_ROOT / '.tune' / sub

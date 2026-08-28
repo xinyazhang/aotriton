@@ -8,7 +8,7 @@ Tuning Results Storage
 Handles writing individual per-impl-variant benchmark results to PostgreSQL.
 
 Phase 2 (modularization unification, modular-tune.md §4.3/§4.7): the former
-save_tuning_result (kernel level, tuning_results table) / save_optune_result
+save_task_report (kernel level, task_reports table) / save_optune_result
 (op level, optune_results table) pair is unified into a single function and
 a single table -- ImplSelector's iface_name/impl_index replace kernel_name/
 hsaco_index and op_name/backend_index, and tuning_level is stored alongside
@@ -20,14 +20,25 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 
-def save_tuning_result(task_id: str, report: dict, conn) -> None:
+def save_task_report(task_id: str, report: dict, conn) -> None:
     """
-    Save a single tuning result to the database.
+    Save a single task report row to `task_reports`.
+
+    Renamed from save_tuning_result alongside the table (perfmon rev2 R06):
+    this writes the output of any DAG class, not just tuning.
 
     Args:
         task_id: Task ID from task_queue
-        report: Benchmark report dictionary with keys:
-            - tuning_level: 'kernel' | 'op'
+        report: Report dictionary. The first three name the row's place in
+            the (arch, class) shard tree and must be present -- there is no
+            default for any of them, because a report that guessed its own
+            arch or class would land in the wrong shard silently:
+            - arch: GPU architecture, e.g. 'gfx942'
+            - class: 'tune_kernel' | 'perf_measure'
+            - subclass: per-class vocabulary; 'kernel' | 'op' for
+              tune_kernel, '' for perf_measure. The tuning workload calls
+              this its tuning_level and maps it at the call site, which is
+              where the concrete-to-generic translation belongs.
             - iface_name: Interface name (e.g. 'attn_fwd')
             - impl_index: Variant index (HSACO index for kernel level,
               backend index for op level)
@@ -42,7 +53,9 @@ def save_tuning_result(task_id: str, report: dict, conn) -> None:
     """
     with conn.cursor() as cur:
         # Extract fields from report
-        tuning_level = report['tuning_level']
+        arch = report['arch']
+        klass = report['class']
+        subclass = report['subclass']
         iface_name = report['iface_name']
         impl_index = report['impl_index']
         result = report['result']
@@ -52,12 +65,15 @@ def save_tuning_result(task_id: str, report: dict, conn) -> None:
 
         # Insert result using Jsonb type
         cur.execute("""
-            INSERT INTO tuning_results
-                (task_id, tuning_level, iface_name, impl_index, result, result_data, error, gpu_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO task_reports
+                (task_id, arch, class, subclass, iface_name, impl_index,
+                 result, result_data, error, gpu_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             task_id,
-            tuning_level,
+            arch,
+            klass,
+            subclass,
             iface_name,
             impl_index,
             result,
@@ -67,14 +83,14 @@ def save_tuning_result(task_id: str, report: dict, conn) -> None:
         ))
 
 
-def get_task_results(task_id: str, conn, tuning_level: str | None = None) -> list:
+def get_task_results(task_id: str, conn, subclass: str | None = None) -> list:
     """
     Retrieve all results for a task.
 
     Args:
         task_id: Task ID
         conn: PostgreSQL connection (from psycopg.connect)
-        tuning_level: Optional 'kernel' | 'op' filter (None = both levels).
+        subclass: Optional task_reports.subclass filter (None = all).
             Only meaningful for tasks whose iface_name is ambiguous across
             levels; ordinarily a task_id already implies exactly one level
             via its task_queue row.
@@ -85,7 +101,7 @@ def get_task_results(task_id: str, conn, tuning_level: str | None = None) -> lis
     query = """
         SELECT
             id,
-            tuning_level,
+            subclass,
             iface_name,
             impl_index,
             result,
@@ -93,13 +109,13 @@ def get_task_results(task_id: str, conn, tuning_level: str | None = None) -> lis
             error,
             gpu_id,
             created_at
-        FROM tuning_results
+        FROM task_reports
         WHERE task_id = %s
     """
     params = [task_id]
-    if tuning_level is not None:
-        query += " AND tuning_level = %s"
-        params.append(tuning_level)
+    if subclass is not None:
+        query += " AND subclass = %s"
+        params.append(subclass)
     query += " ORDER BY iface_name, impl_index"
 
     with conn.cursor() as cur:
@@ -109,7 +125,7 @@ def get_task_results(task_id: str, conn, tuning_level: str | None = None) -> lis
         for row in cur.fetchall():
             results.append({
                 'id': row[0],
-                'tuning_level': row[1],
+                'subclass': row[1],
                 'iface_name': row[2],
                 'impl_index': row[3],
                 'result': row[4],
@@ -125,7 +141,7 @@ def get_task_results(task_id: str, conn, tuning_level: str | None = None) -> lis
 def get_task_debug_snapshot(conn, task_id: int) -> dict:
     """Every row related to one task_id, for the web UI's Debug page.
 
-    Returns keys: task, tuning_results, best_results, accurate_results,
+    Returns keys: task, task_reports, best_results, accurate_results,
     optune_results, best_optune_results. The last two keep those names because
     the templates use them as labels; both read the unified tables filtered to
     tuning_level = 'op'.
@@ -140,11 +156,11 @@ def get_task_debug_snapshot(conn, task_id: int) -> dict:
         task = cur.fetchone()
 
         cur.execute(
-            'SELECT id, task_id, tuning_level, iface_name, impl_index, result,'
-            ' result_data, error, gpu_id, created_at FROM tuning_results'
-            " WHERE task_id = %s AND tuning_level = 'kernel'"
+            'SELECT id, task_id, subclass, iface_name, impl_index, result,'
+            ' result_data, error, gpu_id, created_at FROM task_reports'
+            " WHERE task_id = %s AND subclass = 'kernel'"
             ' ORDER BY iface_name, impl_index', (task_id,))
-        tuning_results = cur.fetchall()
+        task_reports = cur.fetchall()
 
         cur.execute(
             'SELECT * FROM best_tuning_results WHERE task_id = %s'
@@ -159,9 +175,9 @@ def get_task_debug_snapshot(conn, task_id: int) -> dict:
         accurate_results = cur.fetchall()
 
         cur.execute(
-            'SELECT id, tuning_level, iface_name, impl_index, result, result_data,'
-            ' error, gpu_id, created_at FROM tuning_results'
-            " WHERE task_id = %s AND tuning_level = 'op'"
+            'SELECT id, subclass, iface_name, impl_index, result, result_data,'
+            ' error, gpu_id, created_at FROM task_reports'
+            " WHERE task_id = %s AND subclass = 'op'"
             ' ORDER BY iface_name, impl_index', (task_id,))
         optune_results = cur.fetchall()
 
@@ -173,7 +189,7 @@ def get_task_debug_snapshot(conn, task_id: int) -> dict:
 
     return {
         'task': task,
-        'tuning_results': tuning_results,
+        'task_reports': task_reports,
         'best_results': best_results,
         'accurate_results': accurate_results,
         'optune_results': optune_results,
