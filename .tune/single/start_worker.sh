@@ -263,17 +263,26 @@ fi
 # out of the checkout and into scratch/pip/ -- see the DIST_EXTRA_CONFIG block
 # further up, which writes the config file this reads.
 #
-# Build isolation is left ON (pip's default), so pip fetches setuptools into a
-# throwaway env each launch and the remote host needs an index reachable at
-# container start. --no-build-isolation would remove both, but the perfmon venv
-# has no setuptools of its own to fall back on: it is created by `python -m
-# venv` on python3.13, which stopped seeding setuptools, and
-# create_perfmon_dockerfile.sh only adds pip and the ROCm wheels on top. That
-# is an image change, so it is not made here.
+# Everything this package needs at RUNTIME is already in the venv, put there at
+# image build from requirements-def.txt -- psycopg, dacite and the rest of the
+# DEF's dependencies are common to every workload, so they belong to the image
+# rather than to this step. Without them the worker imports and then dies on
+# the first queue access:
+#     File ".../aotriton/tune/pq/queue.py", line 11, in <module>
+#       import psycopg
+#     ModuleNotFoundError: No module named 'psycopg'
 #
-# --no-deps is load-bearing: the perfmon venv is deliberately torch-free
-# (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
-# exactly how torch would come back.
+# --no-deps is therefore belt-and-braces rather than load-bearing: the package
+# declares no dependencies at all (no install_requires, no [project]
+# .dependencies), so pip has nothing to resolve either way. It stays as a guard
+# -- if a dependency is ever declared, it should be added to requirements-def.txt
+# and installed into the image, not resolved from the network at every launch.
+#
+# Build isolation is left ON (pip's default), so pip fetches setuptools into a
+# throwaway env each launch and the remote host needs a reachable index at
+# container start. --no-build-isolation would remove both and is now viable --
+# requirements.txt brings setuptools and wheel into the venv, which was the
+# blocker -- but it is a separate change and is not made here.
 #
 # Installs into the venv, which means the venv must be writable by the uid the
 # container runs as. That is not automatic: --user makes it the uid of whoever

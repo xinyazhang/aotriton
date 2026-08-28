@@ -75,6 +75,92 @@ if [ -z "$ROCM_VERSION" ]; then
   exit 1
 fi
 
+# DEF runtime dependencies, read from requirements-def.txt rather than listed
+# here, so the framework's dependency set has one home and the tuning image
+# (which pulls the same file in via requirements-tuning.txt) cannot drift from
+# this one.
+#
+# INLINED into the generated Dockerfile rather than COPYied in. Not a style
+# choice: build_image.sh ships this image by piping the Dockerfile alone over
+# ssh (`cat > .../Dockerfile.perfmon.<arch>`) and building with image.build/ as
+# the context, so a COPY has nothing on the far side to copy from. Making one
+# work would mean transferring more files, on a code path the tuning image
+# shares.
+#
+# The consequence is that editing requirements-def.txt requires regenerating
+# and rebuilding the image; no running container picks up a change to it.
+AOTRITON_ROOT="$(cd "$TUNE_ROOT/.." && pwd)"
+DEF_REQUIREMENTS="$AOTRITON_ROOT/requirements-def.txt"
+
+# Flatten a requirements file to a quoted, space-separated package list.
+#
+# `-r` includes are followed rather than rejected, because requirements-def.txt
+# opens with one (-r requirements.txt) -- pip would resolve it from the file's
+# own directory, and there is no such directory inside the image, so it has to
+# happen out here. Resolution is relative to the INCLUDING file, matching pip.
+#
+# Each spec is emitted double-quoted: psycopg[binary,pool] is a glob pattern to
+# the shell that runs pip inside the container, and an unquoted one would be
+# silently eaten if a matching path ever existed.
+flatten_requirements() {
+  local file="$1" depth="${2:-0}" dir line spec
+
+  if [ "$depth" -gt 8 ]; then
+    echo "Error: requirements includes nest more than 8 deep at $file" >&2
+    exit 1
+  fi
+  if [ ! -f "$file" ]; then
+    echo "Error: requirements file not found: $file" >&2
+    exit 1
+  fi
+
+  dir="$(cd "$(dirname "$file")" && pwd)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+
+    case "$line" in
+      -r*|--requirement*)
+        spec="${line#--requirement}"
+        spec="${spec#-r}"
+        spec="${spec#=}"
+        spec="$(printf '%s' "$spec" | sed -e 's/^[[:space:]]*//')"
+        case "$spec" in
+          /*) ;;
+          *) spec="$dir/$spec" ;;
+        esac
+        flatten_requirements "$spec" "$((depth + 1))"
+        ;;
+      .*|/*)
+        # A local path (requirements-dev.txt has ./python/pytest-gpu-lease).
+        # Nothing is copied into this build context, so pip would find no such
+        # directory -- and it would fail deep in the image build rather than
+        # here.
+        echo "Error: $file requests a local path '$line'." >&2
+        echo "       This image's build context holds only the Dockerfile, so" >&2
+        echo "       there is nothing for pip to install from." >&2
+        exit 1
+        ;;
+      -*)
+        echo "Error: unsupported pip option '$line' in $file" >&2
+        echo "       Only package specs and -r includes are inlined." >&2
+        exit 1
+        ;;
+      *)
+        printf '"%s" ' "$line"
+        ;;
+    esac
+  done < "$file"
+}
+
+DEF_PACKAGES="$(flatten_requirements "$DEF_REQUIREMENTS")"
+
+if [ -z "$DEF_PACKAGES" ]; then
+  echo "Error: $DEF_REQUIREMENTS resolved to no packages." >&2
+  exit 1
+fi
+
 # Base image. Falls back to the worker base only because a fresh config.rc
 # already sets it to debian:13; anything else should be set explicitly.
 PERFMON_IMAGE_BASE="${PERFMON_IMAGE_BASE:-${CELERY_WORKER_IMAGE_BASE:-debian:13}}"
@@ -219,6 +305,19 @@ RUN su -s /bin/bash ${BUILD_USER} -c '\\
       python -m pip install --index-url ${PIP_INDEX} "${ROCM_SPEC}"; \\
       rocm-sdk init; \\
       echo "Resolved ROCM_PATH=\$(rocm-sdk path --root)"'
+
+# The DEF's own dependencies (see requirements-def.txt). Installed into the
+# venv at BUILD time because they are common to every DEF workload, not
+# specific to perfmon -- unlike the aotriton package itself, which
+# start_worker.sh installs at container launch so it tracks the bind-mounted
+# checkout.
+#
+# Placed after the ROCm layer so that changing this list re-runs pip over a
+# handful of wheels rather than a multi-gigabyte ROCm download.
+RUN su -s /bin/bash ${BUILD_USER} -c '\\
+      set -eux; \\
+      . ${VENV}/bin/activate; \\
+      python -m pip install ${DEF_PACKAGES}'
 
 # Auto-activate the venv and derive ROCm's location for every \`docker run\`.
 ENV VIRTUAL_ENV=${VENV}
