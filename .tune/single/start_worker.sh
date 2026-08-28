@@ -202,9 +202,17 @@ fi
 # was last deployed). Installing at launch is also what keeps the container
 # tracking the mounted checkout rather than a copy frozen at build time.
 #
-# Guarded by an import check, so a restart on an existing container costs
-# nothing; an editable install keeps pointing at the mount, so a later
-# sync_workdir needs no reinstall.
+# Run UNCONDITIONALLY, not guarded by an `import aotriton` check.
+#
+# An editable install tracks edits to modules it already knows about, but not
+# new ones: `find_packages()` runs at install time and its result is baked
+# into the generated finder, so a package that appears in a later deploy is
+# invisible to an install made before it existed. python/tune/dispatch/ and
+# python/tune/perfmon/ are both recent examples. A guard would therefore keep
+# a container pinned to whatever the checkout looked like the first time it
+# started, which is exactly the staleness the bind mount exists to avoid.
+#
+# The cost is one pip run per container launch, on an already-populated venv.
 #
 # --no-deps is load-bearing: the perfmon venv is deliberately torch-free
 # (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
@@ -220,7 +228,7 @@ fi
 # in production use.
 PKG_SETUP=""
 if [ "$WORKLOAD" = "perfmon" ]; then
-  PKG_SETUP="{ python -c 'import aotriton' 2>/dev/null || python -m pip install -q -e . --no-deps ; } && "
+  PKG_SETUP="python -m pip install -q -e . --no-deps && "
 fi
 
 set -x
