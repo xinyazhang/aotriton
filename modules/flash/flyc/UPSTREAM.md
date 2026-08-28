@@ -110,16 +110,17 @@ fmha_bwd_dq_gfx950.py               backward dQ/dB
 fmha_bwd_dq_m16_gfx950.py           backward dQ/dB, MFMA16 body
 fmha_tuning_bwd_dq_gfx950.py        backward dQ/dB tuning policy
 fmha_traits_gfx950.py               ParityDualwaveTraits + make_traits
-fmha_dualwave_gfx950.py             dual-wave device helpers
+fmha_dualwave_gfx950.py             dual-wave device helpers    (TWO edits -- see 1c)
 fmha_wide_gfx950.py                 wide-tile device helpers
 fmha_mfma16_gfx950.py               MFMA16 addressing constants
 ```
 
-**Eleven of the twelve are byte-identical to upstream and must stay that way**
+**Ten of the twelve are byte-identical to upstream and must stay that way**
 (`diff` each against `git show <commit>:kernels/attention/parity/<basename>` and
-expect empty). The twelfth, `flash_attn_func_gfx950.py`, carries the single
-deletion recorded in "Vendored edits (1c)" below. There are **zero** import
-rewrites for gfx950 — see "Import rewrites (1a)" for why, and what it cost.
+expect empty). The other two, `flash_attn_func_gfx950.py` and
+`fmha_dualwave_gfx950.py`, carry the three edits recorded in "Vendored edits
+(1c)" below. There are **zero** import rewrites for gfx950 — see "Import rewrites
+(1a)" for why, and what it cost.
 
 **Not vendored for gfx950:** `gfx950_standalone.py` (we author our own — see
 below), `kernels/attention/flash_attn_utils.py` (polyfilled — see below), every
@@ -200,18 +201,23 @@ gfx950 needs one more module out of that same source tree:
 and `third_party/flydsl-kernel.txt` is bumped to a tag containing it. Then
 `AOTRITON_FLYDSL_KERNEL_ROOT` goes back to the shallow clone for both arches.
 
-## Vendored edits (1c) — gfx950 only, exactly one
+## Vendored edits (1c) — gfx950 only, exactly three
 
 gfx1201 has none of these; its coupling is all in table 1a. gfx950 inverts that:
-zero import rewrites, one deletion.
+zero import rewrites, one deletion in one file and two changes in another. Both
+of the latter are in the same method, and both exist for the same underlying
+reason — upstream compiles a kernel per shape and AOTriton compiles one binary
+per functional — so read them together.
 
-| file | what is deleted | why | retire when |
+| file | what changes | why | retire when |
 |---|---|---|---|
-| `flash_attn_func_gfx950.py` | the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 45 lines at `7cd69444`: 917–961; was 38 lines at 888–925 at `70b2dbc5`) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1137–1143; was 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
+| `flash_attn_func_gfx950.py` | **deleted:** the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 45 lines at `7cd69444`: 917–961; was 38 lines at 888–925 at `70b2dbc5`) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1137–1143; was 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
+| `fmha_dualwave_gfx950.py` | **added:** `ParityStoreHelper._store_lse_row` is split in two — the vendored body is renamed `_store_lse_row_unguarded` verbatim, and a new `_store_lse_row` wraps it in a `@flyc.jit` `if fx.ptrtoint(LSE) != 0` | AOTriton's LSE output is **optional at runtime** (`attn_fwd_params::L`: *"Can be `T2::get_null_tensor()`"*), and the gfx950 kernel had no null test, so an inference caller's null `L` became a buffer descriptor based at address 0 and the store faulted. See below | upstream adds the guard itself |
+| `fmha_dualwave_gfx950.py` | **changed:** in `_store_lse_row_unguarded`, the head count in LSE's descriptor and row formula is `fx.Index(self.num_head_q)` instead of `traits.NUM_HEADS_Q`; the non-varlen branch spells the production row expression inline rather than delegating to `super()`, since upstream's copy bakes the trait | `NUM_HEADS_Q` is compile-time because upstream compiles per shape. AOT compiles one binary for every head count and pins `num_heads=1`, so the trait made the per-batch slice `1 * tokens`: the batch stride advanced by one head and the buffer bound dropped every head but `h == 0`. `L` came back written for head 0 and NaN elsewhere. The runtime count is already a kernarg, and is what gfx1201 feeds `lse_row_addressing`. See below | upstream takes the head count from the kernarg, **or** AOT stops pinning `num_heads=1` |
 
-Both blocks go, not just the first: leaving the call site would be a `NameError`
-at trace time if SPLITK were ever enabled, which is a worse failure than the
-honest one.
+Both split-K blocks go, not just the first: leaving the call site would be a
+`NameError` at trace time if SPLITK were ever enabled, which is a worse failure
+than the honest one.
 
 **Re-derive the line numbers from the AST on every re-sync; do not trust the
 ones above.** The deletion is verified by:
@@ -231,6 +237,76 @@ diff <(git -C <flydsl checkout> show <commit>:kernels/attention/parity/flash_att
 This costs the zero-vendored-edit property the `gfx950_standalone.py` design
 otherwise achieves, and that is a deliberate trade: in exchange the file has one
 `@flyc.kernel` and neither uniqueness assertion can fire at all.
+
+### The null-`LSE` guard, and why it is not `return_lse`
+
+Upstream already accepts this contract on the *other* arch: gfx1201's
+`flash_attn_func_gfx1201_aiw.py` computes
+`_l_valid = fx.Int64(fx.ptrtoint(L)) != fx.Int64(0)` and folds it into the store
+predicate, with a comment on why the log/scale/addressing all stay inside the
+guard (hoisting them cost 8% at head_dim 256, because the values then stay live
+across the epilogue for every wave — including the ones that never store). The
+gfx950 files simply never grew the equivalent; nothing about the algorithm
+resists it. AOTriton's Triton kernel spells the same contract as `L_not_null`
+(`modules/flash/kernel/fwd_kernel.py`: *"Allows null L for training=False"*).
+
+The knob that looks like it covers this, `return_lse`, does not. It is
+compile-time: `if const_expr(traits.RETURN_LSE)` deletes the store from the
+binary, so `return_lse=False` is not "LSE optional", it is "LSE never written" —
+and one AOT binary has to serve both the caller that wants the LSE and the one
+that passes null. So `modules/flash/aot/flyc_attn_fwd.py` pins `return_lse=True`
+(upstream's `_GFX950_FALLBACK` defaults it to `False`, an inference-production
+default) and the per-launch decision lives here.
+
+One choke point covers both forward bodies and both layouts: `WideStoreHelper`
+subclasses `ParityStoreHelper`, and both of that class's LSE paths funnel
+through `_store_lse_row`, which the wrapper encloses. The condition is
+wave-uniform, so it lowers to a scalar branch.
+
+### The head count in the LSE descriptor
+
+Turning the store on exposed a second, independent defect in the same method,
+and it is worth stating separately because it is the more general one: the
+guard is about a pointer AOTriton may pass as null, this is about a *shape*
+AOTriton cannot know at compile time.
+
+Upstream's `_store_lse_row` sizes LSE's per-batch slice as
+`traits.NUM_HEADS_Q * seq_len_v` and bases the buffer descriptor at
+`LSE + batch_idx * that`. `NUM_HEADS_Q` is a compile-time trait, which is
+correct upstream — a kernel is compiled per shape there. AOT compiles one binary
+for every head count, so `modules/flash/aot/flyc_attn_fwd.py` pins
+`num_heads=1`, on the documented assumption that the trait reaches the emitted
+code only through `STRIDE_TOKEN` (which sits behind `strides_constexpr`, pinned
+`False`). LSE's descriptor was the assumption's counterexample. With
+`NUM_HEADS_Q == 1` the slice covers one head's rows, `batch_idx` advances by one
+head instead of `H`, and the hardware bound silently drops the row for every
+head but the first: `L` comes back written for `h == 0` and untouched — NaN,
+under the test harness's fill — for the rest. Nothing reports an error; the
+launch succeeds.
+
+The real count is already in the kernarg vector as `num_head_q` (the generated
+`flyc_attn_fwd_pp_args_0` passes it, and `ParityKernelContext` stores it as
+`self.num_head_q`, which the store helper inherits via
+`DualwaveKernelContext.__dict__` copy-construction). Using it costs two scalar
+ops and leaves the stores themselves untouched. It is also what gfx1201 does:
+its `fmha.lse_row_addressing` call sites pass the runtime `num_head_q`, which is
+why gfx1201's identical `num_heads=1` pin is sound.
+
+The non-varlen branch stops delegating to `super()` as part of this: upstream's
+copy in `flash_attn_utils.py` is where the trait is baked, so there is nothing
+left to inherit. It now spells the production row expression
+(`q_head_idx * seq_len_v + q_row`) inline — three lines, unchanged in meaning —
+while sharing the corrected descriptor with the varlen branch.
+
+Re-sync check — the vendored body must still be byte-identical apart from these:
+
+```bash
+diff <(git -C <flydsl checkout> show <commit>:kernels/attention/parity/fmha_dualwave_gfx950.py) \
+     modules/flash/flyc/fmha_dualwave_gfx950.py
+# expect ONLY: the added `_store_lse_row` wrapper; the `def` line of the
+# original renamed to `_store_lse_row_unguarded`; and inside it, the head-count
+# and non-varlen-branch changes described above.
+```
 
 ## Import rewrites (1a) — gfx1201 only; gfx950 has **none**
 
@@ -760,3 +836,43 @@ timing rather than arithmetic/addressing/allocation was the defect.
 `modules/flash/aot/flyc_attn_fwd.py`'s `FLYC_HEAD_DIMS` (gfx950 branch) mirrors
 `LADDER` verbatim, 96 included, on this basis. Retire this note once upstream
 cleans up the comment (flagged upstream as cheap to fix).
+
+### 5. The gfx950 forward has no null-`LSE` guard; gfx1201's has one
+
+`flash_attn_func_gfx1201_aiw.py` tests `fx.ptrtoint(L) != 0` before writing the
+logsumexp, so upstream already treats a null `L` as a supported input on that
+arch. Neither `ParityStoreHelper._store_lse_row` (`fmha_dualwave_gfx950.py`) nor
+`DualwaveStoreHelper._store_lse_row` (`flash_attn_utils.py`) does the same, and
+`return_lse` is not a substitute: it is `const_expr`, so it decides at *compile*
+time whether the store exists at all. A gfx950 build with `return_lse=True`
+therefore faults on the null `L` that AOTriton's own API documents as legal
+(`attn_fwd_params::L`, *"Can be `T2::get_null_tensor()`"*) — the address the
+buffer descriptor gets is 0.
+
+Patched locally in `fmha_dualwave_gfx950.py` (see "Vendored edits (1c)"), which
+covers both forward bodies because `WideStoreHelper` subclasses
+`ParityStoreHelper`. Upstream's own fix belongs one level lower, in
+`flash_attn_utils.py`, where it would also cover the non-parity kernels. Retire
+this note and the vendored edit together, once it lands there.
+
+### 6. The gfx950 LSE descriptor is sized by `traits.NUM_HEADS_Q`
+
+`_store_lse_row` in both `flash_attn_utils.py` and, until the edit in "Vendored
+edits (1c)", `fmha_dualwave_gfx950.py` computes LSE's per-batch slice from the
+compile-time head count. That is fine upstream, where a kernel is compiled per
+shape, and wrong for any AOT consumer: one binary serves every head count, so
+the count has to come from the `num_head_q` kernarg the launcher already passes.
+gfx1201's kernel does exactly that (`fmha.lse_row_addressing` takes it as an
+argument); gfx950's is the odd one out.
+
+The failure is silent — the buffer bound drops the out-of-slice rows, so `L` is
+written for `h == 0` and left untouched for every other head, with the launch
+reporting success. It was invisible while `return_lse` defaulted off (issue 5
+above), which is why the two were found together.
+
+Patched locally alongside the null guard. Upstream's fix belongs in
+`flash_attn_utils.py` for the same reason as issue 5, and would want the same
+treatment in the split-K workspace helpers, which size their slices the same way
+(`flash_attn_utils.py`'s `ws_ml_per_split_elems` and the `o_part`/`ml_row`
+bases). AOTriton pins `num_kv_splits=1`, so those paths are never traced here
+and are left alone.

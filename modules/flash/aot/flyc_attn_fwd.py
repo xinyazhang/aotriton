@@ -518,6 +518,16 @@ def flyc_attn_fwd(arch, choices, hints):
             # See the gfx1201 branch: not a functional axis, unread by
             # resolve() for the same reason (STRIDE_TOKEN sits behind
             # strides_constexpr, pinned False below).
+            #
+            # STRIDE_TOKEN is not the only reader on this arch, though.
+            # Upstream's `_store_lse_row` also sizes LSE's per-batch slice with
+            # `traits.NUM_HEADS_Q`, because upstream compiles a kernel per
+            # shape and AOT cannot. That one is answered in the kernel, which
+            # takes the count off the `num_head_q` kernarg instead
+            # (`ParityStoreHelper._store_lse_row_unguarded`, an edit this
+            # branch made -- see modules/flash/flyc/UPSTREAM.md). Left as the
+            # trait it silently dropped every head but `h == 0`, which only
+            # became visible once `return_lse` below was pinned on.
             num_heads=1,
             head_dim=tile,
             # gfx950's FmhaInputMetadata has no `causal_type` field — only
@@ -544,12 +554,40 @@ def flyc_attn_fwd(arch, choices, hints):
             # declaration above true. Asserted below, not just assumed.
             paged=False,
             num_kv_splits=1,
+            # LSE **is** optional for AOTriton -- `attn_fwd_params::L` is
+            # declared "Can be T2::get_null_tensor()", and an inference caller
+            # passes exactly that -- but it is optional at RUNTIME, decided per
+            # launch by a null-pointer test, the way the Triton kernel's
+            # `L_not_null` and gfx1201's `_l_valid` decide it. `return_lse` is
+            # not that switch: it is a compile-time knob that deletes the store
+            # from the binary, and one AOT binary has to serve both kinds of
+            # caller. So it is pinned on, and the null case is handled in the
+            # kernel (`ParityStoreHelper._store_lse_row`, which this branch
+            # added the guard to -- see modules/flash/flyc/UPSTREAM.md).
+            #
+            # Pinned rather than left alone because upstream's default is
+            # `return_lse=False` -- inference builds do not want the store --
+            # and `_GFX950_FALLBACK` supplies that default for every field the
+            # caller leaves unset. Left unpinned, `fmha_wide_gfx950`'s
+            # `if const_expr(traits.RETURN_LSE)` compiles the store away and
+            # the kernel returns without ever touching a non-null LSE: the
+            # tensor keeps whatever the caller allocated, which the test
+            # harness fills with NaN on purpose, and every case dies on
+            # "L tensor has NaN" with a launch that reported success. gfx1201
+            # has no such knob -- it always emits the store, and guards it --
+            # which is why this is pinned in this branch and not the one above.
+            return_lse=True,
         ).resolve(meta)
         assert knobs.block_dmodel == tile, (
             f'resolve() returned block_dmodel={knobs.block_dmodel} for '
             f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')
         assert not knobs.strides_constexpr, \
-            'num_heads=1 is only safe while STRIDE_TOKEN stays behind strides_constexpr'
+            'num_heads=1 is only safe while STRIDE_TOKEN stays behind ' \
+            'strides_constexpr (the LSE descriptor, the other NUM_HEADS_Q ' \
+            'reader on this arch, is handled in the kernel)'
+        assert knobs.return_lse, \
+            'the LSE store must exist in every AOT binary (null L is a runtime ' \
+            'test, not a build variant); resolve() must not have cleared it'
         assert not knobs.paged and knobs.num_kv_splits == 1, (
             'AOT gfx950 only ever pins paged=False, num_kv_splits=1 -- that pin '
             'is what makes the Workspace/BlockTable/block_table_stride constexpr '
