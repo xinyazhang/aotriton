@@ -91,11 +91,21 @@ if [ ! -x "$RUNNER" ]; then
 fi
 
 # --- GPU mask ------------------------------------------------------------
-# Both spellings: HIP honours HIP_VISIBLE_DEVICES, and ROCR_VISIBLE_DEVICES
-# is what applies the mask at the runtime layer beneath it. The runner then
-# uses device 0 of what it inherits, per R08.
+# HIP_VISIBLE_DEVICES only. The two variables are NOT two spellings of one
+# setting, which is what this used to assume: ROCR_VISIBLE_DEVICES filters
+# first, at the ROCr layer, and HIP_VISIBLE_DEVICES then indexes into whatever
+# ROCr left visible. Setting both to N asks for "device N of the one-device
+# list containing device N", which is out of range for every N except 0:
+#     runner: hipStreamCreate failed: no ROCm-capable device is detected
+# It worked on gpu 0 and on nothing else.
+#
+# ROCR_VISIBLE_DEVICES is actively cleared rather than merely left alone. An
+# inherited one would re-filter underneath this and silently change which
+# physical GPU `--gpu N` means -- the same compounding, just harder to see.
+#
+# The runner then uses device 0 of what it inherits, per R08.
 export HIP_VISIBLE_DEVICES="$GPU"
-export ROCR_VISIBLE_DEVICES="$GPU"
+unset ROCR_VISIBLE_DEVICES
 
 # --- ROCm and the venv ---------------------------------------------------
 # Mirrors /etc/profile.d/perfmon.sh in the perfmon image, and for the same
@@ -133,6 +143,8 @@ if [ -n "${PERFMON_LAUNCH_DEBUG:-}" ]; then
   echo "launch_runner: preset=${PRESET} module=${MODULE} gpu=${GPU}" >&2
   echo "launch_runner: arch=${ARCH} subject=${SUBJECT_DIR}" >&2
   echo "launch_runner: ROCM_PATH=${ROCM_PATH:-<unset>}" >&2
+  echo "launch_runner: HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}" \
+       "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:-<unset>}" >&2
 fi
 
 exec "$RUNNER"
