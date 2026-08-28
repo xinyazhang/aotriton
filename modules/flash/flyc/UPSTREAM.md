@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: 7e258c99  (was caee9257, was 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
+commit: 73718d1c  (was 7e258c99, caee9257, 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
 path:   kernels/attention/parity/
 ```
 
@@ -291,6 +291,35 @@ derives when it is asked to choose — so the description passing
 Because only the dQ code objects changed, this re-sync needed only those
 regenerated, not a full rebuild — see the note at the end of the re-sync
 procedure for why that is a manual step.
+
+## Re-sync cost, measured at `73718d1c`
+
+The second Level-3-driven one, and the counterpart of `7e258c99`: that fixed the
+dQ kernel, this fixes dK/dV. One vendored file changed
+(`fmha_bwd_dkdv_gfx1201_kernel.py`, 17 lines), no tuning module moved, kernarg
+ABI unchanged at 50, no new polyfill symbol, no ATI description change.
+
+`73718d1c` "bound the split's operand by its own role's head dim" is the fix for
+what our Level-3 `test_hdim_qk_ne_vo` failures had narrowed to. Worth recording
+because it is a trap the ATI side cannot see:
+
+Under `split_head_dim` the two wave roles share a tile width — the builder
+asserts `BLOCK_DMODEL == BLOCK_DMODEL_V` — but the *runtime* extents need not
+agree, and the V/dP role was reading V bounded by `hdim_qk`. Upstream's own
+words: "with a wider V it zeroes the columns in `[hdim_qk, hdim_vo)` whose dO is
+live, so dP silently drops them; with a narrower one it leaves columns past
+`hdim_vo` unzeroed". Silently drops, so the symptom was a wrong dK with dV and
+dQ both correct, at a *valid* column rather than an out-of-bounds one.
+
+Measured before the fix, across 12 shapes at one config: dK was wrong exactly
+when `split_head_dim` was on (tile >= 192) **and** `hdim_vo > hdim_qk`.
+`(160,184)`, `(160,192)`, `(128,256)` failed; `(184,160)`, `(224,160)` and every
+sub-192 tile passed regardless of which axis was wider. That pairing is the
+signature to look for if it ever comes back.
+
+AOTriton cannot prevent this from its side: it has ONE `BLOCK_DMODEL` axis, so
+`block_dmodel_v = block_dmodel = tile` is the only thing the description can
+pass, and both real extents necessarily arrive as runtime `hdim_qk`/`hdim_vo`.
 
 ## Re-sync procedure
 
