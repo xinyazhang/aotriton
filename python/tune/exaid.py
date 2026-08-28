@@ -445,7 +445,30 @@ class ExaidPerfmonWorker(ExaidWorker):
         """
         info = self.platform()
         subject_id = info.get('subject_id')
-        if subject_id is None or preset not in subject_id:
+
+        # An ABSENT id is a different failure from a WRONG one, and saying so
+        # is the whole value of this check. `subject_id=''` used to be reported
+        # as "not the subject that was asked for", which sent the reader
+        # looking for a mis-provisioned subject when the runner had simply
+        # never been told who it is: main.cc takes the id from argv[1] and
+        # defaults it to empty, so a launcher that does not pass one produces
+        # this for every subject alike.
+        if not subject_id:
+            self.proxy.shutdown()
+            self._profile = None
+            raise ExaidProfileMismatch(
+                f"runner launched for preset {preset!r} reported no subject_id. "
+                f"launch_runner.sh passes it as argv[1] from the subject's "
+                f"subject_id file; an empty one means this node is running a "
+                f"launcher that predates that, so aotriton.src needs syncing.")
+
+        # Exact equality. This was `preset not in subject_id`, a substring test
+        # from when the two were spelled differently -- which also silently
+        # accepted any id that merely CONTAINED the preset, so a subject named
+        # after a superstring of it would have passed. They are one string now
+        # (build_subject.sh writes the preset as both the directory name and
+        # the id), so there is nothing left to be loose about.
+        if subject_id != preset:
             self.proxy.shutdown()
             self._profile = None
             raise ExaidProfileMismatch(
