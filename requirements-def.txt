@@ -1,0 +1,21 @@
+# Runtime dependencies of the DEF -- the distributed execution framework that
+# is python/tune/{pq,localq,exaid} (perfmon-rev2.md's term). These are what a
+# worker needs to talk to the queue and run a DAG, whatever workload sits on
+# top, so every DEF image installs them: the tuning image via
+# requirements-tuning.txt, the perfmon image by having this list inlined into
+# its generated Dockerfile (.tune/lib/create_perfmon_dockerfile.sh).
+#
+# Was requirements-tuning.txt until the perfmon workload needed the same set.
+# The rename moved it verbatim; pyelftools, msgpack and filelock were dropped
+# afterwards, having no importer anywhere in the tree (filelock arrives via
+# requirements.txt anyway).
+#
+# Keep workload-specific packages OUT. torch and triton are the ones that
+# matter: they are installed from wheels by the tuning image alone, and the
+# perfmon image has no torch at all, because perfmon drives native bin/runner
+# binaries over the exaid protocol rather than running Python kernels. Anything
+# landing here lands in that image too.
+
+-r requirements.txt
+psycopg[binary,pool]  # PostgreSQL adapter for task queue
+dacite

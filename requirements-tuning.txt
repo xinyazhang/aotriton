@@ -1,6 +1,12 @@
--r requirements.txt
-pyelftools
-msgpack
-filelock
-psycopg[binary,pool]  # PostgreSQL adapter for task queue
-dacite
+# Tuning worker dependencies.
+#
+# Everything here is now the DEF's -- the distributed execution framework of
+# python/tune/{pq,localq,exaid} (perfmon-rev2.md's term) -- which every workload
+# runs on, not just tuning. The list moved to requirements-def.txt so the
+# perfmon image can install the same set without pulling in a file named for a
+# workload it does not run.
+#
+# Kept as a separate file rather than deleted: .tune/lib/create_dockerfile.sh
+# installs it by name, and a tuning-only dependency would belong here rather
+# than in every DEF image.
+-r requirements-def.txt
