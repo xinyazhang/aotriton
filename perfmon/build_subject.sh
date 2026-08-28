@@ -179,12 +179,18 @@ fi
 ORIGIN="https://github.com/ROCm/aotriton.git"
 SRC_PREFIX="${TMPDIR:-/tmp}/perfmon-src/"
 BUILD_PREFIX="${TMPDIR:-/tmp}/perfmon-build/"
+# Shared by every tag and arch, unlike the two prefixes above: an asset name
+# is unique across releases and the images are arch-GROUP-specific at most, so
+# one download serves the fleet. Not a prefix for the same reason -- nothing is
+# appended to it.
+CACHE_DIR="${TMPDIR:-/tmp}/perfmon-cache"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --origin)       ORIGIN="$2"; shift 2 ;;
     --src_prefix)   SRC_PREFIX="$2"; shift 2 ;;
     --build_prefix) BUILD_PREFIX="$2"; shift 2 ;;
+    --cache_dir) CACHE_DIR="$2"; shift 2 ;;
     --) shift; break ;;
     -*) echo "Error: unrecognized option: $1" >&2; exit 1 ;;
     *) break ;;
@@ -210,6 +216,10 @@ if [ "$#" -lt 3 ]; then
   echo '                    <install_prefix>: that subtree is rsynced to the' >&2
   echo '                    GPU workers and should hold products only.' >&2
   echo "                    (default: ${BUILD_PREFIX})" >&2
+  echo '  --cache_dir:      where downloaded release tarballs are kept and' >&2
+  echo '                    reused. Shared across tags and arches; nothing is' >&2
+  echo '                    appended, so no trailing slash is needed.' >&2
+  echo "                    (default: ${CACHE_DIR})" >&2
   exit 1
 fi
 
@@ -413,7 +423,11 @@ build_one_subject() {
   fi
 
   echo "[build_subject] ${TAG_BUILD} ${SRC_DIR} ${AOTRITON_ROOT} ${ARCH}" >&2
-  "${TAG_BUILD}" "${SRC_DIR}" "${AOTRITON_ROOT}" "${ARCH}"
+  # Passed by environment, not as a fourth positional: the
+  # `build-<tag>.sh <src_dir> <install_dir> <arch>` contract is implemented
+  # six times over, and release_asset.sh is the only thing that reads it.
+  PERFMON_CACHE_DIR="${CACHE_DIR}" \
+    "${TAG_BUILD}" "${SRC_DIR}" "${AOTRITON_ROOT}" "${ARCH}"
 
   if [ ! -d "${AOTRITON_ROOT}/include/aotriton" ]; then
     echo "[build_subject] ERROR: ${TAG_BUILD} returned success but" \

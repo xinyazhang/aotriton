@@ -32,22 +32,94 @@
 # Note there is no git sha in any of these names -- an earlier version of this
 # code matched on one, which would never have found anything.
 
-# fetch_release_asset <tag> <asset_name> <dest_dir>
+# Where this library lives, resolved at source time: the digest manifest sits
+# beside it, and a build-<tag>.sh runs from wherever the caller happens to be.
+_RELEASE_ASSET_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# _asset_expected_sha256 <asset_name> -- prints the recorded digest, or nothing
+#
+# Matched on the asset NAME alone, which is unique across releases because
+# every one of these names carries its own tag.
+_asset_expected_sha256() {
+  local asset="$1"
+  local manifest="${PERFMON_ASSET_SHA256:-${_RELEASE_ASSET_LIB_DIR}/asset_sha256.txt}"
+  [ -f "${manifest}" ] || return 0
+  awk -v want="${asset}" '$1 !~ /^#/ && $2 == want { print $1; exit }' "${manifest}"
+}
+
+# _verify_asset <file> <asset_name>
+#
+# An asset with no recorded digest WARNS rather than fails: a new tag has to be
+# buildable before anyone has recorded its digests, and refusing would make
+# adding a release a two-step dance. A recorded digest that does not match is a
+# hard failure -- and takes the file with it, so a retry re-downloads instead of
+# finding the bad copy sitting in the cache.
+_verify_asset() {
+  local file="$1" asset="$2" want got
+  want="$(_asset_expected_sha256 "${asset}")"
+
+  if [ -z "${want}" ]; then
+    echo "[release_asset] WARNING: no recorded sha256 for ${asset}; not verified." >&2
+    echo "[release_asset]          Record it with refresh_asset_sha256.sh to make" >&2
+    echo "[release_asset]          this checked." >&2
+    return 0
+  fi
+
+  got="$(sha256sum "${file}" | cut -d\  -f1)"
+  if [ "${got}" != "${want}" ]; then
+    echo "[release_asset] ERROR: sha256 mismatch for ${asset}" >&2
+    echo "[release_asset]        expected ${want}" >&2
+    echo "[release_asset]        got      ${got}" >&2
+    echo "[release_asset]        Removing it. A re-uploaded release needs" >&2
+    echo "[release_asset]        asset_sha256.txt refreshed and reviewed; anything" >&2
+    echo "[release_asset]        else means the bytes are not what was expected." >&2
+    rm -f "${file}"
+    return 1
+  fi
+  echo "[release_asset] sha256 ok: ${asset}" >&2
+}
+
+# fetch_release_asset <tag> <asset_name> <fallback_dir> -- prints the file's PATH
+#
+# PERFMON_CACHE_DIR, when set, is where downloads are kept and looked for. It
+# is shared across tags and arches (asset names are unique, and the images are
+# arch-group- rather than arch-specific), so a tarball is fetched once for the
+# whole fleet rather than once per subject -- these run to several GB for the
+# pre-0.11b releases, which carry the runtime and the images in one file.
+# <fallback_dir> is used when it is unset, which keeps this script usable
+# standalone with no cache configured.
 #
 # PERFMON_IMAGES_TARBALL overrides the download entirely, for a tarball
 # obtained by other means. PERFMON_RELEASE_REPO overrides the repository, for
 # a mirror.
 fetch_release_asset() {
-  local tag="$1" asset="$2" dest="$3"
+  local tag="$1" asset="$2" fallback="$3"
   local repo="${PERFMON_RELEASE_REPO:-ROCm/aotriton}"
 
-  mkdir -p "${dest}"
-
   if [ -n "${PERFMON_IMAGES_TARBALL:-}" ]; then
+    # Deliberately NOT verified: this exists for a tarball obtained by other
+    # means, including one built locally, which has no published digest. The
+    # caller has said which file to use; second-guessing that would leave no
+    # way to use the override at all.
     echo "[release_asset] using PERFMON_IMAGES_TARBALL: ${PERFMON_IMAGES_TARBALL}" >&2
-    cp "${PERFMON_IMAGES_TARBALL}" "${dest}/"
-    basename "${PERFMON_IMAGES_TARBALL}"
+    printf '%s' "${PERFMON_IMAGES_TARBALL}"
     return 0
+  fi
+
+  local dest="${PERFMON_CACHE_DIR:-${fallback}}"
+  mkdir -p "${dest}"
+  local target="${dest}/${asset}"
+
+  if [ -f "${target}" ]; then
+    # Verified on the way out of the cache as well as into it: the check is
+    # cheap next to a multi-GB download, and it is what makes a cache entry
+    # trustworthy after anything else has had a chance to touch it.
+    if _verify_asset "${target}" "${asset}"; then
+      echo "[release_asset] cache hit: ${target}" >&2
+      printf '%s' "${target}"
+      return 0
+    fi
+    echo "[release_asset] cached copy rejected; re-downloading" >&2
   fi
 
   # curl, not the gh CLI: one HTTP GET does not justify that dependency, and
@@ -57,8 +129,12 @@ fetch_release_asset() {
   local auth=()
   [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
+  # Download beside the target and rename on success. An interrupted curl
+  # otherwise leaves a short file at the cache path, which the next run finds
+  # and -- but for the verification above -- would happily untar.
   echo "[release_asset] curl ${url}" >&2
-  if ! curl -fL "${auth[@]}" -o "${dest}/${asset}" "${url}"; then
+  if ! curl -fL "${auth[@]}" -o "${target}.part" "${url}"; then
+    rm -f "${target}.part"
     echo "[release_asset] ERROR: could not download ${url}" >&2
     echo "[release_asset]        If that asset name is wrong for this release," >&2
     echo "[release_asset]        check https://github.com/${repo}/releases/tag/${tag}" >&2
@@ -66,7 +142,10 @@ fetch_release_asset() {
     echo "[release_asset]        download, set PERFMON_IMAGES_TARBALL=/path/to.tar.gz" >&2
     return 1
   fi
-  printf '%s' "${asset}"
+  mv "${target}.part" "${target}"
+
+  _verify_asset "${target}" "${asset}" || return 1
+  printf '%s' "${target}"
 }
 
 # install_images_from_tarball <tarball> <install_dir>

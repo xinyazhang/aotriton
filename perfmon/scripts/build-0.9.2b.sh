@@ -242,10 +242,10 @@ ninja -C "${BUILD_DIR}" install
 ASSET="aotriton-0.9.2b-manylinux_2_28_x86_64-rocm7.0-shared.tar.gz"
 # Under BUILD_DIR, never under INSTALL_DIR: the download is scratch, and
 # everything below the subject dir is rsynced to the GPU workers.
-IMAGES_DL_DIR="${BUILD_DIR}/images-download"
+IMAGES_DL_DIR="${BUILD_DIR}/images-download"   # only used when no PERFMON_CACHE_DIR
 
-TARBALL_NAME="$(fetch_release_asset "0.9.2b" "${ASSET}" "${IMAGES_DL_DIR}")"
-install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"
+TARBALL="$(fetch_release_asset "0.9.2b" "${ASSET}" "${IMAGES_DL_DIR}")"
+install_images_from_tarball "${TARBALL}" "${INSTALL_DIR}"
 
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
   echo "[build-0.9.2b] ERROR: install finished but ${INSTALL_DIR}/include/aotriton is missing." >&2

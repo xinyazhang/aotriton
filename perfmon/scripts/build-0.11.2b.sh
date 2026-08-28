@@ -324,10 +324,10 @@ esac
 ASSET="aotriton-${TAG}-images-amd-${IMAGES_GROUP}.tar.gz"
 # Under BUILD_DIR, never under INSTALL_DIR: the download is scratch, and
 # everything below the subject dir is rsynced to the GPU workers.
-IMAGES_DL_DIR="${BUILD_DIR}/images-download"
+IMAGES_DL_DIR="${BUILD_DIR}/images-download"   # only used when no PERFMON_CACHE_DIR
 
-TARBALL_NAME="$(fetch_release_asset "${TAG}" "${ASSET}" "${IMAGES_DL_DIR}")"
-install_images_from_tarball "${IMAGES_DL_DIR}/${TARBALL_NAME}" "${INSTALL_DIR}"
+TARBALL="$(fetch_release_asset "${TAG}" "${ASSET}" "${IMAGES_DL_DIR}")"
+install_images_from_tarball "${TARBALL}" "${INSTALL_DIR}"
 
 if [ ! -d "${INSTALL_DIR}/include/aotriton" ]; then
   echo "[build-${TAG}] ERROR: build reported success but ${INSTALL_DIR}/include/aotriton is missing." >&2
