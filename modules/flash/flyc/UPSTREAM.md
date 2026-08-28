@@ -6,6 +6,9 @@ throughout this file, because they re-sync independently: a gfx950 re-sync must
 not silently move gfx1201's files, and vice versa. The three files they *share*
 (`fmha_abi_gfx1201.py`, `fmha_common_gfx1201.py`, `philox.py`) are gfx1201's
 by provenance, and pulling them forward for gfx950 moves both arches at once.
+One of the three has been pulled forward — see "The three shared files are not
+all at the gfx1201 commit" below for which, why, and the evidence that gfx1201
+is unaffected.
 
 ## Source
 
@@ -34,6 +37,47 @@ git -C <flydsl checkout> rev-parse HEAD
 git -C <flydsl checkout> branch --show-current
 ```
 
+### The three shared files are not all at the gfx1201 commit
+
+The header says the shared files are gfx1201's by provenance. One of them has
+since been pulled forward, so the per-file truth is:
+
+| shared file | at commit | branch |
+|---|---|---|
+| `fmha_abi_gfx1201.py` | `caee9257` | gfx1201 |
+| `philox.py` | `caee9257` | gfx1201 |
+| `fmha_common_gfx1201.py` | **`7cd69444`** | **gfx950** |
+
+`fmha_common_gfx1201.py` moved because `fmha_dualwave_gfx950.py` at `7cd69444`
+constructs `MaskedAxis(..., bitmask=True)`, and the `caee9257` copy has no such
+keyword — `TypeError: MaskedAxis.__init__() got an unexpected keyword argument
+'bitmask'` at trace time. There is no way to build gfx950 without it.
+
+Pulling it forward moves gfx1201 too, which is why it needed evidence rather
+than an argument. The whole cross-branch delta is five hunks, all inside
+`class MaskedAxis`: `__slots__` gains `"bitmask"`, `__init__` gains
+`bitmask=False`, and `discard` gains a bit-mask fast path guarded by
+
+```python
+if not self.bitmask or self.elem_dtype is None or self.elem_dtype.width != 16 or width % 2:
+```
+
+whose fall-through body is byte-for-byte the old one. So the new behaviour is
+opt-in, and **no gfx1201 vendored file mentions `bitmask` at all** — gfx1201
+cannot reach the new path. Measured, not just argued: compiling all three
+gfx1201 flyc descriptions across 36 configs (`CAUSAL_TYPE` × `PADDED_HEAD` ×
+`BIAS_TYPE`) against the `caee9257` copy and against the `7cd69444` copy gives
+**byte-identical hsacos** for all 24 that compile, and identical failures for
+the 12 causal+bias combinations that do not (those fail the same way on both;
+they are outside the built config space).
+
+The other two shared files were deliberately **not** pulled forward:
+
+* `fmha_abi_gfx1201.py` — the gfx950 delta *removes* `bias_args`, which gfx1201
+  needs and gfx950 does not want. Moving it would be a real gfx1201 regression.
+* `philox.py` — the gfx950 delta is one additive `"gfx950": 32` table entry, and
+  the existing fallback already yields 32 for gfx950. No behaviour to gain.
+
 ## Vendored files (verbatim at the commit above, before the rewrites in "Import
 rewrites" below are reapplied)
 
@@ -50,6 +94,9 @@ fmha_abi_gfx1201.py                 shared host ABI       ) also imported
 fmha_common_gfx1201.py              shared device helpers ) verbatim by
 philox.py                           shared PRNG           ) every gfx950 file
 ```
+
+`fmha_common_gfx1201.py` is listed here because it is a gfx1201 file, but it is
+vendored at the **gfx950** commit; see the shared-files table under "Source".
 
 ### gfx950 — twelve files
 
