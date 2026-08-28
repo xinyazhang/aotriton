@@ -6,7 +6,7 @@
 --
 -- Phase 2 unification (modular-tune.md §4.3/§4.7): single table, keyed by
 -- (task_id, iface_name, test_case, tensor_name); `tuning_level` denormalized
--- (see schema.sql's tuning_results comment for why) rather than a separate
+-- (see schema.sql's task_reports comment for why) rather than a separate
 -- most_accurate_optune_results table.
 
 CREATE TABLE IF NOT EXISTS most_accurate_tuning_results (
