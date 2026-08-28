@@ -30,15 +30,17 @@
 #   <arch>            GPU arch, e.g. "gfx942" -- forwarded verbatim as
 #                     AOTRITON_TARGET_ARCH.
 #   <install_prefix>  Where subjects go: each lands in
-#                     <install_prefix><arch>/<tag>/, the trailing slash carried
+#                     <install_prefix><arch>/rocm<ver>+aotriton<tag>/ -- the
+#                     preset, which is what resolves it. Trailing slash carried
 #                     by the prefix as autotools does. This script knows
 #                     nothing of "workdir" -- that is a tuner concept, and
 #                     perfmon is not the tuner.
 #
-# Produces <install_prefix><arch>/<tag>/ -- ONE ordinary Linux install tree,
+# Produces <install_prefix><arch>/<preset>/ -- ONE ordinary Linux install tree,
 # not a nest of them. AOTriton and perfmon's own artifacts share it:
 #
-#   subject_id                    aotriton-<tag>+rocm<rocm> (rev0 §9/§11)
+#   subject_id                    rocm<ver>+aotriton<tag>, i.e. the preset
+#                                 and the directory's own name (rev0 §9/§11)
 #   bin/runner                    the executable T13's Verify step checks
 #   lib/libperfmon_flash.so       this subject's adapter
 #   lib/libaotritonpmon_v2.so*    the shim-built AOTriton
@@ -195,7 +197,8 @@ if [ "$#" -lt 3 ]; then
   echo "                        <arch> <install_prefix> <tag> [<tag>...]" >&2
   echo '  <arch>:           GPU arch, e.g. gfx942 (-> AOTRITON_TARGET_ARCH)' >&2
   echo '  <install_prefix>: where subjects go; each lands in' >&2
-  echo '                    <install_prefix><arch>/<tag>/. Carry the trailing' >&2
+  echo '                    <install_prefix><arch>/rocm<ver>+aotriton<tag>/.' >&2
+  echo '                    Carry the trailing' >&2
   echo '                    slash yourself, autotools-style.' >&2
   echo '  <tag>...:         one or more git tags, e.g. 0.13b 0.12.1b' >&2
   echo '  --origin:         git URL to clone release tags from' >&2
@@ -284,7 +287,7 @@ echo "[build_subject] probed ROCm ${ROCM}" >&2
 # Subjects install under the caller's prefix. This script has no idea what a
 # "workdir" is -- that is a tuner concept, and perfmon is not the tuner. The
 # caller (.tune/single/build_perfmon.sh) passes
-# <workdir>/installed/perfmon/ and this puts <prefix><arch>/<tag>/ beneath it,
+# <workdir>/installed/perfmon/ and this puts <prefix><arch>/<preset>/ beneath it,
 # with the trailing slash carried by the prefix as autotools does.
 if [ -z "${INSTALL_PREFIX}" ]; then
   echo "Error: empty install prefix." >&2
@@ -294,12 +297,27 @@ fi
 build_one_subject() {
   local TAG="$1"
 
-  # The ROCm is NOT a path segment: one prefix serves one ROCm, so
-  # <arch>/<tag> is already unique beneath it. The probed version is recorded
-  # inside the subject instead, so a directory built against a ROCm that has
-  # since changed stays identifiable rather than silently assumed current.
-  SUBJECT_ID="aotriton-${TAG}+rocm${ROCM}"
-  SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${TAG}"
+  # The directory IS the preset, and so is subject_id. A subject is a
+  # (ROCm, AOTriton tag) pair, and `rocm<ver>+aotriton<tag>` is how that pair
+  # is spelled everywhere else -- python/tune/perfmon/presets.py builds it,
+  # task_config carries it, and launch_runner.sh resolves
+  # <root>/<arch>/<preset>/bin/runner from it.
+  #
+  # This used to be <arch>/<tag>, on the reasoning that one prefix serves one
+  # ROCm so the tag alone is unique beneath it. True, and beside the point: the
+  # shim was still looking up the preset, so every launch failed with
+  #     launch_runner.sh: no runner for preset 'rocm7.14.0+aotriton0.10b'
+  #     Expected: .../gfx942/rocm7.14.0+aotriton0.10b/bin/runner
+  # while the subject sat next to it under a different name. Naming the
+  # directory after the thing that looks it up removes the translation step
+  # rather than fixing it in one direction.
+  #
+  # subject_id gets the same string, not `aotriton-<tag>+rocm<ver>`. Two
+  # spellings of one pair is what let them disagree: exaid's
+  # _assert_identity() tests `preset in subject_id`, which no ordering of the
+  # old spelling could satisfy.
+  SUBJECT_ID="rocm${ROCM}+aotriton${TAG}"
+  SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${SUBJECT_ID}"
 
   # AOTriton installs into the subject prefix ITSELF, not a nested
   # <subject>/aotriton/. A subject is one self-contained install tree with
