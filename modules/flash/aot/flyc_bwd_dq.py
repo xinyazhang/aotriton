@@ -15,9 +15,11 @@ Two things are specific to this kernel:
   GEMM. dK/dV has the same quantity but walks Q tiles for a fixed KV block, so
   its eight elements are eight q *rows* at one kv column and the store would go
   down a dB column; this kernel writes along a row instead. That is why dB is
-  the dQ kernel's output in both DSLs, and it is not gated: `bias=True` always
-  emits it (FlyDSL 077626cd dropped the `return_dbias` knob), matching
-  `bwd_kernel_dq.py`'s unconditional DB operand.
+  the dQ kernel's output in both DSLs, and why both arches write it whenever
+  bias is present, matching `bwd_kernel_dq.py`'s DB operand. gfx1201 gets there
+  with no knob at all -- FlyDSL 077626cd dropped `return_dbias`, so `bias=True`
+  always emits the store -- while gfx950 kept a `store_db` `const_expr` that
+  defaults *off*, which the builder below has to pin from `BIAS_TYPE`.
 * **`block_m` and `block_n` are both real knobs** here, so nothing has to be
   re-derived for the grid the way `flyc_bwd_dkdv.py` re-derives `block_n`.
 """
@@ -206,7 +208,29 @@ def flyc_bwd_dq(arch, choices, hints):
             # kernel-by-kernel for no functional reason.
             paged=False,
             num_kv_splits=1,
+            # dB is this kernel's second output, and `store_db` is the
+            # `const_expr` that decides whether the store exists at all
+            # (`fmha_bwd_dq_gfx950.py`'s `if const_expr(STORE_DB)`). Upstream's
+            # `_BWD_DQ_FALLBACK` defaults it to False -- inference builds have
+            # no gradient to write -- and it is not derived from `meta.bias`,
+            # so an unpinned build with BIAS_TYPE=1 compiles a kernel that
+            # returns success and leaves dB untouched. Same defect shape as the
+            # forward's `return_lse` (see flyc_attn_fwd.py), with one real
+            # difference: BIAS_TYPE *is* a functional axis, so this one is
+            # genuinely a build-time question and specialising on it is right.
+            #
+            # gfx1201 reaches the same place without a knob -- FlyDSL 077626cd
+            # dropped its `return_dbias` and `bias=True` always emits the store
+            # (see this module's docstring). Both arches therefore write dB
+            # whenever bias is present, and neither implements Triton's extra
+            # runtime out: `bwd_kernel_dq.py` also clears `store_db` when the
+            # caller passes all-zero dB strides, which is how a bias that does
+            # not require grad asks for the store to be skipped.
+            store_db=bool(choices.BIAS_TYPE),
         ).resolve(meta)
+        assert knobs.store_db == bool(choices.BIAS_TYPE), (
+            f'resolve() returned store_db={knobs.store_db} for '
+            f'BIAS_TYPE={choices.BIAS_TYPE}; dB is written exactly when bias is')
         assert knobs.block_dmodel == tile, (
             f'resolve() returned block_dmodel={knobs.block_dmodel} for '
             f'BLOCK_DMODEL={tile}; the compiled tile must be the operator axis')

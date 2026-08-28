@@ -1510,6 +1510,44 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         return q_row * self.stride_o_seq_v + self.lane_div_32 * 8
 
     def _store_lse_row(self, m_row, l_row, q_row):
+        """`_store_lse_row_unguarded`, skipped entirely when `LSE` is null.
+
+        LSE is an **optional** output. `attn_fwd_params::L` is declared "Can be
+        `T2::get_null_tensor()`" (include/aotriton/flash.h), and an inference
+        caller that will never run a backward passes exactly that. The Triton
+        kernel spells the contract as `L_not_null` -- *"Allows null L for
+        training=False"*, modules/flash/kernel/fwd_kernel.py -- and gfx1201's
+        FlyDSL kernel spells it as `_l_valid`
+        (flash_attn_func_gfx1201_aiw.py). The gfx950 path had neither: a null
+        `L` reached `_make_ws_rsrc` as a descriptor based at address 0 and the
+        store faulted.
+
+        So the optionality is a **runtime** property, not a build-time one.
+        `RETURN_LSE` is a compile-time knob that deletes the store outright,
+        which is the wrong instrument for it twice over: one AOT binary has to
+        serve both kinds of caller, and a build with the store deleted is not
+        "LSE optional", it is "LSE never written". `RETURN_LSE` therefore stays
+        pinned on for AOT (modules/flash/aot/flyc_attn_fwd.py) and the null
+        case is decided here, per launch.
+
+        The condition is wave-uniform, so this is a scalar branch. Everything
+        the store needs -- the log, the scale, the addressing -- stays inside
+        it, for the reason gfx1201's kernel records at its own guard: hoisting
+        that arithmetic out cost 8% at head_dim 256 even with the store still
+        predicated, because the values then stay live across the epilogue for
+        every wave, including the ones with nothing to store.
+        """
+        store = self._store_lse_row_unguarded
+        lse_not_null = fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))) != fx.Int64(0)
+
+        @flyc.jit
+        def _store_lse_if_l_not_null():
+            if lse_not_null:
+                store(m_row, l_row, q_row)
+
+        _store_lse_if_l_not_null()
+
+    def _store_lse_row_unguarded(self, m_row, l_row, q_row):
         """LSE addressed through `VarlenBits`, which decides three things here.
 
         LSE is always **compact** -- it is the one tensor whose strides are not
@@ -1534,18 +1572,34 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         must not both count it; that works for either layout because a batch's
         rows are contiguous in both, `H * tokens` of them.
 
-        Non-varlen builds keep the production expression exactly. It is what
-        this generalizes to at `varlen_bits == 0`, `row_off == 0` and
+        Non-varlen builds keep the production row expression exactly --
+        `q_head_idx * seq_len_v + q_row`. It is what the `VarlenBits` form
+        generalizes to at `varlen_bits == 0`, `row_off == 0` and
         `tokens == seq_len_v` -- but only as a *runtime* equality, and emitting
         a select per store to rediscover a constant is not worth it on the path
-        every dense build takes.
+        every dense build takes. What both branches share is the descriptor,
+        and one term in it is **not** the production one: the head count.
+
+        Upstream's `_store_lse_row` sizes the per-batch slice with
+        `traits.NUM_HEADS_Q`, a compile-time trait, because upstream compiles a
+        kernel per shape. AOT cannot: one binary serves every head count, so
+        `modules/flash/aot/flyc_attn_fwd.py` pins `num_heads=1` and the real
+        count arrives as the `num_head_q` kernarg. With the trait, the
+        descriptor covers `1 * tokens` rows, the batch stride advances by one
+        head instead of `H`, and the hardware bound silently drops every head
+        but the first -- `L` comes back written for `h == 0` and untouched
+        (NaN) for the rest. So the count here is `self.num_head_q`, which is
+        also what gfx1201 feeds `lse_row_addressing`. Two scalar ops; the
+        stores are unchanged.
         """
         traits = self.traits
-        if const_expr(not traits.VARLEN):
-            super()._store_lse_row(m_row, l_row, q_row)
-            return
-        tokens = fx.Index(self.lse_tokens_i32)
-        per_batch = fx.Index(traits.NUM_HEADS_Q) * tokens
+        # The runtime head count, NOT `traits.NUM_HEADS_Q` -- see above.
+        num_heads_q = fx.Index(self.num_head_q)
+        if const_expr(traits.VARLEN):
+            tokens = fx.Index(self.lse_tokens_i32)
+        else:
+            tokens = self.seq_len_v
+        per_batch = num_heads_q * tokens
         per_batch_bytes = per_batch * fx.Index(4)
         rsrc = dualwave._make_ws_rsrc(
             fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))),
@@ -1557,17 +1611,20 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
             dualwave.fmath.log(as_mlir_value(l_row), fastmath=self.fm_fast),
             self.fm_fast,
         )
-        base, pitch = fmha.lse_row_addressing(
-            self.varlen_bits_arg,
-            fx.Index(0),
-            self.q_head_idx,
-            traits.NUM_HEADS_Q,
-            tokens,
-            self.q_row_off,
-        )
+        if const_expr(traits.VARLEN):
+            base, pitch = fmha.lse_row_addressing(
+                self.varlen_bits_arg,
+                fx.Index(0),
+                self.q_head_idx,
+                num_heads_q,
+                tokens,
+                self.q_row_off,
+            )
+            lse_local = base + q_row * pitch
+        else:
+            lse_local = self.q_head_idx * tokens + q_row
         # One writer per row: low half-wave, in-bounds row; everything else is
         # redirected to the sentinel the buffer bound drops.
-        lse_local = base + q_row * pitch
         off_row = (q_row < self.seqlen_q_v).select(lse_local, per_batch)
         off = fx.Index((self.lane < fx.Index(32)).select(off_row, per_batch))
         dualwave._ws_store_f32(lse_val, off, rsrc)
