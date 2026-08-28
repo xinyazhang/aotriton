@@ -126,6 +126,12 @@ else
   WORKER_PYTHONPATH="/wkdir/installed/$ARCH/lib"
 fi
 
+# perfmon also imports `aotriton` itself, from the workdir rather than from the
+# venv -- see the PKG_SETUP block below for why it is installed there.
+if [ "$WORKLOAD" = "perfmon" ]; then
+  WORKER_PYTHONPATH="/wkdir/scratch/pip/site:$WORKER_PYTHONPATH"
+fi
+
 RUNFILE="$WORKER_WORKDIR/run/worker.containerid"
 
 # Create the run subdirectories HERE, on the host, as the ssh user -- not
@@ -161,7 +167,7 @@ mkdir -p "$WORKER_WORKDIR/run" \
 #
 # The paths inside are CONTAINER paths; the file itself is written to the host
 # side of the same bind mount.
-mkdir -p "$WORKER_WORKDIR/scratch/pip"
+mkdir -p "$WORKER_WORKDIR/scratch/pip" "$WORKER_WORKDIR/scratch/home"
 cat > "$WORKER_WORKDIR/scratch/pip/dist.cfg" <<'CFG'
 [build]
 build_base = /wkdir/scratch/pip/build
@@ -202,6 +208,21 @@ fi
 DOCKER_USER_ARGS=()
 if [ "$WORKLOAD" = "perfmon" ]; then
   DOCKER_USER_ARGS=(--user "$(id -u):$(id -g)")
+  # HOME is `/` for this container: docker takes it from the image config, and
+  # --user with a numeric uid does not make it consult /etc/passwd. Every tool
+  # that defaults to ~/... therefore aims at the filesystem root, which a
+  # non-root user cannot write:
+  #     WARNING: The directory '/.cache/pip' or its parent directory is not
+  #     owned or is not writable by the current user. The cache has been
+  #     disabled.
+  # Pointing HOME into the workdir fixes that class at the source rather than
+  # one cache variable at a time, and makes the caches persist across launches
+  # instead of dying with the container.
+  #
+  # perfmon only. Tuning runs as root with a writable HOME and is in
+  # production use; repointing it would change where its caches live for no
+  # benefit here.
+  DOCKER_USER_ARGS+=(-e "HOME=/wkdir/scratch/home")
   # A non-root process needs the render group to open /dev/kfd and
   # /dev/dri/renderD*; root did not. Added by GID, and only if the host has
   # such a group, since --group-add on a name that does not exist is a hard
@@ -260,17 +281,32 @@ fi
 # (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
 # exactly how torch would come back.
 #
-# This works only because the venv is owned by the uid the container runs as
-# -- the image bakes the REMOTE host's uid (build_image.sh) and --user passes
-# the same one below. With the server's uid baked in, as it was, pip would
-# fail with EACCES inside site-packages.
+# Installed with --target INTO THE WORKDIR, not into the venv, so the install
+# needs no write access to /venv at all. Writing to the venv failed with
+#     ERROR: Could not install packages due to an OSError: [Errno 13]
+#     Permission denied: '/venv/lib/python3.13/site-packages/aotriton'
+# because site-packages is owned by the uid the image was BUILT with, while
+# --user makes the container run as the uid of whoever starts it.
+#
+# Matching those two up is possible (build_image.sh bakes the remote host's
+# uid) but it makes the image host-specific: one `<image>-perfmon_<arch>` tag
+# is shared across hosts, and any host whose uid differs from the build host's
+# gets this same EACCES. --target sidesteps the ownership question entirely,
+# which also leaves the door open to running this image somewhere its uid was
+# never considered.
+#
+# The target is wiped first. --target is additive, so a module deleted upstream
+# would otherwise linger and keep shadowing; wiping makes each launch a clean
+# snapshot, which is the property this whole block exists to provide. Safe to
+# wipe unconditionally because the RUNFILE guard above means no other container
+# is using this workdir.
 #
 # perfmon only. The tuning image installs its requirements at build time and
 # works today; adding a pip step there would be an untested change to a path
 # in production use.
 PKG_SETUP=""
 if [ "$WORKLOAD" = "perfmon" ]; then
-  PKG_SETUP="DIST_EXTRA_CONFIG=/wkdir/scratch/pip/dist.cfg python -m pip install -q . --no-deps && "
+  PKG_SETUP="rm -rf /wkdir/scratch/pip/site && DIST_EXTRA_CONFIG=/wkdir/scratch/pip/dist.cfg python -m pip install -q . --no-deps --target /wkdir/scratch/pip/site && "
 fi
 
 set -x
