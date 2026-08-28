@@ -766,7 +766,20 @@ def _extract_hsaco(jf) -> bytes:
 
 
 _RE_MACHINE = re.compile(r'Machine:\s*(\S+)')
-_RE_FLAGS = re.compile(r'Flags:\s*(0x[0-9a-fA-F]+),\s*(\S+)')
+# `[^\s,]+`, not `\S+`, for the arch name. `readelf` prints the flags as a
+# comma-separated list whose first entry is the arch and whose remaining entries
+# are the target features, and gfx950 is the first arch here to have any:
+#
+#   gfx1201:  Flags:  0x4f, gfx1201
+#   gfx950:   Flags:  0x54f, gfx950, xnack, sramecc
+#
+# `\S+` is greedy up to whitespace, so on gfx950 it swallowed the separator and
+# produced 'gfx950,' -- which never equals the requested target and failed every
+# hsaco. Stopping at the comma is what makes the group the arch name on both.
+# The feature entries are deliberately not captured: AOTriton's arch identity is
+# the bare `gfx950`, and this check asks only whether the ELF is for the arch we
+# asked for.
+_RE_FLAGS = re.compile(r'Flags:\s*(0x[0-9a-fA-F]+),\s*([^\s,]+)')
 _RE_KERNEL_NAME = re.compile(r'^\s*\.name:\s*(\S+)', re.MULTILINE)
 _RE_GROUP_SEGMENT = re.compile(r'^\s*\.group_segment_fixed_size:\s*(\d+)', re.MULTILINE)
 _RE_KERNARG_SEGMENT = re.compile(r'^\s*\.kernarg_segment_size:\s*(\d+)', re.MULTILINE)
