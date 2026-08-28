@@ -2,7 +2,26 @@
 # SPDX-License-Identifier: MIT
 
 """
-Message handlers for local queue DAG workflow.
+Handlers for the `tune_kernel` DAG:
+
+    tune_kernel -> preprocess -> probe -> N x tune_impl -> impl_result
+                                                        -> postprocess
+
+AOTriton-specific throughout (`ImplSelector`, `save_task_report`, tuning
+levels), which is exactly why it is separated from the framework (perfmon
+rev2 R03). Adding a second DAG costs a sibling module and a registration
+list, not edits to a shared file.
+
+Message classes are namespaced with this DAG's name -- `tune_kernel/probe`,
+not `probe`. Without that, a second DAG wanting its own `probe` step would
+silently collide with this one in the worker's handler registry. The
+DAG-START message keeps the bare name `tune_kernel`, because that string is
+the task_queue.class value the PG reader forwards verbatim.
+
+NOT namespaced, and not to be confused with these: the wire DSL commands the
+exaid proxy writes to a runner process (`probe`, `benchmark`,
+`prepare_data`). Those are a different protocol entirely, spoken to a C++
+binary over a pipe -- see exaid.py.
 """
 
 import json
@@ -14,63 +33,13 @@ from typing import Dict, Any, List
 import psycopg
 from psycopg.types.json import Jsonb
 
-from ..exaid import exaid_create, ExaidSubprocessNotOK
-from ..tdesc import ImplSelector
-from ..pq.queue import TaskQueue
-from ..pq.results import save_tuning_result
+from ...exaid import exaid_create, ExaidSubprocessNotOK
+from ...tdesc import ImplSelector
+from ...pq.queue import TaskQueue
+from ...pq.results import save_task_report
+from .base import MessageHandler
 
 logger = logging.getLogger(__name__)
-
-
-class MessageHandler:
-    """Base class for message handlers"""
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        """Get message class this handler processes"""
-        raise NotImplementedError
-
-    def handle(self, message: dict) -> dict | List[dict] | None:
-        """
-        Process message and return result message(s) (or None).
-
-        Result message is automatically forwarded to its target_queue.
-
-        Args:
-            message: Input message
-
-        Returns:
-            Result message, list of result messages, or None
-        """
-        raise NotImplementedError
-
-    def resolve_dependency(self, blocked_msg: dict, incoming_msg: dict) -> bool:
-        """
-        Called when incoming_msg arrives that might resolve blocked_msg's dependency.
-
-        Args:
-            blocked_msg: Message waiting for dependencies
-            incoming_msg: Newly arrived message
-
-        Returns:
-            True if dependency is resolved (unblock message)
-        """
-        return False
-
-    def teardown_with_unmet_dependency(self, message: dict) -> dict | None:
-        """
-        Called during graceful shutdown when message has unmet dependencies.
-
-        Default implementation returns None (no action needed).
-        Override in subclasses if teardown requires specific actions.
-
-        Args:
-            message: Blocked message being torn down
-
-        Returns:
-            Result message to enqueue (or None)
-        """
-        return None
 
 
 class TuneKernelHandler(MessageHandler):
@@ -87,7 +56,7 @@ class TuneKernelHandler(MessageHandler):
 
     def handle(self, message: dict) -> dict:
         return {
-            'class': 'preprocess',
+            'class': 'tune_kernel/preprocess',
             'target_queue': 'gpu_queue',
             'task_id': message['task_id'],
             'task_config': message['task_config'],
@@ -107,7 +76,7 @@ class PreprocessHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "preprocess"
+        return "tune_kernel/preprocess"
 
     def handle(self, message: dict) -> dict | None:
         task_config = message['task_config']
@@ -115,7 +84,7 @@ class PreprocessHandler(MessageHandler):
 
         # Execute preprocessing
         module = task_config["module"]
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
 
         if 'tmpdir' in task_config:
             tmpdir = Path(task_config['tmpdir'])
@@ -143,7 +112,7 @@ class PreprocessHandler(MessageHandler):
 
         # Return probe message
         return {
-            'class': 'probe',
+            'class': 'tune_kernel/probe',
             'target_queue': 'gpu_queue',
             'task_id': message['task_id'],
             'task_config': task_config
@@ -178,7 +147,7 @@ class ProbeHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "probe"
+        return "tune_kernel/probe"
 
     def handle(self, message: dict) -> List[dict] | dict | None:
         task_config = message['task_config']
@@ -190,7 +159,7 @@ class ProbeHandler(MessageHandler):
         # op task at the wrong level.
         level = task_config['tuning_level']
 
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
         tmpdir = Path(task_config['tmpdir'])
         arch = task_config.get('arch')
 
@@ -255,7 +224,7 @@ class ProbeHandler(MessageHandler):
             for impl_index in range(len(limited)):
                 impl_tasks.append((iface_name, impl_index))
                 results.append({
-                    'class': 'tune_impl',
+                    'class': 'tune_kernel/tune_impl',
                     'target_queue': 'gpu_queue',
                     'task_id': task_id,
                     'task_config': task_config,
@@ -268,11 +237,11 @@ class ProbeHandler(MessageHandler):
             expected_impls.setdefault(name, []).append(index)
 
         results.append({
-            'class': 'postprocess',
+            'class': 'tune_kernel/postprocess',
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'task_config': task_config,
-            'depends': ['impl_result'],
+            'depends': ['tune_kernel/impl_result'],
             'expected_impls': expected_impls,
             'received_impls': defaultdict(dict),
         })
@@ -299,7 +268,7 @@ class TuneImplHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "tune_impl"
+        return "tune_kernel/tune_impl"
 
     def handle(self, message: dict) -> dict:
         task_config = message['task_config']
@@ -313,11 +282,18 @@ class TuneImplHandler(MessageHandler):
         # come through that path and guessing 'kernel' would silently run an
         # op task at the wrong level.
         level = task_config['tuning_level']
-        exaid = exaid_create(module, self.gpu_id)
+        exaid = exaid_create('tune_kernel', module, self.gpu_id)
         tmpdir = Path(task_config['tmpdir'])
 
         impl_selector = ImplSelector(tuning_level=level, iface_name=iface_name, impl_index=impl_index)
-        report = {'tuning_level': level, 'iface_name': iface_name, 'impl_index': impl_index}
+        # The report names its own place in the (arch, class) shard tree.
+        # `subclass` is the generic column; this DAG's concrete name for it
+        # is tuning_level, and the translation happens here, at the boundary
+        # between the workload and the framework (rev2 section 5 layering).
+        report = {'arch': task_config['arch'],
+                  'class': 'tune_kernel',
+                  'subclass': level,
+                  'iface_name': iface_name, 'impl_index': impl_index}
         try:
             result_data = exaid.benchmark(tmpdir, impl_selector)
             report['result'] = 'OK'
@@ -335,7 +311,7 @@ class TuneImplHandler(MessageHandler):
             report['error'] = {'stdout': e.stdout, 'stderr': e.stderr}
 
         return {
-            'class': 'impl_result',
+            'class': 'tune_kernel/impl_result',
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'iface_name': iface_name,
@@ -346,12 +322,12 @@ class TuneImplHandler(MessageHandler):
 
 class WriteImplResultHandler(MessageHandler):
     """
-    Writes an impl benchmark result to the unified tuning_results table.
+    Writes an impl benchmark result to the unified task_reports table.
 
     Unified (modular-tune.md §4.1-§4.3): replaces the former
     WriteHsacoResultHandler/WriteBackendResultHandler pair, both of which
-    wrote to two separate tables (tuning_results/optune_results); now a
-    single save_tuning_result() call, distinguished by report['tuning_level'].
+    wrote to two separate tables (task_reports/optune_results); now a
+    single save_task_report() call, distinguished by report['subclass'].
 
     Input: impl_result message
     Output: None (triggers dependency resolution for postprocess)
@@ -362,16 +338,16 @@ class WriteImplResultHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "impl_result"
+        return "tune_kernel/impl_result"
 
     def handle(self, message: dict) -> None:
         task_id = message['task_id']
         report = message['report']
 
-        save_tuning_result(task_id, report, self.db_conn)
+        save_task_report(task_id, report, self.db_conn)
 
         logger.debug(f"Wrote impl result for task_id={task_id} "
-                    f"{report['iface_name']}[{report['impl_index']}] (tuning_level={report['tuning_level']})")
+                    f"{report['iface_name']}[{report['impl_index']}] (subclass={report['subclass']})")
         return None
 
 
@@ -380,7 +356,7 @@ class PostprocessHandler(MessageHandler):
     Aggregates all hsaco results and cleans up.
 
     Input: postprocess message (after dependencies resolved)
-    Output: tune_kernel_ack message (triggers PG reader to continue)
+    Output: dag_ack message (triggers PG reader to continue)
 
     DESIGN NOTE: This class has dual-context usage:
     1. Broker context: Instantiated with db_conn=None, only resolve_dependency() is called
@@ -401,7 +377,7 @@ class PostprocessHandler(MessageHandler):
 
     @classmethod
     def get_class_name(cls) -> str:
-        return "postprocess"
+        return "tune_kernel/postprocess"
 
     def resolve_dependency(self, blocked_msg: dict, incoming_msg: dict) -> bool:
         """
@@ -411,7 +387,7 @@ class PostprocessHandler(MessageHandler):
         IMPORTANT: This method is called in the BROKER context, not the CPU worker context.
         Do NOT access self.db_conn here — it will be None.
         """
-        if blocked_msg['class'] != 'postprocess':
+        if blocked_msg['class'] != 'tune_kernel/postprocess':
             return False
 
         if incoming_msg['class'] not in blocked_msg['depends']:
@@ -456,7 +432,7 @@ class PostprocessHandler(MessageHandler):
 
         logger.info(f"Postprocess returning ack message for task_id={task_id}")
         return {
-            'class': 'tune_kernel_ack',
+            'class': 'dag_ack',
             'task_id': task_id,
         }
 
@@ -495,83 +471,4 @@ class PostprocessHandler(MessageHandler):
             'target_queue': 'cpu_queue',
             'task_id': task_id,
             'arch': arch
-        }
-
-
-class GracefulCancelRunningTaskHandler(MessageHandler):
-    """
-    Moves task state back to pending when gracefully cancelled.
-
-    This handler is used during graceful shutdown to cancel running tasks
-    that have unmet dependencies (incomplete tune_hsaco work).
-    """
-
-    def __init__(self, db_conn):
-        self.db_conn = db_conn
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        return "graceful_cancel_running_task"
-
-    def handle(self, message: dict) -> None:
-        task_id = message['task_id']
-        arch = message['arch']
-
-        logger.info(f"Gracefully cancelling task_id={task_id}, moving back to pending")
-
-        # Move task back to pending state
-        task_queue = TaskQueue(self.db_conn)
-        task_queue.mark_pending(task_id, arch)
-
-        logger.info(f"Task {task_id} moved back to pending state")
-
-        # No result message
-        return None
-
-
-class MarkTaskFailedHandler(MessageHandler):
-    """
-    Marks task as failed in database.
-
-    This handler is used when GPU workers encounter exceptions during
-    preprocess or probe stages. GPU workers don't have DB access, so they
-    send this message to CPU workers to write the failure to the database.
-    """
-
-    def __init__(self, db_conn):
-        self.db_conn = db_conn
-
-    @classmethod
-    def get_class_name(cls) -> str:
-        return "mark_task_failed"
-
-    def handle(self, message: dict) -> dict:
-        task_id = message['task_id']
-        arch = message['arch']
-        error = message['error']
-
-        logger.info(f"Marking task_id={task_id} as failed: {error}")
-
-        # Mark task as failed in database
-        task_queue = TaskQueue(self.db_conn)
-        task_queue.mark_failed(task_id, arch=arch, error_message=error)
-
-        logger.info(f"Task {task_id} marked as failed in database")
-
-        # Remove prepared data from tmpfs to free space
-        tmpdir = message.get('tmpdir')
-        if tmpdir:
-            tmpdir_path = Path(tmpdir)
-            if tmpdir_path.exists():
-                try:
-                    shutil.rmtree(tmpdir_path)
-                    logger.info(f"Removed tmpdir {tmpdir_path} for failed task {task_id}")
-                except OSError as e:
-                    logger.warning(f"Failed to remove tmpdir {tmpdir_path}: {e}")
-
-        # Return nak (negative ack) message to unblock PG reader
-        return {
-            'class': 'tune_kernel_ack',
-            'task_id': task_id,
-            'negative': True
         }
