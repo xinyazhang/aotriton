@@ -154,6 +154,37 @@ def load_family_visperf(family: str, modules_dir: 'Path | None' = None):
     return mod
 
 
+def load_family_perfmon(family: str, modules_dir: 'Path | None' = None):
+    """Import `<modules_dir>/<family>/perfmon/__init__.py` by path under a
+    synthetic unique package name, mirroring `load_family_visperf` above
+    (identical rationale, D8 in perfmon-rev0.md: `modules/<family>` stays a
+    plain directory, not a package). Cached in `sys.modules`.
+
+    The returned module exports `PerfDesc` (a `aotriton.tune.perfmon.pdesc.
+    PerfDescription` subclass) -- the perfmon analogue of `load_family_tune`'s
+    `TuneDesc` / `load_family_visperf`'s `DESCRIPTOR`.
+    """
+    modname = f'_aotriton_modules_{family}_perfmon'
+    cached = sys.modules.get(modname)
+    if cached is not None:
+        return cached
+    if modules_dir is None:
+        modules_dir = default_modules_dir()
+    perfmon_dir = Path(modules_dir) / family / 'perfmon'
+    init_path = perfmon_dir / '__init__.py'
+    if not init_path.is_file():
+        raise ImportError(
+            f"No perfmon block for family '{family}': {init_path} not found "
+            f"(modules_dir={modules_dir}). Set AOTRITON_MODULES_DIR or run "
+            f"from the repo root.")
+    spec = importlib.util.spec_from_file_location(
+        modname, init_path, submodule_search_locations=[str(perfmon_dir)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_tune_module(module_name: str, modules_dir: 'Path | None' = None):
     """Resolve a flat family name (e.g. `'flash'`) to its tune package under
     `modules/<family>/tune/`. The returned package exports `TuneDesc` and

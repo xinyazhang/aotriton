@@ -47,7 +47,7 @@ impl_result (CPU worker) - write result to DB
     ↓
 postprocess (CPU worker) - aggregate & cleanup
     ↓
-tune_kernel_ack (to PG reader) - unblock next task
+dag_ack (to PG reader) - unblock next task
 ```
 
 ## Architecture Components
@@ -75,7 +75,7 @@ Messages are enqueued with priority (higher = more urgent):
 - `impl_result`: 0 (lowest - CPU write)
 
 **ACK Mechanism**:
-PG readers register for ACK when sending tune_kernel. When postprocess completes, it sends `tune_kernel_ack` to the broker, which notifies the waiting PG reader to fetch the next task.
+PG readers register for ACK when sending the DAG-start message. When postprocess completes, it sends `dag_ack` to the broker, which notifies the waiting PG reader to fetch the next task.
 
 ### generic_worker.py - GenericWorker
 
@@ -121,7 +121,7 @@ Handler classes for each message type:
 
 **WriteImplResultHandler**: Writes the impl result to `tuning_results`, returns None (triggers dependency resolution)
 
-**PostprocessHandler**: Aggregates all impl results after dependencies resolved, updates `task_queue` status to completed, cleans up tmpdir, returns `tune_kernel_ack`
+**PostprocessHandler**: Aggregates all impl results after dependencies resolved, updates `task_queue` status to completed, cleans up tmpdir, returns `dag_ack`
 
 ### buffered_socket.py - BufferedSocket
 
