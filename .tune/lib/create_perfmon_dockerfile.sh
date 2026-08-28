@@ -75,89 +75,23 @@ if [ -z "$ROCM_VERSION" ]; then
   exit 1
 fi
 
-# DEF runtime dependencies, read from requirements-def.txt rather than listed
-# here, so the framework's dependency set has one home and the tuning image
-# (which pulls the same file in via requirements-tuning.txt) cannot drift from
-# this one.
+# The DEF's dependencies (requirements-def.txt) are installed into the venv at
+# image build: they are common to every DEF workload, unlike the aotriton
+# package itself, which start_worker.sh installs at container launch so it
+# tracks the bind-mounted checkout.
 #
-# INLINED into the generated Dockerfile rather than COPYied in. Not a style
-# choice: build_image.sh ships this image by piping the Dockerfile alone over
-# ssh (`cat > .../Dockerfile.perfmon.<arch>`) and building with image.build/ as
-# the context, so a COPY has nothing on the far side to copy from. Making one
-# work would mean transferring more files, on a code path the tuning image
-# shares.
-#
-# The consequence is that editing requirements-def.txt requires regenerating
-# and rebuilding the image; no running container picks up a change to it.
+# The files are COPYied into the image and handed to `pip install -r`. pip
+# already resolves the `-r requirements.txt` include that requirements-def.txt
+# opens with; an earlier version of this script inlined a flattened package
+# list into the Dockerfile instead, which reimplemented that resolution in
+# shell to avoid transferring two extra files. Copying the files is smaller and
+# keeps pip's semantics.
 AOTRITON_ROOT="$(cd "$TUNE_ROOT/.." && pwd)"
-DEF_REQUIREMENTS="$AOTRITON_ROOT/requirements-def.txt"
 
-# Flatten a requirements file to a quoted, space-separated package list.
-#
-# `-r` includes are followed rather than rejected, because requirements-def.txt
-# opens with one (-r requirements.txt) -- pip would resolve it from the file's
-# own directory, and there is no such directory inside the image, so it has to
-# happen out here. Resolution is relative to the INCLUDING file, matching pip.
-#
-# Each spec is emitted double-quoted: psycopg[binary,pool] is a glob pattern to
-# the shell that runs pip inside the container, and an unquoted one would be
-# silently eaten if a matching path ever existed.
-flatten_requirements() {
-  local file="$1" depth="${2:-0}" dir line spec
-
-  if [ "$depth" -gt 8 ]; then
-    echo "Error: requirements includes nest more than 8 deep at $file" >&2
-    exit 1
-  fi
-  if [ ! -f "$file" ]; then
-    echo "Error: requirements file not found: $file" >&2
-    exit 1
-  fi
-
-  dir="$(cd "$(dirname "$file")" && pwd)"
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    [ -z "$line" ] && continue
-
-    case "$line" in
-      -r*|--requirement*)
-        spec="${line#--requirement}"
-        spec="${spec#-r}"
-        spec="${spec#=}"
-        spec="$(printf '%s' "$spec" | sed -e 's/^[[:space:]]*//')"
-        case "$spec" in
-          /*) ;;
-          *) spec="$dir/$spec" ;;
-        esac
-        flatten_requirements "$spec" "$((depth + 1))"
-        ;;
-      .*|/*)
-        # A local path (requirements-dev.txt has ./python/pytest-gpu-lease).
-        # Nothing is copied into this build context, so pip would find no such
-        # directory -- and it would fail deep in the image build rather than
-        # here.
-        echo "Error: $file requests a local path '$line'." >&2
-        echo "       This image's build context holds only the Dockerfile, so" >&2
-        echo "       there is nothing for pip to install from." >&2
-        exit 1
-        ;;
-      -*)
-        echo "Error: unsupported pip option '$line' in $file" >&2
-        echo "       Only package specs and -r includes are inlined." >&2
-        exit 1
-        ;;
-      *)
-        printf '"%s" ' "$line"
-        ;;
-    esac
-  done < "$file"
-}
-
-DEF_PACKAGES="$(flatten_requirements "$DEF_REQUIREMENTS")"
-
-if [ -z "$DEF_PACKAGES" ]; then
-  echo "Error: $DEF_REQUIREMENTS resolved to no packages." >&2
+if [ ! -f "$AOTRITON_ROOT/requirements-def.txt" ]; then
+  echo "Error: $AOTRITON_ROOT/requirements-def.txt not found." >&2
+  echo "       It names what python/tune/{pq,localq,exaid} import, and this" >&2
+  echo "       image has no other source for them." >&2
   exit 1
 fi
 
@@ -235,6 +169,19 @@ WORKLOAD="perfmon"
 IMAGE_BUILD_DIR="$WORKDIR/image.build"
 DOCKERFILE="$IMAGE_BUILD_DIR/Dockerfile.${WORKLOAD}.${ARCH}"
 mkdir -p "$IMAGE_BUILD_DIR"
+
+# Stage the requirements files into the context, in their own subdirectory so
+# they arrive together and `-r` includes still resolve beside each other.
+# Rebuilt from scratch each run so a file deleted upstream does not survive here
+# and keep satisfying an include that should have started failing.
+#
+# All of requirements*.txt, not just requirements-def.txt: the include graph is
+# pip's to walk, and guessing which files it will reach is how the missing one
+# turns into a docker build failure.
+REQ_CONTEXT_DIR="$IMAGE_BUILD_DIR/requirements"
+rm -rf "$REQ_CONTEXT_DIR"
+mkdir -p "$REQ_CONTEXT_DIR"
+cp "$AOTRITON_ROOT"/requirements*.txt "$REQ_CONTEXT_DIR/"
 
 cat > "$DOCKERFILE" <<EOF
 # Auto-generated by .tune/lib/create_perfmon_dockerfile.sh
@@ -314,10 +261,11 @@ RUN su -s /bin/bash ${BUILD_USER} -c '\\
 #
 # Placed after the ROCm layer so that changing this list re-runs pip over a
 # handful of wheels rather than a multi-gigabyte ROCm download.
+COPY requirements/ /tmp/requirements/
 RUN su -s /bin/bash ${BUILD_USER} -c '\\
       set -eux; \\
       . ${VENV}/bin/activate; \\
-      python -m pip install ${DEF_PACKAGES}'
+      python -m pip install -r /tmp/requirements/requirements-def.txt'
 
 # Auto-activate the venv and derive ROCm's location for every \`docker run\`.
 ENV VIRTUAL_ENV=${VENV}

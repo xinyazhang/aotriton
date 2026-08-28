@@ -126,11 +126,22 @@ if [ "$WORKLOAD" = "perfmon" ]; then
   fi
 
   # Push it, then build with image.build/ as the context: it holds only
-  # generated Dockerfiles, so the upload is negligible, whereas the full
-  # workdir would be sent for a build that reads none of it.
+  # generated Dockerfiles and the requirements files staged beside them, so the
+  # upload is negligible, whereas the full workdir would be sent for a build
+  # that reads none of it.
   BUILD_CONTEXT="$WORKER_WORKDIR/image.build"
   ssh "$HOSTNAME" "mkdir -p '$BUILD_CONTEXT' && cat > '$WORKER_WORKDIR/$DOCKERFILE_REL'" \
     < "$WORKDIR/$DOCKERFILE_REL"
+
+  # The Dockerfile COPYs requirements/, so it has to reach the far side too.
+  # tar, not a second `cat`, because this is a directory whose contents are
+  # create_perfmon_dockerfile.sh's to decide -- whatever it staged there is what
+  # gets sent, with no list to keep in sync here. Only that subdirectory is
+  # sent: the sibling Dockerfiles in image.build/ belong to other arches and to
+  # the tuning image, and overwriting a remote one from here would be a
+  # surprising side effect of building this one.
+  tar -C "$WORKDIR/image.build" -cf - requirements \
+    | ssh "$HOSTNAME" "tar -C '$BUILD_CONTEXT' -xf -"
 
   # Tag by workload AND arch. Workload because two images that serve different
   # DAGs must not share a name; arch because the perfmon image bakes an
