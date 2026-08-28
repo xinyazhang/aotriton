@@ -126,33 +126,13 @@ fi
 # ${SUBJECT_DIR}/lib. Adding it would let a stray copy on that path win over
 # the subject's own, which is the failure the RUNPATH work exists to prevent.
 
-# The runner takes its subject_id as argv[1] (core/main.cc: `runner.subject_id
-# = (argc > 1) ? argv[1] : ""`), and nothing was passing one -- so it reported
-# an empty id and exaid's _assert_identity(), which tests `preset in
-# subject_id`, could only ever fail once it got this far.
-#
-# Read from the subject's own file rather than reusing $PRESET: the check exists
-# to catch a subject that is not what was asked for, and answering it with the
-# question defeats it. The id is also mixed into the runner's data seed
-# (core/entry_codec.cc), so an empty one was silently seeding every subject
-# alike.
-SUBJECT_ID_FILE="${SUBJECT_DIR}/subject_id"
-if [ ! -f "${SUBJECT_ID_FILE}" ]; then
-  echo "launch_runner.sh: ${SUBJECT_DIR} has no subject_id file." >&2
-  echo "                  It is written by build_subject.sh, so this tree is" >&2
-  echo "                  incomplete or was built before subjects carried one." >&2
-  exit 1
-fi
-SUBJECT_ID="$(cat "${SUBJECT_ID_FILE}")"
-
 # cd into the subject so any relative path the runner resolves is its own.
 cd "$SUBJECT_DIR"
 
 if [ -n "${PERFMON_LAUNCH_DEBUG:-}" ]; then
   echo "launch_runner: preset=${PRESET} module=${MODULE} gpu=${GPU}" >&2
   echo "launch_runner: arch=${ARCH} subject=${SUBJECT_DIR}" >&2
-  echo "launch_runner: subject_id=${SUBJECT_ID}" >&2
   echo "launch_runner: ROCM_PATH=${ROCM_PATH:-<unset>}" >&2
 fi
 
-exec "$RUNNER" "$SUBJECT_ID"
+exec "$RUNNER"

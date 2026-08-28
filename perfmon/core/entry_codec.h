@@ -66,7 +66,7 @@
 //    protocol (T07) actually carries a seed value end to end -- nothing
 //    upstream computes or transmits one. `parse_entry_pon` therefore derives
 //    it itself, deterministically, from the exact strings it already has
-//    (`entry_pon`, `subject_id`, `iface`) via a plain FNV-1a 64-bit hash.
+//    (`entry_pon`, `iface`) via a plain FNV-1a 64-bit hash.
 //    This satisfies every property any already-completed task's Verify step
 //    actually checks (T09: "two runs with the same seed are bit-identical"
 //    -- trivially true for a pure function of its inputs) without inventing
@@ -103,13 +103,12 @@ struct PmonEntryFields {
 // Parses `entry_pon` (the reassembled, single-space-rejoined
 // `functional_pon` + ';' + `shape_pon` text -- see this header's item 2
 // above) into a `PmonEntryFields`. `iface` is the already-resolved integer
-// index (item 1 above); `subject_id` feeds the seed derivation (item 3).
+// index (item 1 above), and also feeds the seed derivation (item 3).
 //
 // Throws std::invalid_argument, with a message naming the offending key,
 // on any missing/malformed field -- never returns a partially-filled
 // struct silently.
-PmonEntryFields parse_entry_pon(const std::string& entry_pon, int32_t iface,
-                                 const std::string& subject_id);
+PmonEntryFields parse_entry_pon(const std::string& entry_pon, int32_t iface);
 
 // dtype name ("float16"/"bfloat16"/"float32") -> perfmon_abi.h's
 // `pmon_dtype` enum value. Exposed separately (not just used internally)

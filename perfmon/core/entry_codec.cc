@@ -149,8 +149,7 @@ uint64_t fnv1a64(const std::string& s) {
   return h;
 }
 
-PmonEntryFields parse_entry_pon(const std::string& entry_pon, int32_t iface,
-                                 const std::string& subject_id) {
+PmonEntryFields parse_entry_pon(const std::string& entry_pon, int32_t iface) {
   auto d = split_pairs(entry_pon);
 
   PmonEntryFields f;
@@ -171,10 +170,16 @@ PmonEntryFields parse_entry_pon(const std::string& entry_pon, int32_t iface,
   f.varlen = parse_pon_bool("varlen", require(d, "varlen")) ? 1 : 0;
   f.storage_flip = parse_pon_bool("storage_flip", require(d, "storage_flip")) ? 1 : 0;
 
-  // rev0 §5.3: seed = hash(functional_pon, shape_pon, subject, iface). See
-  // entry_codec.h item 3 for why this is derived here rather than read from
-  // the wire.
-  std::string seed_input = entry_pon + "|" + subject_id + "|" + std::to_string(iface);
+  // seed = hash(functional_pon, shape_pon, iface). See entry_codec.h item 3
+  // for why this is derived here rather than read from the wire.
+  //
+  // rev0 §5.3 also hashed the subject in. Dropped: it made the same entry get
+  // DIFFERENT input data from each AOTriton version, which is the opposite of
+  // what §5.3 wants -- its whole argument for controlled data is that content
+  // effects (denormals, NaN through softmax) "shift timings in ways that have
+  // nothing to do with kernel quality". Comparing two versions means holding
+  // the data fixed. Now the same entry seeds identically everywhere.
+  std::string seed_input = entry_pon + "|" + std::to_string(iface);
   f.seed = fnv1a64(seed_input);
 
   return f;

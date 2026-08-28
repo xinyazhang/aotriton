@@ -235,9 +235,9 @@ class MeasureHandler(MessageHandler):
             report['result_data'] = None
             report['error'] = {'stdout': e.stdout, 'stderr': e.stderr}
         except RuntimeError as e:
-            # Includes ExaidProfileMismatch (use_profile) and resolve_entry's
-            # "does not fit in VRAM even at the floor" -- neither is a
-            # process crash, but neither has a resolved_metadata to report.
+            # resolve_entry's "does not fit in VRAM even at the floor", among
+            # others -- not a process crash, but with no resolved_metadata to
+            # report either.
             logger.error(f"Measure failed for {iface_name}[{impl_index}]: {e}")
             report['result'] = 'NotOK'
             report['result_data'] = None

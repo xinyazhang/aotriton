@@ -26,7 +26,8 @@
 #   The ROCm version is PROBED, not passed: this script cannot locate a ROCm
 #   install from a version string -- it uses whatever ROCM_PATH/hipcc the
 #   environment provides -- so accepting one could only let the label disagree
-#   with the toolchain actually used, and that label goes into subject_id.
+#   with the toolchain actually used, and that label goes into the
+#   subject's directory name.
 #   <arch>            GPU arch, e.g. "gfx942" -- forwarded verbatim as
 #                     AOTRITON_TARGET_ARCH.
 #   <install_prefix>  Where subjects go: each lands in
@@ -39,8 +40,6 @@
 # Produces <install_prefix><arch>/<preset>/ -- ONE ordinary Linux install tree,
 # not a nest of them. AOTriton and perfmon's own artifacts share it:
 #
-#   subject_id                    rocm<ver>+aotriton<tag>, i.e. the preset
-#                                 and the directory's own name (rev0 §9/§11)
 #   bin/runner                    the executable T13's Verify step checks
 #   lib/libperfmon_flash.so       this subject's adapter
 #   lib/libaotritonpmon_v2.so*    the shim-built AOTriton
@@ -257,7 +256,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # as input. This script cannot locate a ROCm install from a version string --
 # it uses whatever ROCM_PATH/hipcc the environment provides -- so accepting one
 # would only let the label disagree with the thing being used, and that label
-# ends up in subject_id, i.e. in what the published numbers claim they were
+# ends up in the subject's directory name, i.e. in what the published
+# numbers claim they were
 # measured against.
 probe_rocm_version() {
   local v=""
@@ -297,7 +297,7 @@ fi
 build_one_subject() {
   local TAG="$1"
 
-  # The directory IS the preset, and so is subject_id. A subject is a
+  # The directory IS the preset. A subject is a
   # (ROCm, AOTriton tag) pair, and `rocm<ver>+aotriton<tag>` is how that pair
   # is spelled everywhere else -- python/tune/perfmon/presets.py builds it,
   # task_config carries it, and launch_runner.sh resolves
@@ -312,12 +312,12 @@ build_one_subject() {
   # directory after the thing that looks it up removes the translation step
   # rather than fixing it in one direction.
   #
-  # subject_id gets the same string, not `aotriton-<tag>+rocm<ver>`. Two
-  # spellings of one pair is what let them disagree: exaid's
-  # _assert_identity() tests `preset in subject_id`, which no ordering of the
-  # old spelling could satisfy.
-  SUBJECT_ID="rocm${ROCM}+aotriton${TAG}"
-  SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${SUBJECT_ID}"
+  # ${ROCM} here is the version PROBED during this build, not a configured
+  # one, so the directory name records what the subject was actually built
+  # against. That provenance used to live in a separate subject_id file; the
+  # path carries it now, and nothing else did.
+  PRESET="rocm${ROCM}+aotriton${TAG}"
+  SUBJECT_DIR="${INSTALL_PREFIX}${ARCH}/${PRESET}"
 
   # AOTriton installs into the subject prefix ITSELF, not a nested
   # <subject>/aotriton/. A subject is one self-contained install tree with
@@ -337,7 +337,6 @@ build_one_subject() {
   # in-subject dependency through a single `$ORIGIN/../lib`.
   AOTRITON_ROOT="${SUBJECT_DIR}"
 
-  echo "[build_subject] subject_id=${SUBJECT_ID}" >&2
   echo "[build_subject] subject_dir=${SUBJECT_DIR}" >&2
   mkdir -p "${SUBJECT_DIR}"
 
@@ -358,8 +357,6 @@ build_one_subject() {
       rm -rf "${SUBJECT_DIR:?}/${_stale}"
     fi
   done
-
-  printf '%s\n' "${SUBJECT_ID}" > "${SUBJECT_DIR}/subject_id"
 
   # --- Step 1: source tree ------------------------------------------------
   # A shallow clone of the tag from upstream, NOT a worktree of the local

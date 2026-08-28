@@ -40,14 +40,13 @@
 // --- Disclosed design decisions (see entry_codec.h for the PON-parsing
 // ones; these are the runner-level ones) ---
 //
-// * `argv[1]`, if present, is treated as this runner's `subject_id` (used
-//   only to derive `pmon_entry.seed`, entry_codec.h item 3). T13's own
-//   Verify step invokes the runner with NO argv at all
-//   (`perfmon/subjects/<id>/bin/runner <<< "exit"`), so this cannot be a
-//   required positional argument; it defaults to the empty string,
-//   documented here as a placeholder until a real invocation convention is
-//   decided (that decision belongs to a `runner_proxy.py`, out of this
-//   task's T01-T13 scope).
+// * The runner takes NO arguments. `argv[1]` was once a placeholder for a
+//   `subject_id`, pending an invocation convention that was never decided;
+//   nothing ever passed one, so every runner reported the empty string it
+//   defaulted to. It fed only the data seed and a self-identification check,
+//   and neither survived: the id could say nothing the preset in the
+//   subject's path does not already say, and hashing it in made each version
+//   see different data.
 // * A single non-default `hipStream_t`, created once at startup and reused
 //   for every `measure`, since T12's spec requires `launch()` to run on a
 //   capturable (non-null) stream and creating one per call would be wasted
@@ -136,7 +135,6 @@ std::string json_thermal(const perfmon::pmon_thermal& t) {
 struct Runner {
   const pmon_family_vtable* vtable = nullptr;
   hipStream_t stream = nullptr;
-  std::string subject_id;
 
   std::string measure(const std::vector<std::string>& args) {
     // Wire shape (protocol.h, T07): `measure <entry_pon> <iface> <backend>`.
@@ -150,7 +148,7 @@ struct Runner {
     const int32_t iface = std::stoi(args[args.size() - 2]);
     const int32_t backend = std::stoi(args[args.size() - 1]);
 
-    perfmon::PmonEntryFields ff = perfmon::parse_entry_pon(entry_pon, iface, subject_id);
+    perfmon::PmonEntryFields ff = perfmon::parse_entry_pon(entry_pon, iface);
     pmon_entry entry{};
     entry.iface = ff.iface;
     entry.dtype = ff.dtype;
@@ -211,7 +209,7 @@ struct Runner {
     const std::string entry_pon = rejoin(args, args.size() - 1);
     const int32_t iface = std::stoi(args[args.size() - 1]);
 
-    perfmon::PmonEntryFields ff = perfmon::parse_entry_pon(entry_pon, iface, subject_id);
+    perfmon::PmonEntryFields ff = perfmon::parse_entry_pon(entry_pon, iface);
     pmon_entry entry{};
     entry.iface = ff.iface;
     entry.dtype = ff.dtype;
@@ -260,7 +258,6 @@ struct Runner {
     }
     std::ostringstream oss;
     oss << "{\"pmon_abi_version\":" << PMON_ABI_VERSION
-        << ",\"subject_id\":\"" << json_escape(subject_id) << "\""
         << ",\"vram_total_gb\":" << vram_gb
         << ",\"thermal\":" << json_thermal(t)
         << "}";
@@ -270,7 +267,7 @@ struct Runner {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main() {
   const pmon_family_vtable* vtable = pmon_family_entry();
   if (vtable == nullptr) {
     std::cerr << "runner: pmon_family_entry() returned null\n";
@@ -287,7 +284,6 @@ int main(int argc, char** argv) {
   Runner runner;
   runner.vtable = vtable;
   runner.stream = stream;
-  runner.subject_id = (argc > 1) ? std::string(argv[1]) : std::string();
 
   perfmon::Handlers handlers;
   handlers.measure = [&runner](const std::vector<std::string>& args) {

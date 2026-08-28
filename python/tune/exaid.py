@@ -104,15 +104,6 @@ class ExaidSubprocessNotOK(RuntimeError):
         self.stderr = stderr
 
 
-class ExaidProfileMismatch(RuntimeError):
-    """A runner did not identify as the profile it was launched for.
-
-    Backs the profile comparison with the runner's own self-identification,
-    which catches what the comparison alone cannot: a mis-provisioned worker,
-    or a stale binary at the resolved path.
-    """
-
-
 class ExaidProxy(object):
     """Pipe and line protocol. Knows nothing about what it launched.
 
@@ -403,7 +394,7 @@ class ExaidPerfmonWorker(ExaidWorker):
         super().__init__(module_name, gpu_id)
         self._profile = None          # the preset the live process serves
         self._pending_profile = None  # what the next launch should serve
-        self._vram_total_gb = None    # cached from platform(), see _assert_identity
+        self._vram_total_gb = None    # cached from platform(), see _cache_platform
 
     def _spawn_argv(self):
         if self._pending_profile is None:
@@ -428,66 +419,37 @@ class ExaidPerfmonWorker(ExaidWorker):
                         "replacing runner process")
             self.proxy.shutdown()
         self._pending_profile = preset
-        # Force the launch here rather than lazily, so the identity assertion
+        # Force the launch here rather than lazily, so the platform round trip
         # below runs exactly once per process rather than once per command.
         self.proxy.process
         self._profile = preset
-        self._assert_identity(preset)
+        self._cache_platform()
         return True
 
-    def _assert_identity(self, preset: str):
-        """Back the profile comparison with the runner's own self-report.
+    def _cache_platform(self):
+        """Ask the runner for its platform facts, once per process.
 
-        `platform` costs ~0 ms and runs once per process, not per
-        measurement. It catches a mis-provisioned worker or a stale binary at
-        the resolved path -- failures the profile comparison cannot see,
-        because both sides of that comparison are this process's own belief.
+        This was `_assert_identity()`, which also compared the runner's
+        self-reported `subject_id` against the preset. That check is gone with
+        subject_id itself: the runner had no way to know its own id (it came
+        from an argv slot nothing filled), and once supplied it could only ever
+        be a copy of the preset already in the path used to launch it -- a
+        comparison between two copies of one string, which cannot fail for the
+        reason the check existed (a stale binary at a correct path).
+
+        The call itself stays. D05a: the runner is the only process guaranteed
+        to have the GPU -- masked to exactly one device by HIP_VISIBLE_DEVICES
+        -- so it is the source of VRAM for D05's resolve_entry(). `platform`
+        costs ~0 ms and is asked once per process, not per measurement.
         """
         info = self.platform()
-        subject_id = info.get('subject_id')
-
-        # An ABSENT id is a different failure from a WRONG one, and saying so
-        # is the whole value of this check. `subject_id=''` used to be reported
-        # as "not the subject that was asked for", which sent the reader
-        # looking for a mis-provisioned subject when the runner had simply
-        # never been told who it is: main.cc takes the id from argv[1] and
-        # defaults it to empty, so a launcher that does not pass one produces
-        # this for every subject alike.
-        if not subject_id:
-            self.proxy.shutdown()
-            self._profile = None
-            raise ExaidProfileMismatch(
-                f"runner launched for preset {preset!r} reported no subject_id. "
-                f"launch_runner.sh passes it as argv[1] from the subject's "
-                f"subject_id file; an empty one means this node is running a "
-                f"launcher that predates that, so aotriton.src needs syncing.")
-
-        # Exact equality. This was `preset not in subject_id`, a substring test
-        # from when the two were spelled differently -- which also silently
-        # accepted any id that merely CONTAINED the preset, so a subject named
-        # after a superstring of it would have passed. They are one string now
-        # (build_subject.sh writes the preset as both the directory name and
-        # the id), so there is nothing left to be loose about.
-        if subject_id != preset:
-            self.proxy.shutdown()
-            self._profile = None
-            raise ExaidProfileMismatch(
-                f"runner launched for preset {preset!r} identifies as "
-                f"subject_id={subject_id!r}; the resolved binary is not the "
-                f"subject that was asked for")
-        logger.info(f"perfmon runner identity confirmed: subject_id={subject_id}")
-        # D05a: the runner is the only process guaranteed to have the GPU
-        # (masked to exactly one device via HIP_VISIBLE_DEVICES), so it is
-        # the source of VRAM for D05's resolve_entry(). platform() already
-        # runs once per process here; cache its answer rather than asking
-        # again per measurement.
         self._vram_total_gb = info.get('vram_total_gb')
 
     @property
     def vram_total_gb(self) -> float | None:
         """This worker's GPU's total VRAM in GiB, from the runner's own
         `platform` self-report (D05a). None until a profile has been
-        established (`use_profile()` -> `_assert_identity()`)."""
+        established (`use_profile()` -> `_cache_platform()`)."""
         return self._vram_total_gb
 
     def platform(self) -> dict:
