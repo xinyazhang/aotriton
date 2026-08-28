@@ -140,6 +140,35 @@ mkdir -p "$WORKER_WORKDIR/run" \
          "$WORKER_WORKDIR/run/logs" \
          "$WORKER_WORKDIR/run/pycache"
 
+# Keep pip's build artifacts out of the mounted checkout.
+#
+# pip builds a local directory IN TREE (the default since 21.3; the
+# out-of-tree option was removed in 22.1), so `pip install .` from
+# /wkdir/aotriton.src drops build/ and aotriton.egg-info/ into the git
+# checkout on every remote host. Nothing breaks, but they show up in
+# git status there and they are not ours to leave behind.
+#
+# DIST_EXTRA_CONFIG is setuptools' supported hook for extra distutils config;
+# build_base and egg_base are the two paths that would otherwise land in the
+# source tree. Verified: with it set, the source tree stays byte-identical and
+# both artifacts appear under the configured directory instead.
+#
+# scratch/ is where this workdir already keeps build trees and caches
+# (build_perfmon.sh's scratch/perfmon/build/, build_triton_wheel.sh's
+# scratch/triton/), and sync_workdir.sh excludes it -- so these neither travel
+# on deploy nor get deleted by one. Written from HERE, on the host, for the
+# same reason the run/ dirs are: the container is not the workdir's owner.
+#
+# The paths inside are CONTAINER paths; the file itself is written to the host
+# side of the same bind mount.
+mkdir -p "$WORKER_WORKDIR/scratch/pip"
+cat > "$WORKER_WORKDIR/scratch/pip/dist.cfg" <<'CFG'
+[build]
+build_base = /wkdir/scratch/pip/build
+[egg_info]
+egg_base = /wkdir/scratch/pip
+CFG
+
 if [ -f "$RUNFILE" ]; then
   echo "Worker already running or stale run file exists. Run stop first." >&2
   exit 1
@@ -215,9 +244,17 @@ fi
 # the code out from under a live worker, and a half-synced checkout cannot be
 # imported at all.
 #
-# Costs one pip run per container launch, and leaves build/ and *.egg-info in
-# the mounted aotriton.src (pip builds in-tree). Both are owned by the
-# invoking uid, per the --user note below.
+# Costs one pip run per container launch. Its build artifacts are redirected
+# out of the checkout and into scratch/pip/ -- see the DIST_EXTRA_CONFIG block
+# further up, which writes the config file this reads.
+#
+# Build isolation is left ON (pip's default), so pip fetches setuptools into a
+# throwaway env each launch and the remote host needs an index reachable at
+# container start. --no-build-isolation would remove both, but the perfmon venv
+# has no setuptools of its own to fall back on: it is created by `python -m
+# venv` on python3.13, which stopped seeding setuptools, and
+# create_perfmon_dockerfile.sh only adds pip and the ROCm wheels on top. That
+# is an image change, so it is not made here.
 #
 # --no-deps is load-bearing: the perfmon venv is deliberately torch-free
 # (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
@@ -233,7 +270,7 @@ fi
 # in production use.
 PKG_SETUP=""
 if [ "$WORKLOAD" = "perfmon" ]; then
-  PKG_SETUP="python -m pip install -q . --no-deps && "
+  PKG_SETUP="DIST_EXTRA_CONFIG=/wkdir/scratch/pip/dist.cfg python -m pip install -q . --no-deps && "
 fi
 
 set -x
