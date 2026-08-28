@@ -97,8 +97,8 @@ else()
   set(AOTRITON_ENABLE_FP32 0)
 endif()
 
-# Normalise ON/OFF to 1/0 here, as AOTRITON_ENABLE_FP32 above does: the generator reads
-# this with the codebase's bool(int(os.getenv(...))) idiom, which does not accept ON/OFF.
+# Normalise ON/OFF to 1/0 here to make python `bool(int(os.getenv(...)))`
+# idiom work.
 if(AOTRITON_DEBUG_SKIP_TRITON_KERNELS)
   set(AOTRITON_DEBUG_SKIP_TRITON_KERNELS_ENV 1)
   message(WARNING
