@@ -88,9 +88,14 @@ for worker in "${WORKERS[@]}"; do
     GPU_SELECTION=$(get_worker_gpu_selection "$WORKDIR" "$hostname")
 
     # Build --multi_gpu args if selection exists
+    # NB: no "--" in here. The separator is emitted exactly once at the call
+    # sites below. Prefixing it here as well produced two, and the second one
+    # travelled all the way into worker_service.sh's argument loop, which
+    # rejects it as "Unknown option: --" -- so `wkctl start` failed for any
+    # host that HAD a GPU selection, and only worked for hosts that did not.
     MULTI_GPU_ARGS=()
     if [ -n "$GPU_SELECTION" ]; then
-        MULTI_GPU_ARGS+=("--" "--multi_gpu")
+        MULTI_GPU_ARGS+=("--multi_gpu")
 
         # Parse GPU selection: "-1" for all, or comma-separated IDs like "1,2,3"
         if [ "$GPU_SELECTION" = "-1" ]; then
@@ -111,7 +116,7 @@ for worker in "${WORKERS[@]}"; do
 
     case "$ACTION" in
         start)
-            "$TUNE_ROOT/single/start_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --workload "$WORKLOAD"
+            "$TUNE_ROOT/single/start_worker.sh" "$WORKDIR" "$hostname" -- "${MULTI_GPU_ARGS[@]}" --workload "$WORKLOAD"
             ;;
         stop)
             "$TUNE_ROOT/single/stop_worker.sh" "$WORKDIR" "$hostname"
@@ -120,7 +125,7 @@ for worker in "${WORKERS[@]}"; do
             "$TUNE_ROOT/single/stop_worker.sh" "$WORKDIR" "$hostname" --graceful
             ;;
         restart)
-            "$TUNE_ROOT/single/restart_worker.sh" "$WORKDIR" "$hostname" "${MULTI_GPU_ARGS[@]}" -- --workload "$WORKLOAD"
+            "$TUNE_ROOT/single/restart_worker.sh" "$WORKDIR" "$hostname" -- "${MULTI_GPU_ARGS[@]}" --workload "$WORKLOAD"
             ;;
         stopwait)
             "$TUNE_ROOT/single/stopwait_worker.sh" "$WORKDIR" "$hostname"

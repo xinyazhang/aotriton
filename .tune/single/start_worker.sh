@@ -19,9 +19,16 @@ shift 2
 
 # Collect extra args after '--'
 EXTRA_ARGS=()
-if [ "$1" = "--" ]; then
+if [ "${1:-}" = "--" ]; then
   shift
   EXTRA_ARGS=("$@")
+elif [ "$#" -gt 0 ]; then
+  # Refuse rather than ignore. Silently dropping these is what let a caller
+  # that forgot the separator start a perfmon worker from the tuning image:
+  # the workload flag never arrived, WORKLOAD fell back to its default, and
+  # nothing said so.
+  echo "Error: extra arguments must follow a literal '--'; got: $*" >&2
+  exit 1
 fi
 
 if [ -z "$WORKDIR" ] || [ -z "$HOSTNAME" ]; then
