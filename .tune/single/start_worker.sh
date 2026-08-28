@@ -202,17 +202,22 @@ fi
 # was last deployed). Installing at launch is also what keeps the container
 # tracking the mounted checkout rather than a copy frozen at build time.
 #
-# Run UNCONDITIONALLY, not guarded by an `import aotriton` check.
+# Run UNCONDITIONALLY, not guarded by an `import aotriton` check: a deploy
+# updates aotriton.src, and the container that starts after it has to be
+# running that code. A guard would pin a container to whatever the checkout
+# looked like the first time it started.
 #
-# An editable install tracks edits to modules it already knows about, but not
-# new ones: `find_packages()` runs at install time and its result is baked
-# into the generated finder, so a package that appears in a later deploy is
-# invisible to an install made before it existed. python/tune/dispatch/ and
-# python/tune/perfmon/ are both recent examples. A guard would therefore keep
-# a container pinned to whatever the checkout looked like the first time it
-# started, which is exactly the staleness the bind mount exists to avoid.
+# A REGULAR install, not `-e`. Editable buys one thing -- the installed package
+# tracking later edits to the source -- and refreshing on every launch already
+# provides that, so the indirection is all cost and no benefit here. A regular
+# install also copies the tree into site-packages, which makes what the worker
+# imports a snapshot taken at launch: a deploy landing mid-run cannot change
+# the code out from under a live worker, and a half-synced checkout cannot be
+# imported at all.
 #
-# The cost is one pip run per container launch, on an already-populated venv.
+# Costs one pip run per container launch, and leaves build/ and *.egg-info in
+# the mounted aotriton.src (pip builds in-tree). Both are owned by the
+# invoking uid, per the --user note below.
 #
 # --no-deps is load-bearing: the perfmon venv is deliberately torch-free
 # (create_perfmon_dockerfile.sh), and resolving this project's dependencies is
@@ -228,7 +233,7 @@ fi
 # in production use.
 PKG_SETUP=""
 if [ "$WORKLOAD" = "perfmon" ]; then
-  PKG_SETUP="python -m pip install -q -e . --no-deps && "
+  PKG_SETUP="python -m pip install -q . --no-deps && "
 fi
 
 set -x
