@@ -6,11 +6,18 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 usage() {
-  echo 'Usage: build-test.sh [--database_root <dir>] [--name_suffix <suffix>] [--no_mold] [--altwheel_config <yaml>] <target arch> [optional pre-compiled triton wheel]' >&2
+  echo 'Usage: build-test.sh [--database_root <dir>] [--flydsl_kernel_root <dir>] [--name_suffix <suffix>] [--no_mold] [--altwheel_config <yaml>] <target arch> [optional pre-compiled triton wheel]' >&2
   echo '<target arch> can be semicolon separated list of arches.' >&2
+  echo '' >&2
+  echo '--flydsl_kernel_root points the flyc backend at an existing FlyDSL source' >&2
+  echo 'tree instead of the shallow clone at the third_party/flydsl-kernel.txt tag.' >&2
+  echo 'gfx950 currently REQUIRES this: the tagged tree is not sufficient for a' >&2
+  echo 'correct gfx950 build. See modules/flash/flyc/UPSTREAM.md, "The gfx950' >&2
+  echo 'kernel-root pin is stricter than gfx1201s", for the delta and for the' >&2
+  echo 'condition that retires the requirement.' >&2
 }
 
-TEMP=$(getopt -o '' --long database_root:,name_suffix:,no_mold,altwheel_config: -n 'build-test.sh' -- "$@")
+TEMP=$(getopt -o '' --long database_root:,flydsl_kernel_root:,name_suffix:,no_mold,altwheel_config: -n 'build-test.sh' -- "$@")
 if [ $? != 0 ]; then
   usage
   exit 1
@@ -19,6 +26,7 @@ fi
 eval set -- "$TEMP"
 
 database_root=""
+flydsl_kernel_root=""
 name_suffix=""
 no_mold=false
 altwheel_config=""
@@ -26,6 +34,10 @@ while true; do
   case "$1" in
     --database_root)
       database_root="$2"
+      shift 2
+      ;;
+    --flydsl_kernel_root)
+      flydsl_kernel_root="$2"
       shift 2
       ;;
     --name_suffix)
@@ -69,6 +81,10 @@ fi
 
 if [ -n "$database_root" ]; then
   build_args+=("-DAOTRITON_TUNING_DATABASE_ROOT=${database_root}")
+fi
+
+if [ -n "$flydsl_kernel_root" ]; then
+  build_args+=("-DAOTRITON_FLYDSL_KERNEL_ROOT=$(realpath "$flydsl_kernel_root")")
 fi
 
 if [ -n "$name_suffix" ]; then
