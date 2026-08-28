@@ -123,6 +123,19 @@ echo "Tag origin:   $PERFMON_ORIGIN"
 # perfmon image builds its venv -- otherwise installed/perfmon/ comes back
 # root-owned and the next build cannot overwrite it.
 #
+# Same --user, same missing-passwd-entry consequence as
+# .tune/single/start_worker.sh: HOME stays "/" for this uid, so every per-tag
+# build script's `pip install -r requirements.txt` (perfmon/scripts/build-*.sh
+# -- each makes its own throwaway venv, but pip's download CACHE is keyed off
+# $HOME regardless of which venv is active) hits
+#     WARNING: The directory '/.cache/pip' or its parent directory is not
+#     owned or is not writable by the current user. The cache has been
+#     disabled.
+# -e HOME=/wkdir/scratch/home fixes it the same way start_worker.sh does, and
+# the directory is created here, host-side, for the same reason start_worker.sh
+# creates it there rather than leaving the container to try: the container's
+# uid is not guaranteed to be $REMOTE_WORKDIR's owner.
+#
 # The two modes build the docker command by DIFFERENT means, on purpose:
 #
 #   follow    the argv is assembled inside the heredoc, where $(id -u) is a
@@ -160,9 +173,12 @@ PERFMON_ORIGIN="$4"
 shift 4
 TAGS=("$@")
 
+mkdir -p "${REMOTE_WORKDIR}/scratch/home"
+
 jobid=$(tsp docker run --rm \
   --network=host \
   --user "$(id -u):$(id -g)" \
+  -e HOME=/wkdir/scratch/home \
   --mount "type=bind,source=${REMOTE_WORKDIR},target=/wkdir" \
   "$PERFMON_IMAGE" \
   bash /wkdir/aotriton.src/perfmon/build_subject.sh \
@@ -180,7 +196,9 @@ EOF
 else
   # shellcheck disable=SC2029
   ssh -n "$BUILD_NODE_HOST" \
-    "tsp docker run --rm --network=host --user \$(id -u):\$(id -g)"\
+    "mkdir -p $REMOTE_WORKDIR/scratch/home &&"\
+" tsp docker run --rm --network=host --user \$(id -u):\$(id -g)"\
+" -e HOME=/wkdir/scratch/home"\
 " --mount type=bind,source=$REMOTE_WORKDIR,target=/wkdir $PERFMON_IMAGE"\
 " bash /wkdir/aotriton.src/perfmon/build_subject.sh --origin $PERFMON_ORIGIN"\
 " --src_prefix /wkdir/scratch/perfmon/src/"\
