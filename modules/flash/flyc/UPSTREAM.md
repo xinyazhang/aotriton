@@ -245,7 +245,8 @@ pin can reach the commit it lives on.
 | `fmha_dualwave_gfx950.py` | **added:** `ParityStoreHelper._store_lse_row` is split in two — the vendored body is renamed `_store_lse_row_unguarded` verbatim, and a new `_store_lse_row` wraps it in a `@flyc.jit` `if fx.ptrtoint(LSE) != 0` | AOTriton's LSE output is **optional at runtime** (`attn_fwd_params::L`: *"Can be `T2::get_null_tensor()`"*), and the gfx950 kernel had no null test, so an inference caller's null `L` became a buffer descriptor based at address 0 and the store faulted. See below | upstream adds the guard itself |
 | `flash_attn_func_gfx950.py` | **added:** `_KvTailCausalMaskMixin`, and `softmax_helper` is built from `_ParitySoftmaxHelper` / `_WideSoftmaxHelper` (the mixin over the two upstream helpers) instead of `ParitySoftmaxHelper` / `WideSoftmaxHelper`. The mixin overrides `causal_mask_prologue_if_needed` to run `seq_pad_mask_if_needed` *before* delegating | upstream drops the KV tail mask from every causal build, on an argument that holds for `delta = seqlen_kv - seqlen_q` and not for the `delta_i32` a window build re-points at `window_right`. Top-left causal is `window_right == 0`, so rows past `seqlen_kv` attend to columns the K buffer does not have; those read back as 0, which is a logit and not `-inf`. Every `seqlen_q > seqlen_k` case came out too small. See below | upstream masks the tail in window builds (issue 8) |
 | `fmha_bwd_dkdv_gfx950.py` | **changed:** the GQA group loop's trip count is `ctx.num_head_q // ctx.num_head_k`, not `traits.GQA_GROUP_SIZE`; the drain before the loop's staging prologue is guarded on the runtime `g != 0` instead of `const_expr(traits.GQA_GROUP_SIZE > 1)` | the grid is one workgroup per **KV** head with the group's query heads summed inside (`flyc_bwd_dkdv.py`, `FlycBwdDkdvContext::grid_calculator()`), so the loop is what performs the reduction. `num_heads` is not a functional axis and the description pins it to 1, so every build carried `GQA_GROUP_SIZE == 1` and the loop folded away: dK and dV were short by every query head but the first. `_args`, which upstream relies on to reject that mismatch, is a host-side wrapper the C++ launcher never calls | AOT grows a head-count axis, which it will not — the test suite alone uses group 5 (issue 9) |
-| `fmha_bwd_dkdv_m16_gfx950.py` | **added:** `dualwave._s_nop(1)` at the end of `M16SoftmaxHelper.probabilities`, after the eight `exp2` | `v_exp_f32` is a quarter-rate transcendental and needs a wait state before a VALU consumer; `GCNHazardRecognizer` does not insert one for gfx950. With the trip count above making the loop runtime, the scheduler put `v_exp_f32` immediately before the `v_cvt_pk_bf16_f32` that reads it, and that element of the dV B operand carried the pre-`exp2` score. See below | upstream supplies the wait state, or LLVM models the hazard (issue 10) |
+| `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dkdv_gfx950.py` | **added:** `exp2_wait_state(...)` around the `exp2` batch in both families' `probabilities` | `v_exp_f32` is a quarter-rate transcendental and needs a wait state before a VALU consumer; `GCNHazardRecognizer` does not insert one for gfx950. With the trip count above making the loop runtime, the scheduler put `v_exp_f32` immediately before the `v_cvt_pk_bf16_f32` that reads it, and that element of the dV B operand carried the pre-`exp2` score. A bare `_s_nop` does not hold the gap — see below | upstream supplies the wait state, or LLVM models the hazard (issue 10) |
+| `fmha_dualwave_gfx950.py` | **added:** `exp2_wait_state` | the tied-operand inline-asm barrier the two rows above call. Not upstream's to keep either way; it exists only because of issue 10 | same as above |
 | `fmha_dualwave_gfx950.py`, and the call sites in `fmha_bwd_dkdv_gfx950.py`, `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dq_m16_gfx950.py` | **added:** `_lds_ptr_ty`, `_lds_ptr_with_imm`, `_tag_lds_alias`, `_ds_read_tr16_b64_imm` and `_ds_read_tr_v4f16_imm`, copied verbatim from `flash_attn_utils.py` at `0a9c5906` with `ir`/`llvm`/`vector` reached through `dualwave.`. The six `dualwave._ds_read_tr*_imm(...)` call sites drop the `dualwave.` prefix and import the local names instead | the pin emits these reads as **inline asm**, which `SIInsertWaitcnts` cannot see through, so no `s_waitcnt lgkmcnt` is placed before uses; above head_dim 128 the allocator spills to AGPRs and puts `v_accvgpr_write` copies of the destination ahead of the kernel's own wait — 22 unwaited uses at 192, 160 at 256, 0 at 64 and 128 — giving non-deterministic NaN. The op form also takes the alias scopes that keep `buffer_load ... lds` from forcing a `vmcnt(0)` drain, worth ~10% at head_dim 64. Every primitive the op form needs (`rocdl.ds_read_tr16_b64`, `llvm.GEPNoWrapFlags.inbounds`, both `_dualwave_lds_*_scopes`) is already present at the pin; only these five functions are not | `0a9c5906` merges upstream and the pin is bumped to a tag containing it |
 | `fmha_dualwave_gfx950.py` | **changed:** in `_store_lse_row_unguarded`, the head count in LSE's descriptor and row formula is `fx.Index(self.num_head_q)` instead of `traits.NUM_HEADS_Q`; the non-varlen branch spells the production row expression inline rather than delegating to `super()`, since upstream's copy bakes the trait | `NUM_HEADS_Q` is compile-time because upstream compiles per shape. AOT compiles one binary for every head count and pins `num_heads=1`, so the trait made the per-batch slice `1 * tokens`: the batch stride advanced by one head and the buffer bound dropped every head but `h == 0`. `L` came back written for head 0 and NaN elsewhere. The runtime count is already a kernarg, and is what gfx1201 feeds `lse_row_addressing`. See below | upstream takes the head count from the kernarg, **or** AOT stops pinning `num_heads=1` |
 
@@ -1035,11 +1036,41 @@ not of an addressing or algebra error.
 Upstream already carries `dualwave._s_nop(1)` in `ParityGemmHelper.qk` and in
 the dQ M16 family's `qk` for the head_dim 96 defect, and `sdpa_lore_gfx950.md`
 records that a wait state "after `exp2`" also fixes that one — so this is the
-same neighbourhood, found from the other end. The difference is that those two
-are documented as perturbing register allocation rather than supplying a delay;
-this one is a delay, and the offending instruction pair is named.
+same neighbourhood, found from the other end. Those two are documented as
+perturbing register allocation rather than supplying a delay, and that turns out
+to describe this one too.
+
+#### `_s_nop` is not the fix, and the first patch here only looked like one
+
+The original patch put a bare `dualwave._s_nop(1)` after the `exp2` batch and
+claimed it was an ordering point that kept a consumer out of the next slot.
+**That claim was wrong.** `s_nop` is emitted as inline asm with no operands, so
+it orders itself against memory and nothing else; a pure VALU has no dependence
+on it and LLVM moves one across freely. Scanning the shipped dK/dV kernels, the
+`_s_nop` stayed within three instructions of an `exp2` in exactly one of eight
+builds, and `BLOCK_DMODEL=192, PADDED_HEAD=False` still carried two zero-gap
+sites with the patch in. It fixed the one build it was written against by
+changing the allocation, which is the same accident the two `qk` sites are.
+
+The barrier has to be one the values flow *through*. `exp2_wait_state` in
+`fmha_dualwave_gfx950.py` ties every `exp2` result to a matching inline-asm
+output (`"=v,=v,…,0,1,…"`), so the allocator gives each pair one register, the
+asm emits one `s_nop 0`, and a consumer cannot precede it because it reads the
+asm's result rather than the `exp2`'s. Across all 216 compiled dK/dV
+signatures the zero-gap site count is 0.
+
+**`has_side_effects` must be off on that asm.** With it on, the asm becomes a
+scheduling-region boundary; at rung 224, which sits on the 512-VGPR cliff and
+already spills, that took `vgpr_spill_count` from 100 to 440 and cost 38–48% of
+the backward at head_dim 216, `causal=False`. Without it the allocation is
+byte-for-byte the pre-patch one and the ordering is unaffected, because what
+holds the consumer down is the SSA def-use edge and not the flag. Widths 16, 8,
+4 and 1 all spill identically with the flag on, and a
+`sched_barrier(0)`/`s_nop`/`sched_barrier(0)` sandwich spills 296 — the flag is
+the variable, not the shape.
 
 **Fix:** model the hazard in `GCNHazardRecognizer`, or supply the wait state in
-`flash_attn_utils.py` where `exp2` is emitted. Patched locally in
-`fmha_bwd_dkdv_m16_gfx950.py` only, since that is where it is demonstrated; the
-forward and dQ families are exposed to the same gap and are currently lucky.
+`flash_attn_utils.py` where `exp2` is emitted. Patched locally in both dK/dV
+families (`M16SoftmaxHelper` and `BwdDkDvSoftmaxHelper`), since that is where it
+is demonstrated; the forward and dQ families are exposed to the same gap and are
+currently lucky.

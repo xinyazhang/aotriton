@@ -122,6 +122,9 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 KERNEL_NAME = "flash_attn_func_gfx950_kernel"
 
@@ -130,6 +133,7 @@ KERNEL_NAME = "flash_attn_func_gfx950_kernel"
 # primitives the hand-built pipeline is made of, and a second copy of any of
 # them would be a second thing to keep in step.
 from fmha_dualwave_gfx950 import _anchor_v_o  # noqa: E402  (one-accumulator safe)
+from fmha_dualwave_gfx950 import exp2_wait_state  # noqa: E402  (issue 10)
 
 _anchor_v_p = dualwave._anchor_v_p
 _dualwave_sync_barrier = dualwave._dualwave_sync_barrier
@@ -231,11 +235,47 @@ class _KvTailCausalMaskMixin:
         )
 
 
-class _ParitySoftmaxHelper(_KvTailCausalMaskMixin, ParitySoftmaxHelper):
+class _Exp2WaitStateMixin:
+    """`exp2` with the gfx950 `v_exp_f32` wait state; see `exp2_wait_state`.
+
+    The body is `dualwave._exp2_score_slice` verbatim apart from the one call,
+    which is why it is copied rather than wrapped: the results are consumed
+    inside it (`Vec.from_elements` on the `start == 0` path), so there is no
+    return value a wrapper could interpose on.
+
+    The forward is exposed to the hazard the same way dK/dV is, and by the same
+    consumer -- `cast_p` reaches `_bf16_trunc_pack_v8`. A scan of the 108
+    compiled bf16 forward kernels found a zero-gap `v_exp_f32` site in seven,
+    at `BLOCK_DMODEL` 96, 224 and 256, which is exactly the set of rungs whose
+    head dims were failing: 96 serves head_dim 72/80/88/96 and 224 serves 216.
+
+    This also supersedes the `_s_nop(1)` in `ParityGemmHelper.qk`, whose own
+    comment records that it fixes head_dim 96 "not for the reason it looks
+    like" and by perturbing register allocation. That reads as the same defect
+    seen from the other end: a barrier that does not bind, working by accident.
+    The `_s_nop` is left in place because it was measured to cost nothing and
+    removing it is a separate change with its own bisection.
+    """
+
+    def exp2(self, v_s, start, length):
+        if const_expr(start == 0):
+            s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
+            lo_partial = exp2_wait_state(
+                [dualwave.rocdl.exp2(T.f32, as_mlir_value(s_lo[r])) for r in range_constexpr(16)]
+            )
+            return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
+        lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
+        hi_full = exp2_wait_state(
+            [dualwave.rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])) for r in range_constexpr(16)]
+        )
+        return lo_partial, hi_full
+
+
+class _ParitySoftmaxHelper(_Exp2WaitStateMixin, _KvTailCausalMaskMixin, ParitySoftmaxHelper):
     pass
 
 
-class _WideSoftmaxHelper(_KvTailCausalMaskMixin, WideSoftmaxHelper):
+class _WideSoftmaxHelper(_Exp2WaitStateMixin, _KvTailCausalMaskMixin, WideSoftmaxHelper):
     pass
 
 

@@ -207,6 +207,65 @@ def _anchor_v_o(traits, v_o):
     return [dualwave.llvm.inline_asm(acc.type, [acc], "", "=v,0", has_side_effects=True)]
 
 
+def exp2_wait_state(values):
+    """One wait state between a batch of `exp2` results and their consumers.
+
+    `v_exp_f32` is a quarter-rate transcendental -- it retires 16 lanes a cycle
+    -- so a VALU instruction issued in the very next slot reads a destination
+    the trans unit has only partly written. CDNA requires one wait state there
+    and `GCNHazardRecognizer` does not model it for gfx950, so the schedule is
+    free to emit `v_exp_f32 vN, ..` immediately before the
+    `v_cvt_pk_bf16_f32 vM, v(N-1), vN` of `_bf16_trunc_pack_v8`. When it does,
+    that element of the eight-wide B operand carries the *pre-exp* score into
+    the MFMA, which is why the symptom is a single wrong element rather than a
+    wrong tile.
+
+    **`_s_nop` alone does not fix this, and the earlier claim that it did was
+    wrong.** `s_nop` is side-effecting inline asm with no operands, so it
+    orders itself against memory but creates no data dependence on the values;
+    LLVM moves pure VALU across it freely. Measured on the shipped kernels: of
+    the eight dK/dV builds scanned, the `_s_nop(1)` stayed adjacent to an
+    `exp2` in exactly one, and the two zero-gap sites in
+    `BLOCK_DMODEL=192, PADDED_HEAD=False` survived it.
+
+    So the barrier has to be one the value flows *through*. Every input is tied
+    to the matching output (`"0"`, `"1"`, ... constraints), which forces the
+    allocator to give each pair one register: the asm costs no moves, emits the
+    single `s_nop 0` that supplies the wait state, and no consumer can be
+    hoisted above it because it reads the asm's result and not the `exp2`'s.
+    Only the last `exp2` in the batch is actually at risk -- the others have
+    the rest of the batch between them and the barrier -- so one barrier covers
+    the whole list.
+
+    **`has_side_effects` is deliberately off, and it is the difference between
+    free and a 48% regression.** A side-effecting asm is a scheduling-region
+    boundary, and rung 224 sits on the 512-VGPR cliff already spilling: adding
+    one there took `vgpr_spill_count` from 100 to 440 and cost 38-48% of the
+    backward at head_dim 216, `causal=False`. Dropping the flag restores the
+    pre-fix allocation *exactly* -- spill 100 and 468 scratch bytes at
+    `PADDED_HEAD=True`, 80 and 68 at `False`, both identical to the build
+    without this call -- and the ordering does not depend on the flag anyway:
+    what holds a consumer below the `s_nop` is the SSA def-use edge through the
+    tied operand, which no pass can break. Four other shapes were measured and
+    rejected -- side-effecting at widths 16, 8, 4 and 1 all spill 438-440, and
+    a `sched_barrier(0)`/`s_nop`/`sched_barrier(0)` sandwich spills 296.
+
+    `s_nop 0` is one wait state, which is what the hazard asks for. It runs
+    once per score sub-block, against 128 MFMAs in the same loop iteration.
+    """
+    irs = [as_mlir_value(v) for v in values]
+    n = len(irs)
+    if const_expr(n == 1):
+        return [dualwave.llvm.inline_asm(irs[0].type, irs, "s_nop 0", "=v,0", has_side_effects=False)]
+    # Same shape as `dualwave._anchor_v_o`, and the same reason for the struct:
+    # a multi-output asm returns one, and LLVM rejects a struct return from a
+    # single-output asm -- hence the `n == 1` case above.
+    ret_ty = dualwave.ir.Type.parse(f"!llvm.struct<({', '.join(['f32'] * n)})>")
+    constraints = ",".join(["=v"] * n + [str(i) for i in range(n)])
+    ret = dualwave.llvm.inline_asm(ret_ty, irs, "s_nop 0", constraints, has_side_effects=False)
+    return [dualwave.llvm.extractvalue(irs[i].type, ret, [i]) for i in range(n)]
+
+
 # --- the DS transpose reads, vendored ---------------------------------------
 #
 # `flash_attn_utils` at the `third_party/flydsl-kernel.txt` pin emits

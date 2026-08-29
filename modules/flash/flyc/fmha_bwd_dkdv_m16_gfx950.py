@@ -82,7 +82,7 @@ It also leaves a lane's four accumulator rows **contiguous** (`8*(lane//16) +
 """
 
 from fmha_common_gfx1201 import MaskedAxis
-from fmha_dualwave_gfx950 import _ds_read_tr16_b64_imm
+from fmha_dualwave_gfx950 import _ds_read_tr16_b64_imm, exp2_wait_state
 from fmha_mfma16_gfx950 import MFMA16_M, a16_chunk_offset, a16_read_base, lds_elem, tok_off, tok_off_dyn
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -352,35 +352,24 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(ACC16)]
         if const_expr(bias2 is not None):
             scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(ACC16)]
-        out = [
-            dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
-            for r in range_constexpr(ACC16)
-        ]
-        # **A wait state, and this one really is one** -- unlike the `_s_nop(1)`
-        # the two `qk` helpers carry, which the lore file records as perturbing
-        # register allocation rather than supplying a delay.
-        #
-        # `v_exp_f32` is a quarter-rate transcendental: it retires 16 lanes a
-        # cycle, so a VALU consumer issued in the very next slot reads a
-        # partially written destination. CDNA requires one wait state there and
-        # `GCNHazardRecognizer` does not insert it for gfx950, so the schedule
-        # is free to land `v_exp_f32 vN, ..` immediately before the
-        # `v_cvt_pk_bf16_f32` in `_bf16_trunc_pack_v8` that reads `vN` -- and
-        # when it does, that element of the B operand carries the *pre-exp*
-        # score into the dV MFMA. Only the lanes the trans unit had not reached
-        # are wrong, which is why it shows as `kv % 8 < 4` and only for the one
-        # packed element whose producer lost the race.
-        #
-        # `_s_nop` is side-effecting inline asm, so it is an ordering point for
-        # the scheduler: every consumer of these eight results is placed after
-        # it and the gap can no longer be zero. One per score sub-block, which
-        # is eight per loop iteration against 128 MFMAs.
+        # The `v_exp_f32` wait state. `exp2_wait_state` says why it is needed
+        # and why the `dualwave._s_nop(1)` that used to stand here did not
+        # supply it -- the short version is that `s_nop` takes no operands, so
+        # nothing stopped the scheduler from hoisting a `v_cvt_pk_bf16_f32`
+        # above it and back into the slot right after an `exp2`.
         #
         # Found at `block_dmodel=128, mfma_rows=16`, bf16, `BIAS_TYPE=1`, where
         # the schedule that hits it appears once per iteration: dV came out
-        # about five times the reference on the odd tile's second q group.
-        dualwave._s_nop(1)
-        return out
+        # about five times the reference on the odd tile's second q group. The
+        # `_s_nop` fixed *that* build, by luck of the allocation it perturbed,
+        # and left `BLOCK_DMODEL=192, PADDED_HEAD=False` with two zero-gap
+        # sites still in it.
+        return exp2_wait_state(
+            [
+                dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
+                for r in range_constexpr(ACC16)
+            ]
+        )
 
     def dscores(self, p_list, v_dp, delta, keep=None):
         """`dS = P * (dP - delta)`. `dP` is unscaled; `sm_scale` belongs to dK.
