@@ -64,7 +64,10 @@ anything else was written.
 """
 
 import fmha_common_gfx1201 as fmha  # noqa: F401  (kept for the shared row addressing)
-from fmha_dualwave_gfx950 import ParityKernelContext  # noqa: F401  (documents the base this rides on)
+from fmha_dualwave_gfx950 import (  # ParityKernelContext documents the base this rides on
+    ParityKernelContext,  # noqa: F401
+    _ds_read_tr_v4f16_imm,
+)
 from fmha_mfma16_gfx950 import MFMA16_M
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -286,7 +289,7 @@ class M16DqReader:
             imm = self._d_off(c * MFMA16_M) * traits.BF16_BYTES
 
             def read(off):
-                return dualwave._ds_read_tr_v4f16_imm(
+                return _ds_read_tr_v4f16_imm(
                     base,
                     off,
                     lds_kv_base_idx=self.ctx.lds_kv_base_idx,
