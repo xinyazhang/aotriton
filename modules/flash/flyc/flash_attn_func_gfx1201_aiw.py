@@ -500,8 +500,15 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
     # an unrelated flag.
     _LPT_TILE_ORDER = CAUSAL and LPT_TILE_ORDER_KNOB
     # Measurement-only: drops the KV row clamp. UNSAFE in general -- it is
-    # what buffer bounds checking would replace -- but valid for a benchmark
-    # where seq_len is an exact multiple of BLOCK_M.
+    # what buffer bounds checking would replace -- and now the *only* way the
+    # clamp comes off, so read the precondition carefully.
+    #
+    # The condition is `seqlen_k % BLOCK_N == 0`, not the "seq_len a multiple of
+    # BLOCK_M" this said before. BLOCK_M bounds the Q axis and has nothing to
+    # do with it: what over-reads is the ragged KV *tail* tile, whose rows run
+    # to `ceil(seqlen_k / BLOCK_N) * BLOCK_N`. Nothing checks either, at build
+    # time or at launch, so a benchmark that turns this on and then changes its
+    # sequence length reads off the end of K and V.
     _NO_KV_CLAMP = UNSAFE_NO_KV_CLAMP
     # Floating-point latitude granted to the compiler.
     #
@@ -961,9 +968,23 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
         _k_row_off_v = fx.Index(k_row_off)
         # Bias is (B, H, Sq, Sk): the last axis is the KV column, so unlike
         # Q/K/V/O its "row" stride is stride_b_seq_q and the contiguous axis is the
-        # one the KV tile walks. Indexed with the *same* (batch_index,
-        # q_row_off) the varlen decode produced, so it inherits every layout
-        # for free rather than needing its own -- sdpa-bias-plan.md 3.
+        # one the KV tile walks. Indexed with the *same* offsets the varlen
+        # decode produced, so it inherits every layout for free rather than
+        # needing its own -- sdpa-bias-plan.md 3.
+        #
+        # **Both** offsets: `q_row_off` on the row and `k_row_off` on the
+        # column. The column half was missing, so under a packed layout every
+        # sequence read sequence 0's bias columns -- a wrong answer rather than
+        # an out-of-bounds one, since a KV column is always below `seqlen_k`
+        # and so inside the tensor, which is why nothing caught it. It also
+        # contradicted the sentence above: the bias inherited the Q decode and
+        # ignored the K one.
+        #
+        # Inert everywhere with coverage today. `k_row_off` is 0 for dense and
+        # for the padded varlen layouts; only the packed layouts move, and
+        # bias-with-varlen has no test in any of the three suites. That gap is
+        # worth naming rather than papering over: this makes the kernel
+        # self-consistent, it does not settle what a packed bias should mean.
         if const_expr(BIAS_TYPE):
             _b_ptr = fmha.pointer_to_llvm_ptr(B)
             _b_base = (
@@ -995,19 +1016,38 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
             fmha.philox_report(philox_seed_output, philox_offset_output, _ph_seed, _ph_off)
             _ph_base, _ph_stride = PHILOX.grid_plane(_ph_off, _off_zh, max_seqlen_q, max_seqlen_k)
 
-        # `clamp` is const_expr: with both prefetch distances 0 and neither
-        # load guard, there is no over-read, so the clamp is not emitted.
+        # `clamp` is what bounds a KV row against `seqlen_k`. Nothing else does,
+        # so the only way to drop it is the explicit unsafe knob.
         #
-        # **Both** guards, because this one flag is handed to K's *and* V's
-        # aperture. They are computed from different widths -- `_load_geom` is
-        # called on the QK width for K and on VO_CHUNK_COLS for V -- and each
-        # asks whether its rows-per-batch divides BLOCK_N. They agree at every
-        # point on the current ladder, so this changes no emitted code today;
-        # it stops a future V width that does not divide BLOCK_N from silently
-        # losing V's clamp.
-        _KV_CLAMP = not (
-            _NO_KV_CLAMP or (K_PREFETCH_DIST == 0 and V_PREFETCH_DIST == 0 and not K_NEEDS_GUARD and not V_NEEDS_GUARD)
-        )
+        # There used to be a second escape -- "with both prefetch distances 0
+        # and neither load guard, there is no over-read" -- and both halves of
+        # it were wrong:
+        #
+        #   * the only guard in the distance-0 `stage` path is
+        #     `row < block_rows` with `block_rows == BLOCK_N`. That bounds the
+        #     row *within the tile*; it says nothing about `seqlen_k`.
+        #   * "the tail is masked" masks the *scores*, not the address. It held
+        #     only while the interface padded `seqlen_k`, and that padding is
+        #     gone.
+        #
+        # The ragged tail tile therefore walks rows `_full_end ..
+        # _full_end + BLOCK_N - 1`, of which up to `BLOCK_N - 1` are past
+        # `seqlen_k`; at the last KV head that leaves the allocation. Measured
+        # 4096 bytes past K at B=1 H=512 seqlen 16 head_dim 128 with both
+        # distances pinned to 0 -- a HIP fault at exactly K's end.
+        #
+        # It cannot be repaired by narrowing, because raggedness is a *runtime*
+        # property and this predicate is `const_expr`. Note also that it tested
+        # `V_NEEDS_GUARD` while the transposed-V path's guard is
+        # `V_TR_NEEDS_GUARD`, and that for transposed V the global load sits
+        # outside `publish_transposed`'s guard entirely -- two more ways for one
+        # tensor's guard to answer for another.
+        #
+        # No policy-resolved build loses anything: `v_prefetch_dist` defaults to
+        # 1 and no policy path sets it to 0, so the escape was unreachable
+        # except by pinning the knob by hand. This emits identical code for
+        # every shipped configuration.
+        _KV_CLAMP = not _NO_KV_CLAMP
         _addr_kw = dict(
             seqlen_k=seqlen_k_v,
             seq_last=seq_last,
@@ -1592,6 +1632,8 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                     # stays correct under varlen.
                     _bq = q_rows[qt] if (q_row_i32s[qt] < seqlen_q_i32) else fx.Index(0)
                     _b_row = _b_base + _bq * fx.Index(stride_b_seq_q)
+                    # The KV column offset, the mirror of `_bq` on the row.
+                    _b_col0 = _k_row_off_v
                     if const_expr(_MASK_STEPS):
                         # **The tail tile reads one element at a time, with the
                         # address clamped.** A group's eight columns can run
@@ -1620,7 +1662,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                         for _i in range_constexpr(NUM_S_VALS):
                             _bcol = _kv_i32 + fx.Int32(fmha.acc_elem_column(_i)) + _klane_off
                             _bin = _bcol < seqlen_k_i32
-                            _bsafe = fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
+                            _bsafe = _b_col0 + fx.Index(fx.Int32(_bcol) if _bin else fx.Int32(0))
                             _braw = fx.Float32(
                                 fx.as_dsl_value(
                                     _pointer_load(
@@ -1638,7 +1680,7 @@ def build_flash_attn_func_aiw_module_primary(meta, knobs):
                             _c0 = (_st // 2) * 32 + (_st % 2) * 16
                             _bv = load_global_v8f16(
                                 _b_ptr,
-                                _b_row + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
+                                _b_row + _b_col0 + fx.Index(kv_block_start) + fx.Index(_c0) + klane * fx.Index(8),
                                 fx.Index(0),
                             )
                             for _r in range_constexpr(8):

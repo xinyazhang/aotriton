@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: 74b05eb1  (was 73718d1c, 7e258c99, caee9257, 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
+commit: 31b28894  (was 74b05eb1, 73718d1c, 7e258c99, caee9257, 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
 path:   kernels/attention/parity/
 ```
 
@@ -347,6 +347,46 @@ which is why the row and not the column is what crashed. Upstream located it by
 address arithmetic off an `AMD_LOG_LEVEL=3` dump rather than by reasoning: the
 faulting address was 70,074 bytes past a 519,750-byte allocation, and
 `519750 == 3*5*11*(1063+512)*2` identified the bias tensor exactly.
+
+## Re-sync cost, measured at `31b28894`
+
+Four more loading fixes, still in the bias/short-seqlen family:
+
+| commit | |
+|---|---|
+| `674370f2` | an empty varlen sequence gets row 0 of the tensor, not its own |
+| `2d8ddc63` | forward: the KV row clamp comes off only by the unsafe knob |
+| `e4751975` | **ABI**: enforce the D-axis pitch once, on every path, and exactly |
+| `3d12cc3f` | forward: the bias column takes the K row offset too |
+
+Three vendored files: `flash_attn_func_gfx1201_aiw.py` (80 lines),
+`fmha_abi_gfx1201.py` (29), `fmha_common_gfx1201.py` (24). Kernarg ABI unchanged
+at 43 / 50 / 50, no tuning module moved, no ATI description change, and no new
+helper symbol.
+
+**`fmha_abi_gfx1201.py` is the file to be careful with on a re-sync**, and this
+is the first time it has moved since the torch-laziness rewrites were written:
+it is the only vendored file carrying rewrite table 1b rather than 1a, its three
+insertion points have no import line to grep for, and getting one wrong is a
+module-scope `import torch` in a venv that has none. Locate them by the code
+they guard, not by line number, then check the result mechanically:
+
+```python
+# no module-scope torch import, and every function touching torch imports it locally
+import ast
+t = ast.parse(open('fmha_abi_gfx1201.py').read())
+assert not [n for n in t.body if isinstance(n, (ast.Import, ast.ImportFrom))
+            and 'torch' in ((getattr(n, 'module', '') or '') + ''.join(a.name for a in n.names))]
+for fn in [n for n in ast.walk(t) if isinstance(n, ast.FunctionDef)]:
+    body = [b for b in fn.body if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))]
+    src = ast.unparse(ast.Module(body=body, type_ignores=[])) if body else ''
+    if 'torch' in src:
+        assert any(isinstance(x, (ast.Import, ast.ImportFrom)) and 'torch' in ast.unparse(x)
+                   for x in ast.walk(fn)), fn.name
+```
+
+Still three insertion points at `31b28894`, unchanged in shape: the rank-2 f32
+row check, the logsumexp pointer helper, and the philox u64 scalar helper.
 
 ## Re-sync procedure
 

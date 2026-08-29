@@ -75,8 +75,7 @@ from kernels.common import buffer_ops, kernels_common
 # from `kernels.common.utils` -- ssel, smin, smax, sdiv_rd_pow2 -- are
 # branch-local and absent from the released tag the build clones, so both names
 # alias the polyfill wholesale and no call site below changes. `buffer_ops` and
-# `kernels_common` are NOT rewritten: `get_element_ptr` and `_if_then` are in
-# the released tree.
+# `kernels_common` are NOT rewritten: their symbols are in the released tree.
 import flyc_polyfill as wmma_ops
 import flyc_polyfill as common_utils
 
@@ -1305,6 +1304,30 @@ def decode_addressing(varlen_bits, bits_shift, max_seqlen, s0, s1, z):
             common_utils.ssel(stacked, z * fx.Int32(max_seqlen), zero),
         ),
     )
+    # **An empty sequence gets row 0 of the tensor, not row 0 of itself.**
+    #
+    # A zero-length sequence has no row to point at. Under a packed layout a
+    # *trailing* one puts `row_off` at exactly `total_tokens`, so even row 0 of
+    # that sequence is one past the last row of the tensor -- and every clamp
+    # downstream is powerless, because `MaskedAxis.safe` redirects to element 0
+    # *of the axis* and an empty axis has none. Three kernels read past the end
+    # of Q, dO and K/V that way; two of the three were reproduced as HIP
+    # memory-access faults whose address was bit-for-bit the end of the tensor.
+    #
+    # Redirecting the offset itself is what there always is a legal answer for:
+    # row 0 of the whole tensor exists whenever any workgroup runs at all, since
+    # a zero-row tensor makes the grid empty.
+    #
+    # Nothing else needs to change, because a workgroup on an empty sequence
+    # already does no work: every loop is zero-trip (`decompose_causal_regions`
+    # inverts its range when `alive` is false) and every store is guarded. The
+    # prologue preloads were the one access that ran regardless, and their
+    # results are discarded -- so making the address legal is the whole fix,
+    # and skipping the transaction as well would buy nothing.
+    #
+    # Inert for every non-empty sequence, and for the padded layouts where
+    # `row_off` is already zero.
+    row_off = common_utils.ssel(seqlen > zero, row_off, zero)
     batch = common_utils.ssel(stacked, zero, z)
     return seqlen, row_off, batch
 
