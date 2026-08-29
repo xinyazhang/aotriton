@@ -136,6 +136,7 @@ from fmha_dualwave_gfx950 import (
     _ds_read_tr_v4f16_imm,
     _score_column_runs,
     _v_imm_lo,
+    exp2_wait_state,
     wire_ptr,
     wire_view,
 )
@@ -1141,10 +1142,12 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
         scaled = [dualwave._fmul(values[r], scale, fm) for r in range_constexpr(16)]
         if const_expr(bias2 is not None):
             scaled = [dualwave._fadd(scaled[r], bias2[r], fm) for r in range_constexpr(16)]
-        return [
-            dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
-            for r in range_constexpr(16)
-        ]
+        return exp2_wait_state(
+            [
+                dualwave.rocdl.exp2(T.f32, as_mlir_value(dualwave._fadd(scaled[r], neg_lse2[r], fm)))
+                for r in range_constexpr(16)
+            ]
+        )
 
     # -- the forward's bias path, shadowed ---------------------------------
     #
