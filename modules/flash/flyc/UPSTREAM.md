@@ -5,7 +5,7 @@
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx1201-feature
-commit: 73718d1c  (was 7e258c99, caee9257, 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
+commit: 74b05eb1  (was 73718d1c, 7e258c99, caee9257, 93d8d497f8e9bbc66106617feb851cf0fb12acd3)
 path:   kernels/attention/parity/
 ```
 
@@ -320,6 +320,33 @@ signature to look for if it ever comes back.
 AOTriton cannot prevent this from its side: it has ONE `BLOCK_DMODEL` axis, so
 `block_dmodel_v = block_dmodel = tile` is the only thing the description can
 pass, and both real extents necessarily arrive as runtime `hdim_qk`/`hdim_vo`.
+
+## Re-sync cost, measured at `74b05eb1`
+
+Bias out-of-bounds loads, in two commits: `903f22fc` clamps the bias COLUMN on
+the tail tile "in all three kernels" (forward, dQ, fuse), `74b05eb1` clamps the
+bias ROW in the forward, "which is what actually faulted".
+
+| | |
+|---|---|
+| vendored files changed | 2 — `flash_attn_func_gfx1201_aiw.py` (90 lines), `fmha_bwd_dq_gfx1201_kernel.py` (56) |
+| our re-wiring | the usual 2 + 3 import lines; nothing else |
+| kernarg ABI | **unchanged** — 43 / 50 / 50, all claimed in order |
+| tuning modules | untouched, so psel strings and the generated shim do not move |
+| ATI description changes | none |
+
+`fmha_bwd_fuse_gfx1201_kernel.py` also changed and is deliberately not vendored;
+dK/dV was already correct here and is untouched.
+
+Worth keeping because it is the second bug in this family that AOTriton could
+not have caught by inspection: a workgroup covers `BLOCK_M` query rows whatever
+`seqlen_q` is — 128 rows at head_dim 24 against a seqlen_q of 11 — and every
+dead lane still ran the bias load. Rows are `stride_b_seq_q` apart, so the
+overshoot leaves the tensor outright rather than reading a neighbouring row,
+which is why the row and not the column is what crashed. Upstream located it by
+address arithmetic off an `AMD_LOG_LEVEL=3` dump rather than by reasoning: the
+faulting address was 70,074 bytes past a 519,750-byte allocation, and
+`519750 == 3*5*11*(1063+512)*2` identified the bias tensor exactly.
 
 ## Re-sync procedure
 
