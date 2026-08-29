@@ -9,12 +9,17 @@ usage() {
   echo 'Usage: build-test.sh [--database_root <dir>] [--flydsl_kernel_root <dir>] [--name_suffix <suffix>] [--no_mold] [--altwheel_config <yaml>] <target arch> [optional pre-compiled triton wheel]' >&2
   echo '<target arch> can be semicolon separated list of arches.' >&2
   echo '' >&2
-  echo '--flydsl_kernel_root points the flyc backend at an existing FlyDSL source' >&2
-  echo 'tree instead of the shallow clone at the third_party/flydsl-kernel.txt tag.' >&2
-  echo 'gfx950 currently REQUIRES this: the tagged tree is not sufficient for a' >&2
-  echo 'correct gfx950 build. See modules/flash/flyc/UPSTREAM.md, "The gfx950' >&2
-  echo 'kernel-root pin is stricter than gfx1201s", for the delta and for the' >&2
-  echo 'condition that retires the requirement.' >&2
+  echo '--flydsl_kernel_root is OPTIONAL and points the flyc backend at an existing' >&2
+  echo 'FlyDSL source tree. Left unset, CMake shallow-clones the ref named by' >&2
+  echo 'third_party/flydsl-kernel.txt into <build dir>/flydsl and points' >&2
+  echo 'AOTRITON_FLYDSL_KERNEL_ROOT at that, so no build needs this flag to' >&2
+  echo 'configure. Pass it to build against local FlyDSL kernel changes.' >&2
+  echo '' >&2
+  echo 'One caveat, numerical and gfx950-only: head_dim above 128 needs the ROCDL' >&2
+  echo 'LDS-transpose change, which has not landed upstream and so is in no tag the' >&2
+  echo 'pin can name. Until it does, a gfx950 build wanting those head dims has to' >&2
+  echo 'point this at a tree carrying it. See modules/flash/flyc/UPSTREAM.md, "The' >&2
+  echo 'gfx950 kernel-root pin is stricter than gfx1201s".' >&2
 }
 
 TEMP=$(getopt -o '' --long database_root:,flydsl_kernel_root:,name_suffix:,no_mold,altwheel_config: -n 'build-test.sh' -- "$@")
