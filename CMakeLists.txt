@@ -364,13 +364,18 @@ if(NOT AOTRITON_NOIMAGE_MODE)
   add_custom_target(aotriton_venv_flydsl ALL DEPENDS "${AOTRITON_FLYDSL_STAMP}")
 
   ## Handle flydsl-kernel.txt -- same shape as third_party/aiter.txt, see
-  ## v3src/CMakeLists.txt. Only kernels/common is consumed; the vendored attention
-  ## kernels themselves live in modules/flash/flyc/ and are NOT taken from here.
+  ## v3src/CMakeLists.txt. The vendored attention kernel *bodies* live in
+  ## modules/flash/flyc/ and are NOT taken from here, but two libraries they are
+  ## written against still are: kernels/common (buffer_ops, kernels_common) and
+  ## kernels/attention/flash_attn_utils.py -- the `dualwave` module supplying the
+  ## base classes and emitter helpers every gfx950 kernel derives from. The pip
+  ## wheel from flydsl-compiler.txt ships the compiler and no kernels/ at all,
+  ## which is why this second, independent pin exists.
   find_package(Git REQUIRED)
   file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/third_party/flydsl-kernel.txt" FLYDSL_GIT_TAG
        LIMIT_COUNT 1 ENCODING UTF-8)
   set(AOTRITON_FLYDSL_KERNEL_ROOT "${CMAKE_CURRENT_BINARY_DIR}/flydsl" CACHE PATH
-      "Root of a FlyDSL source tree supplying kernels/common. Defaults to a shallow clone at the third_party/flydsl-kernel.txt tag; point it at an existing checkout to build against local kernel changes.")
+      "Root of a FlyDSL source tree supplying kernels/common and kernels/attention. OPTIONAL: defaults to a shallow clone at the third_party/flydsl-kernel.txt tag, so no build has to set it. Point it at an existing checkout to build against local kernel changes.")
   if(AOTRITON_FLYDSL_KERNEL_ROOT STREQUAL "${CMAKE_CURRENT_BINARY_DIR}/flydsl")
     # CAVEAT: MUST USE GIT TAG OTHERWISE --depth 1 --branch WILL NOT WORK
     if(NOT EXISTS "${AOTRITON_FLYDSL_KERNEL_ROOT}/.git")
