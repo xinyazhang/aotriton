@@ -82,6 +82,7 @@ It also leaves a lane's four accumulator rows **contiguous** (`8*(lane//16) +
 """
 
 from fmha_common_gfx1201 import MaskedAxis
+from fmha_dualwave_gfx950 import _ds_read_tr16_b64_imm
 from fmha_mfma16_gfx950 import MFMA16_M, a16_chunk_offset, a16_read_base, lds_elem, tok_off, tok_off_dyn
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -212,10 +213,10 @@ class M16StreamReader(dualwave.DualwaveKernelContext):
         packs = []
         for g in range_constexpr(q_groups(traits)):
             base = chunk_off + tok_off(traits, g * MFMA16_K) * traits.BF16_BYTES
-            a = dualwave._ds_read_tr16_b64_imm(
+            a = _ds_read_tr16_b64_imm(
                 self.v_lds_read_vec4_type, addr, base, scope_name=scope_name, scope_names=traits.LDS_SCOPE_NAMES
             )
-            b = dualwave._ds_read_tr16_b64_imm(
+            b = _ds_read_tr16_b64_imm(
                 self.v_lds_read_vec4_type,
                 addr,
                 base + pair,

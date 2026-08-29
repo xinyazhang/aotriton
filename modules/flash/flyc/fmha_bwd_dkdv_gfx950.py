@@ -133,6 +133,7 @@ from fmha_dualwave_gfx950 import (
     ParityKernelContext,
     ParityKvGmemToLdsLoader,
     ParitySoftmaxHelper,
+    _ds_read_tr_v4f16_imm,
     _score_column_runs,
     _v_imm_lo,
     wire_ptr,
@@ -1005,7 +1006,7 @@ class BwdDkDvStreamReader(dualwave.DualwaveKernelContext):
         packs = []
         for k_substep in range_constexpr(4):
             imm_lo = _v_imm_lo(traits, dc, k_substep)
-            a = dualwave._ds_read_tr_v4f16_imm(
+            a = _ds_read_tr_v4f16_imm(
                 lds_base,
                 imm_lo,
                 lds_kv_base_idx=self.lds_kv_base_idx,
@@ -1013,7 +1014,7 @@ class BwdDkDvStreamReader(dualwave.DualwaveKernelContext):
                 scope_name=scope_name,
                 scope_names=traits.LDS_SCOPE_NAMES,
             )
-            b = dualwave._ds_read_tr_v4f16_imm(
+            b = _ds_read_tr_v4f16_imm(
                 lds_base,
                 imm_lo + pair,
                 lds_kv_base_idx=self.lds_kv_base_idx,
