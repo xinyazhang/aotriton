@@ -207,6 +207,58 @@ def _anchor_v_o(traits, v_o):
     return [dualwave.llvm.inline_asm(acc.type, [acc], "", "=v,0", has_side_effects=True)]
 
 
+def mfma_operand_wait_state(pack):
+    """Two wait states between a packed MFMA operand and the MFMA reading it.
+
+    A sibling of `exp2_wait_state`, one step further down the same chain: that
+    one keeps `v_exp_f32` away from the `v_cvt_pk_bf16_f32` that reads it, this
+    one keeps the `v_cvt_pk_bf16_f32` away from the `v_mfma` that reads *its*
+    result as SrcA or SrcB. Same barrier shape and the same reason for it -- a
+    bare `_s_nop` creates no data dependence, so only an asm the value flows
+    through pins the gap.
+
+    **The hazard, as measured.** In `flyc_bwd_dkdv` at `BLOCK_DMODEL=128`,
+    bf16, `CAUSAL_TYPE=0`, `ENABLE_DROPOUT=True`, `PADDED_HEAD=False`,
+    `BIAS_TYPE=1` the scheduler emitted
+
+        v_cvt_pk_bf16_f32 v70, v0, v1
+        s_waitcnt lgkmcnt(1)
+        v_mfma_f32_16x16x32_bf16 v[54:57], v[78:81], v[70:73], v[54:57]
+
+    and `v[54:57]` came out as uninitialised-looking garbage -- NaN and values
+    around 1e23 against a correct magnitude of 2e-3 -- in dK head-dim columns
+    16..31 and nowhere else. Swapping the `v_cvt_pk_bf16_f32` with the
+    `ds_read_b64_tr_b16` above it, which changes nothing but the slot distance
+    (the `lgkmcnt(1)` leaves the same DS op outstanding either way), makes the
+    kernel correct. That patch was applied to the shipped `.hsaco` by hand and
+    five previously-failing shapes came out clean, including the two that had
+    been failing hardest.
+
+    **It is a wait-state hazard and not a memory-visibility one.** Forcing
+    *every* `s_waitcnt` in the same kernel to `vmcnt(0) lgkmcnt(0)` -- all 131
+    of them, again by patching the `.hsaco` -- left the corruption exactly as
+    it was, so the LDS data was demonstrably present and the fault is on the
+    VGPR side. `s_waitcnt` retires on the scalar pipe, so an already-satisfied
+    one between the two supplies no wait state at all.
+
+    **Scope is deliberately narrow.** A blanket "VALU write then MFMA read
+    needs two wait states" is not what the hardware does: scanning all 648
+    built gfx950 FlyDSL kernels finds ~7500 sites with fewer than two
+    vector-pipe instructions in the gap, across 426 kernels that overwhelmingly
+    pass. So this guards one shape -- a `_bf16_trunc_pack_v8` result on its way
+    into an MFMA operand -- and not the general pattern. The fp16 half of that
+    pack goes through it too, for symmetry and because its producer is the same
+    class of instruction, though only bf16 has been seen to fail. What separates
+    the failing site from the benign majority is not established -- see
+    `UPSTREAM.md` issue 11.
+
+    `s_nop 1` is two wait states. One runs per eight-element pack, against the
+    128 MFMAs in the same loop iteration.
+    """
+    ir_val = as_mlir_value(pack)
+    return dualwave.llvm.inline_asm(ir_val.type, [ir_val], "s_nop 1", "=v,0", has_side_effects=False)
+
+
 def exp2_wait_state(values):
     """One wait state between a batch of `exp2` results and their consumers.
 

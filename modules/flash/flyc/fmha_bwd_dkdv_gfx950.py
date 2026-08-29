@@ -137,6 +137,7 @@ from fmha_dualwave_gfx950 import (
     _score_column_runs,
     _v_imm_lo,
     exp2_wait_state,
+    mfma_operand_wait_state,
     wire_ptr,
     wire_view,
 )
@@ -1297,10 +1298,18 @@ class BwdDkDvSoftmaxHelper(ParitySoftmaxHelper):
         packs both halves together because its two accumulators are live
         together anyway; here they deliberately are not (see
         `BwdDkDvTileBody.run`), and a whole-tile packer would force them to be.
+
+        Each pack leaves through `mfma_operand_wait_state`, which is where the
+        `v_cvt_pk_bf16_f32`-into-`v_mfma` wait state comes from; that docstring
+        has the measurement. The barrier is on the pack rather than inside
+        `contract_q` so that it sits at the producer, which is the end the
+        hazard is counted from.
         """
         return [
-            dualwave._bf16_trunc_pack_v8(
-                self.traits, [values[p * 8 + s] for s in range_constexpr(8)], elem_dtype=self.elem_dtype
+            mfma_operand_wait_state(
+                dualwave._bf16_trunc_pack_v8(
+                    self.traits, [values[p * 8 + s] for s in range_constexpr(8)], elem_dtype=self.elem_dtype
+                )
             )
             for p in range_constexpr(self.traits.PV_K_STEPS)
         ]

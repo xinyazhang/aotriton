@@ -67,6 +67,7 @@ import fmha_common_gfx1201 as fmha  # noqa: F401  (kept for the shared row addre
 from fmha_dualwave_gfx950 import (  # ParityKernelContext documents the base this rides on
     ParityKernelContext,  # noqa: F401
     _ds_read_tr_v4f16_imm,
+    mfma_operand_wait_state,
 )
 from fmha_mfma16_gfx950 import MFMA16_M
 from gfx950_standalone import buffer_ops, dualwave
@@ -614,9 +615,16 @@ class M16DqSoftmax:
         operand must hold the token the transpose read put at `4g + 16r + i` --
         which is accumulator half `r`, element `i`. The whole permutation
         argument reduces to this concatenation being in the obvious order.
+
+        The pack leaves through `mfma_operand_wait_state` for the same reason
+        dK/dV's does; that docstring has the measurement. dQ has not been seen
+        to fail this way, but it builds the operand with the same instruction
+        and hands it to the same MFMA shape, and the barrier is free.
         """
         vals = list(ds_lists[0]) + list(ds_lists[1])
-        return dualwave._bf16_trunc_pack_v8(self.traits, vals, elem_dtype=self.ctx.elem_dtype)
+        return mfma_operand_wait_state(
+            dualwave._bf16_trunc_pack_v8(self.traits, vals, elem_dtype=self.ctx.elem_dtype)
+        )
 
 
 class M16DqStore:

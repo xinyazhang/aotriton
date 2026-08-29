@@ -1074,3 +1074,66 @@ the variable, not the shape.
 families (`M16SoftmaxHelper` and `BwdDkDvSoftmaxHelper`), since that is where it
 is demonstrated; the forward and dQ families are exposed to the same gap and are
 currently lucky.
+
+### 11. No wait state between `v_cvt_pk_bf16_f32` and the MFMA that reads it
+
+One step further down the chain than issue 10: that one is `v_exp_f32` into the
+`v_cvt_pk_bf16_f32` that reads it, this one is that `v_cvt_pk_bf16_f32` into the
+`v_mfma` that reads *its* result as SrcB.
+
+`flyc_bwd_dkdv`, `Q='*bf16:16' BLOCK_DMODEL=128 CAUSAL_TYPE=0
+ENABLE_DROPOUT=True PADDED_HEAD=False BIAS_TYPE=1`, `mfma_rows=16`, compiled to
+
+```
+v_cvt_pk_bf16_f32 v70, v0, v1
+s_waitcnt lgkmcnt(1)
+v_mfma_f32_16x16x32_bf16 v[54:57], v[78:81], v[70:73], v[54:57]
+```
+
+and `v[54:57]` came out as garbage — NaN, and magnitudes around 1e23 and 1e28
+against a correct 2e-3 — in dK head-dim columns 16..31 and in no other column.
+The failure is non-deterministic: two runs from the same seed, with bit-identical
+inputs and a bit-identical reference, disagreed on which rows were wrong (84092
+vs 94272 bad cells, only 2192 of the bad rows in common), so it is a timing race
+and not a miscompiled value. dV out of the same kernel is always correct.
+
+**It is a wait-state hazard, and not a memory-visibility one.** Patching all 131
+`s_waitcnt` in the shipped `.hsaco` to `vmcnt(0) lgkmcnt(0)` left the corruption
+exactly as it was, which rules out the LDS fill, the LDS-DMA-versus-VGPR-load
+ordering, and the barrier placement in one shot: the data was demonstrably
+there. `s_waitcnt` retires on the scalar pipe, so an already-satisfied one
+between the two supplies no wait state at all — the real gap here is zero.
+
+**One instruction slot is the whole of it.** Swapping the `v_cvt_pk_bf16_f32`
+with the `ds_read_b64_tr_b16` above it — semantically a no-op, since the
+`lgkmcnt(1)` leaves the same DS op outstanding either way and neither writes
+what the other reads — makes the kernel correct. Applied by hand to the shipped
+`.hsaco`, five previously-failing shapes came out clean, including the two that
+failed hardest.
+
+**Scope is not established, and the obvious generalisation is wrong.** A blanket
+"VALU write then MFMA read needs two wait states" cannot be the rule: scanning
+all 648 built gfx950 FlyDSL kernels finds ~7500 sites with fewer than two
+vector-pipe instructions between a VALU write and an MFMA reading that register,
+spread over 426 kernels that overwhelmingly pass. Narrowing to the
+`v_cvt_pk_*_f32`-into-MFMA-SrcB shape at zero effective wait states still leaves
+196 kernels — 48 forward, 42 dK/dV, 78 dQ (with `_bf16_trunc_pack_v8` producing
+SrcB in every one). What separates the one site that corrupts from the rest is
+not known. Candidates not ruled out: the producer writing the *first* register
+of the SrcB tuple, and the intervening instruction being scalar rather than
+merely short.
+
+**Fix:** model the hazard in `GCNHazardRecognizer`, or supply the wait state in
+`flash_attn_utils.py` where `_bf16_trunc_pack_v8` builds the operand. Patched
+locally by `mfma_operand_wait_state` in `fmha_dualwave_gfx950.py` — the same
+tied-operand inline-asm shape as `exp2_wait_state` and for the same reason, with
+`s_nop 1` for two wait states — applied at the three pack sites the shadow layer
+owns: `M16SoftmaxHelper.pack_group` (where it was demonstrated),
+`BwdDkDvSoftmaxHelper.pack_half` and `M16DqSoftmax.pack_ds`. Free on the
+demonstrated kernel: `vgpr_count` 202 → 200, `vgpr_spill_count` 0 → 0,
+`sgpr_spill_count` 115 → 115, and the compile metadata otherwise byte-identical.
+
+**Still exposed:** the forward and the 32-row dQ build their packs in upstream's
+`DualwaveSoftmaxHelper.cast_p`, which the shadow layer does not override, so the
+126 kernels of those two families keep the gap. Overriding `cast_p` would close
+them, and has not been done because neither has been observed to fail.

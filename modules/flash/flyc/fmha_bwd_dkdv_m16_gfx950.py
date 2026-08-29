@@ -82,7 +82,7 @@ It also leaves a lane's four accumulator rows **contiguous** (`8*(lane//16) +
 """
 
 from fmha_common_gfx1201 import MaskedAxis
-from fmha_dualwave_gfx950 import _ds_read_tr16_b64_imm, exp2_wait_state
+from fmha_dualwave_gfx950 import _ds_read_tr16_b64_imm, exp2_wait_state, mfma_operand_wait_state
 from fmha_mfma16_gfx950 import MFMA16_M, a16_chunk_offset, a16_read_base, lds_elem, tok_off, tok_off_dyn
 from gfx950_standalone import buffer_ops, dualwave
 
@@ -461,8 +461,15 @@ class M16SoftmaxHelper(dualwave.DualwaveKernelContext):
         and four of another quarter wave's. `_bf16_trunc_pack_v8` is the 32-row
         family's, unchanged -- which is the other reason `16x16x32` is the
         cheaper port.
+
+        The pack leaves through `mfma_operand_wait_state`, which supplies the
+        `v_cvt_pk_bf16_f32`-into-`v_mfma` wait state. This is the family the
+        hazard was found in -- `block_dmodel=128`, `mfma_rows=16`, bf16,
+        dropout, matrix bias -- and that docstring has the measurement.
         """
-        return dualwave._bf16_trunc_pack_v8(self.traits, list(lo) + list(hi), elem_dtype=self.elem_dtype)
+        return mfma_operand_wait_state(
+            dualwave._bf16_trunc_pack_v8(self.traits, list(lo) + list(hi), elem_dtype=self.elem_dtype)
+        )
 
 
 class M16StoreHelper(dualwave.DualwaveKernelContext):
