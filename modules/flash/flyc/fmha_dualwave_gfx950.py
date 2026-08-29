@@ -454,6 +454,50 @@ def _v_imm_lo(traits, dc, k_substep):
     return (k_substep * traits.V_LDS_TO_REG_K_SUBSTEP_STRIDE + _v_dc_offset(traits, dc)) * traits.BF16_BYTES
 
 
+def _bias_slab_num_records_bytes(seqlen_q, seqlen_kv, stride_b_seq_q, elem_bytes):
+    """Byte bound for a `(q_row, kv_col)` bias slab, in `num_records` terms.
+
+    `stride_b_seq_q` is the distance between bias rows, **not** the width of
+    one. They coincide only when the bias is contiguous in `(.., seqlen_q,
+    seqlen_k)` order; a BSHD caller hands us `(batch, seqlen_q, head,
+    seqlen_k)`, where the row stride is `num_heads * seqlen_k` and each row's
+    real extent is `seqlen_k` -- the rest of the stride belongs to the *other
+    heads* of that row.
+
+    So `seqlen_q * stride_b_seq_q`, the obvious bound, overshoots the slab by
+    `stride_b_seq_q - seqlen_k`. For an interior head that merely reads a
+    neighbouring head's bias into columns the KV tail mask then sets to `-inf`,
+    which is invisible. For the **last** (batch, head) slab it runs off the end
+    of the tensor, and if the allocation happens to end a mapping there it is a
+    hard memory fault rather than a clamped read: `flyc_attn_fwd` faulting on
+    the first byte past a `(3, 5, 32, 16)` bias with strides
+    `(2560, 16, 80, 1)`, 128 bytes past, is exactly this.
+
+    The true end of the slab is the last row's last column, so the bound is
+    `(seqlen_q - 1) * stride_b_seq_q + seqlen_k`. That subtraction wraps when
+    `seqlen_q` is 0 -- a varlen empty sequence -- and an index that wraps
+    becomes a `num_records` covering all of memory, which is the failure this
+    is fixing rather than a smaller version of it. `minui` against the
+    untightened span pins that case back to 0 and is a no-op everywhere else,
+    since `seqlen_k <= stride_b_seq_q` always holds.
+
+    **Do not round this up, and do not widen it back to `loose`.** Ending on
+    the last valid element costs the *readers* something: gfx950 range-checks a
+    multi-dword buffer op per dword and drops any dword not wholly inside
+    `num_records`, so for odd `seqlen_k` a wide read of the last row loses
+    column `seqlen_k-1` to the out-of-range column `seqlen_k` sharing its
+    dword. That is a load-side problem and `ParitySoftmaxHelper._add_bias_
+    inplace` solves it load-side, with 2-byte reads on the tiles that can hold
+    that column. Buying those columns back here instead would mean reading
+    memory the caller never handed us -- 2 bytes for a rounded-up bound, up to
+    `(stride_b_seq_q - seqlen_k) * elem_bytes` for `loose`, which is the fault
+    described above.
+    """
+    loose = seqlen_q * fx.Index(stride_b_seq_q) * fx.Index(elem_bytes)
+    tight = (seqlen_q * fx.Index(stride_b_seq_q) - fx.Index(stride_b_seq_q) + seqlen_kv) * fx.Index(elem_bytes)
+    return arith.minui(as_mlir_value(tight), as_mlir_value(loose))
+
+
 def _score_column_runs(kv_vectorized):
     """`[(element_index, column_offset, width)]` covering one score vector.
 
@@ -1091,11 +1135,14 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             # The bound is the slab, so a row past `seqlen_q` reads zero
             # instead of faulting -- which is also the right bias for a padded
             # row -- and so does a column that runs off the last row's end.
-            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq_q)
+            # `_bias_slab_num_records_bytes` is what makes the second half of
+            # that true when the bias row stride is wider than the row.
             self.bias_rsrc = buffer_ops.create_buffer_resource(
                 self.Bias,
                 max_size=False,
-                num_records_bytes=as_mlir_value(_bias_span * fx.Index(traits.BF16_BYTES)),
+                num_records_bytes=_bias_slab_num_records_bytes(
+                    self.seqlen_q_v, self.seqlen_kv_v, self.stride_b_seq_q, traits.BF16_BYTES
+                ),
                 base_byte_offset=as_mlir_value(
                     self._slab_byte_base(
                         self.stride_b_batch,
@@ -1434,7 +1481,7 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
     # -- P5: bias ------------------------------------------------------------
 
-    def _add_bias_inplace(self, v_s, tile_idx):
+    def _add_bias_inplace(self, v_s, tile_idx, narrow_tail=False):
         """`S += bias * log2(e)`, in place, for one KV tile.
 
         **After the scale and before the mask**, and both halves of that matter:
@@ -1449,6 +1496,25 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
 
         No runtime "does this tile need it" guard. There is nothing to skip: a
         bias build reads a bias for every live tile by definition.
+
+        `narrow_tail` reads the run one column at a time instead of as one
+        `dwordx2`/`dwordx4`. gfx950 range-checks a multi-dword buffer op **per
+        dword** and drops any dword that is not wholly inside `num_records`, so
+        a live column paired into the same dword as an out-of-range one is
+        dropped with it. `_bias_slab_num_records_bytes` ends the slab exactly on
+        the last valid element, so for odd `seqlen_k` the final dword covers
+        columns `(seqlen_k-1, seqlen_k)` and straddles: the last row's last bias
+        entry reads back 0, for every `(batch, head)`. Widening the bound would
+        make the kernel read memory the caller never handed it, so the load
+        narrows instead.
+
+        Only the tiles that can *contain* column `seqlen_k-1` need it. A
+        straddle requires `seqlen_k` odd, hence `seqlen_k % BLOCK_N != 0`, hence
+        that tile is partial and takes the KV tail mask -- so
+        `seq_pad_mask_if_needed` passes `narrow_tail`, and `bias_to_lists` does
+        not. An interior tile is wholly in bounds, so its final dword covers
+        `(c, c+1)` with `c+1 <= seqlen_k-1` and ends at or before the bound; it
+        keeps the wide load.
         """
         traits = self.traits
         ctx = self.ctx_ref
@@ -1475,9 +1541,24 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         fm_bias = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
         for half, values in ((0, s_lo), (1, s_hi)):
             for elem0, col_off, width in _score_column_runs(traits.KV_VECTORIZED):
+                run_base = row_base + col_base + fx.Index(col_off + half * 32)
+                if const_expr(narrow_tail):
+                    for j in range_constexpr(width):
+                        one = buffer_ops.buffer_load(
+                            ctx.bias_rsrc,
+                            as_mlir_value(fx.Int32(run_base + fx.Index(j))),
+                            vec_width=1,
+                            dtype=ctx.elem_dtype,
+                        )
+                        # `vec_width=1` returns a **scalar** of the element
+                        # type, not a one-lane vector, so it is wrapped
+                        # directly rather than through `Vec(...)[0]`.
+                        b = fx.Float32(ctx.elem_dtype(one).to(fx.Float32))
+                        values[elem0 + j] = dualwave._fadd(values[elem0 + j], dualwave._fmul(b, log2e, fm_bias), fm_bias)
+                    continue
                 span = buffer_ops.buffer_load(
                     ctx.bias_rsrc,
-                    as_mlir_value(fx.Int32(row_base + col_base + fx.Index(col_off + half * 32))),
+                    as_mlir_value(fx.Int32(run_base)),
                     vec_width=width,
                     dtype=ctx.elem_dtype,
                 )
@@ -1513,7 +1594,10 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         """
         if const_expr(self.traits.BIAS_TYPE):
             lists = self.v_s_vec_to_lists(v_s)
-            self._add_bias_inplace(lists, tile_idx)
+            # `narrow_tail`: these are the tiles that can hold column
+            # `seqlen_k-1`, and a wide read there loses it. See
+            # `_add_bias_inplace`.
+            self._add_bias_inplace(lists, tile_idx, narrow_tail=True)
             v_s = dualwave._score_lists_to_vecs(lists)
         return super().seq_pad_mask_if_needed(v_s, tile_idx)
 

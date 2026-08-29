@@ -133,6 +133,7 @@ from fmha_dualwave_gfx950 import (
     ParityKernelContext,
     ParityKvGmemToLdsLoader,
     ParitySoftmaxHelper,
+    _bias_slab_num_records_bytes,
     _ds_read_tr_v4f16_imm,
     _score_column_runs,
     _v_imm_lo,
@@ -739,11 +740,12 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # the prologue's head already; this is the binding that survives, and
         # it is the same expression because `_slab_byte_base` is shared.
         if const_expr(self.traits.BIAS_TYPE):
-            _bias_span = self.seqlen_q_v * fx.Index(self.stride_b_seq_q)
             self.bias_rsrc = buffer_ops.create_buffer_resource(
                 self.Bias,
                 max_size=False,
-                num_records_bytes=as_mlir_value(_bias_span * fx.Index(self.traits.BF16_BYTES)),
+                num_records_bytes=_bias_slab_num_records_bytes(
+                    self.seqlen_q_v, self.seqlen_kv_v, self.stride_b_seq_q, self.traits.BF16_BYTES
+                ),
                 base_byte_offset=as_mlir_value(
                     self._slab_byte_base(
                         self.stride_b_batch,

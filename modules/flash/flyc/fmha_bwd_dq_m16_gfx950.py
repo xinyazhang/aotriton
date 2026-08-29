@@ -455,6 +455,15 @@ class M16DqSoftmax:
         bias for a padded row -- and a column past `seqlen_kv` picks up the
         next row's entry, which the KV tail mask below then overwrites with
         `-inf`. That is the forward's argument, unchanged.
+
+        **2-byte reads, one column at a time, not one `dwordx2` per run.**
+        gfx950 range-checks a multi-dword buffer op per dword and drops any
+        dword not wholly inside `num_records`, and the slab ends exactly on the
+        last valid element -- so a wide read of the last row with odd
+        `seqlen_kv` loses column `seqlen_kv-1` to the out-of-range column
+        `seqlen_kv` sharing its dword. The forward narrows only on its
+        tail-masked tiles; here every tile takes the mask (see the call at the
+        `M16TileBody` loop), so there is no wide case to keep.
         """
         ctx = self.ctx
         fm = arith.FastMathFlags.contract | arith.FastMathFlags.reassoc
@@ -463,15 +472,15 @@ class M16DqSoftmax:
         lists = self.to_lists(v_s)
         for step in range_constexpr(2):
             col0 = self.kv_col(tile_idx, lane, step, 0)
-            span = buffer_ops.buffer_load(
-                ctx.bias_rsrc,
-                as_mlir_value(fx.Int32(row_base + fx.Index(col0))),
-                vec_width=self.n,
-                dtype=ctx.elem_dtype,
-            )
-            vec = Vec(span, (self.n,), ctx.elem_dtype)
             for i in range_constexpr(self.n):
-                b = fx.Float32(vec[i].to(fx.Float32))
+                one = buffer_ops.buffer_load(
+                    ctx.bias_rsrc,
+                    as_mlir_value(fx.Int32(row_base + fx.Index(col0 + i))),
+                    vec_width=1,
+                    dtype=ctx.elem_dtype,
+                )
+                # `vec_width=1` returns a **scalar**, not a one-lane vector.
+                b = fx.Float32(ctx.elem_dtype(one).to(fx.Float32))
                 lists[step][i] = dualwave._fadd(lists[step][i], dualwave._fmul(b, log2e, fm), fm)
         return self.to_vecs(lists)
 
