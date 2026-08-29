@@ -41,6 +41,28 @@ REL_PYTHON = Path(os.path.abspath(sys.executable)).relative_to(Path(sys.exec_pre
 # launch_workers() spawns inherit it without threading it through argv.
 AOTRITON_DEBUG_SKIP_TRITON_KERNELS = bool(int(os.getenv('AOTRITON_DEBUG_SKIP_TRITON_KERNELS', default='0')))
 
+
+# Triton kernels that keep their image rules even under the flag above, because a
+# non-Triton backend cannot run without them and FlyDSL has no equivalent:
+#
+#   bwd_preprocess / bwd_preprocess_varlen  produce Delta = rowsum(dO * O), which
+#       both flyc backward kernels read and neither produces (metro_bwd_flyc)
+#   debug_simulate_encoded_softmax          the dropout-mask debug step that
+#       metro_fwd_flyc deliberately keeps on Triton
+#
+# Skipping these does not give the "Triton operators do not work, everything else
+# does" the flag promises -- it gives a flyc metro with a missing step, i.e. an
+# empty .zip and a runtime failure.
+#
+# A hand-maintained list, matched by name: this is a debugging aid, not a
+# dependency solver. Add a name when a metro starts borrowing another Triton
+# kernel.
+AOTRITON_SKIP_TRITON_KEEP_KERNELS = frozenset({
+    'bwd_preprocess',
+    'bwd_preprocess_varlen',
+    'debug_simulate_encoded_softmax',
+})
+
 def _shard_path(selective: str) -> Path:
     # --selective may be a glob pattern such as flash/affine/*; keep glob
     # metacharacters out of host filesystem paths used only for worker shards.
@@ -150,8 +172,10 @@ class RootGenerator(object):
             ksg = KernelShimGenerator(self._args, k, parent_repo=None)
             ksg.generate()
             shims += ksg.shim_files
-            # AOTRITON_DEBUG_SKIP_TRITON_KERNELS: emit the C++ shim but no image rules.
-            if AOTRITON_DEBUG_SKIP_TRITON_KERNELS:
+            # AOTRITON_DEBUG_SKIP_TRITON_KERNELS: emit the C++ shim but no image
+            # rules, except for the kernels another backend needs to run at all.
+            if (AOTRITON_DEBUG_SKIP_TRITON_KERNELS
+                    and k.NAME not in AOTRITON_SKIP_TRITON_KEEP_KERNELS):
                 continue
             hsacos = ksg.this_repo.get_data('hsaco')
             hsaco_for_kernels.append((k, hsacos))
