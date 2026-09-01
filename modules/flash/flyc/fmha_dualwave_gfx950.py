@@ -592,21 +592,54 @@ class ParityGemmHelper(dualwave.DualwaveGemmHelper):
     """
 
     def qk_stage(self, v_k, q_all_scaled_bf16, acc, stage=0):
+        """One D stage of `S += Q·K^T`, with the Q pack held off the MFMA.
+
+        **`mfma_operand_wait_state` is load-bearing here, and the reason is not
+        the one `scale_all` suggests.** Q is scaled and rounded back to bf16
+        once, before the KV loop, so the `v_cvt_pk_bf16_f32` that builds these
+        packs looks loop-invariant -- but the whole chain is 32 VGPRs live
+        across the loop, and LLVM sinks it back in and rematerializes it per
+        MFMA rather than pay that. What lands is the operand written in the
+        slot before the MFMA that reads it, with only scalar instructions
+        between:
+
+            v_cvt_pk_bf16_f32 v100, v48, v49
+            s_subb_u32 s1, s1, s9                    <- scalar, no wait state
+            s_lshl_b64 s[0:1], s[0:1], 1             <- scalar, no wait state
+            v_mfma_f32_32x32x16_bf16 v[18:33], v[34:37], v[100:103], v[18:33]
+
+        which is zero effective wait states against the two the documented
+        VALU-to-MFMA-SrcA/B rule asks for, and `UPSTREAM.md` issue 11's shape
+        exactly. 28 of the 216 forward kernels came out this way. The `k_hi`
+        MFMA reads the same quad one slot later and is shielded by the `k_lo`
+        one, so a single barrier per pack covers both.
+
+        The `_s_nop(1)` in `qk` below is a different thing at a different
+        place -- it sits *after* all the QK MFMAs and, as its comment records,
+        works by perturbing register allocation rather than by supplying a wait
+        state. It does not cover this gap.
+        """
         k_lo, k_hi = v_k
         v_s_lo, v_s_hi = acc
         steps = self.traits.K_STEPS_PER_STAGE
         for ks in range_constexpr(steps):
-            q_pack = dualwave._get_q_pack(self.traits, q_all_scaled_bf16, stage * steps + ks)
+            q_pack = mfma_operand_wait_state(
+                dualwave._get_q_pack(self.traits, q_all_scaled_bf16, stage * steps + ks)
+            )
             v_s_lo = dualwave._mfma_acc(k_lo[ks], q_pack, v_s_lo, self.mma_atom, self.mfma_acc_vec_type)
             v_s_hi = dualwave._mfma_acc(k_hi[ks], q_pack, v_s_hi, self.mma_atom, self.mfma_acc_vec_type)
         return (v_s_lo, v_s_hi)
 
     def qk(self, v_k, q_all_scaled_bf16, stage=0):
-        """Unstaged entry point: seed at zero and run the one stage there is."""
-        if const_expr(self.traits.D_STAGES == 1):
-            out = super().qk(v_k, q_all_scaled_bf16)
-        else:
-            out = self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
+        """Unstaged entry point: seed at zero and run the one stage there is.
+
+        `D_STAGES == 1` used to go through `super().qk`, which builds its own
+        unbarriered Q packs. At one stage `K_STEPS_PER_STAGE == K_STEPS_QK` and
+        `stage * steps + ks == ks`, so `qk_stage` from a zero seed is the same
+        loop; routing both through it is what puts the barrier on every build
+        rather than only the staged ones.
+        """
+        out = self.qk_stage(v_k, q_all_scaled_bf16, (self.c_zero_v16f32, self.c_zero_v16f32), stage)
         # Works, and **not for the reason it looks like.** Without it head_dim
         # 96 computes a wrong answer; with it, 96 is correct across five shapes
         # in both masking modes at ~0 cost.
@@ -1748,6 +1781,16 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
         one row in a few contiguous spans, and the spans start at multiples of
         `randoms_per_offset`, so each is a whole number of Philox calls with no
         partial draw.
+
+        Every pack leaves through `mfma_operand_wait_state`. These packs are the
+        PV GEMM's operand, built by the same `v_cvt_pk_bf16_f32` and handed to
+        the same MFMA shape that made `BwdDqSoftmaxHelper.cast_p` return a 39%
+        relative-L2 wrong answer; scanning the built binaries found 44 forward
+        kernels where the scheduler left fewer than two vector-pipe
+        instructions in the gap, `ENABLE_DROPOUT=True` in most of them. Unlike
+        dQ this has not been caught producing a wrong answer -- but the gap is
+        the same gap, and `UPSTREAM.md` issue 11 says the hardware does not
+        interlock it.
         """
         if const_expr(self.traits.ENABLE_DROPOUT):
             traits = self.traits
@@ -1771,7 +1814,11 @@ class ParitySoftmaxHelper(dualwave.DualwaveSoftmaxHelper):
                     for j in range_constexpr(width):
                         values[elem0 + j] = keep[j].select(fx.Float32(values[elem0 + j]), zero)
             v_p = (lo, hi)
-        return super().cast_p(v_p)
+        p_lo_packs, p_hi_packs = super().cast_p(v_p)
+        return (
+            [mfma_operand_wait_state(p) for p in p_lo_packs],
+            [mfma_operand_wait_state(p) for p in p_hi_packs],
+        )
 
     # -- P3: generalized sliding window --------------------------------------
     #
