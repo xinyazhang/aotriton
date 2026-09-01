@@ -355,10 +355,14 @@ class BwdDkDvKernelContext(ParityKernelContext):
 
     Six things move, and they are all descriptors, bounds or indices:
 
-    - `strides` carries **18** slots, not 12: Q, K, V, dO, dK, dV. The first
-      twelve go to the base class, which means its `stride_o_*` names hold
-      **dO's** strides. Nothing below reads those names; `stride_do_*` is
-      spelled out instead.
+    - `strides` carries **18** slots: Q, K, V, dO, dK, dV. Only the first nine
+      go to the base class, which is all it addresses; dO, dK and dV are held
+      here under their own names, with `stride_do_*`, `stride_dk_*` and
+      `stride_dv_*`. **There is no `O` here.** dK used to be handed to the
+      base's `O` slot so `o_div` would describe it, which made `stride_o_*`
+      the strides of whichever tensor happened to be in the slot; this kernel
+      writes dK and dV, both KV-row-shaped, and builds `dk_div` and `dv_div`
+      for them directly.
     - The staging machinery's K slot carries Q and its V slot carries dO.
     - Both staged tiles are V-shaped, so the LDS bases and the row-major read
       base are recomputed against `STREAM_LINE_STRIDE`.
@@ -369,7 +373,9 @@ class BwdDkDvKernelContext(ParityKernelContext):
     """
 
     def __init__(self, traits, *, strides, DO, DK, DV, Delta, **kwargs):
-        super().__init__(traits, strides=strides[:12], **kwargs)
+        # Q, K, V only. The base's `O` slot stays empty -- this kernel has no
+        # O -- so it builds no O view and `stride_o_*` stays zero and unread.
+        super().__init__(traits, strides=strides[:9], **kwargs)
         self.DO = DO
         self.DK = DK
         self.DV = DV
@@ -454,9 +460,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
 
     def init_runtime_indices(self, **kwargs):
         super().init_runtime_indices(**kwargs)
-        # The base class names dO's seq stride `stride_o_seq_v`, since dO
-        # occupies its O slot. The two outputs have no slot there at all.
-        self.stride_do_seq_v = self.stride_o_seq_v
+        self.stride_do_seq_v = fx.Index(self.stride_do_seq)
         self.stride_dk_seq_v = fx.Index(self.stride_dk_seq)
         self.stride_dv_seq_v = fx.Index(self.stride_dv_seq)
 
@@ -650,7 +654,6 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.hdim_vo,
             batch_idx=self.kv_batch_idx,
         )
-        self.o_div = self.dk_div
 
         # Raw bounded resources over the same four slabs, for the 16-row
         # family's 64-bit loads and stores. A `_slab_view` carries a copy atom
@@ -1677,16 +1680,11 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             Q=Q,
             K=K,
             V=V,
-            O=DK,
             DO=DO,
             DK=DK,
             DV=DV,
             Delta=Delta,
             LSE=LSE,
-            DebugCounts=DK,
-            CuSeqQ=Q,
-            CuSeqKv=Q,
-            BlockTable=Q,
             seq_len=max_seqlen_q,
             seq_len_kv=max_seqlen_k,
             stride_q_n=stride_q_seq,
