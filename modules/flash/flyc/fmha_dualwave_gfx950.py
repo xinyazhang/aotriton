@@ -498,6 +498,55 @@ def _bias_slab_num_records_bytes(seqlen_q, seqlen_kv, stride_b_seq_q, elem_bytes
     return arith.minui(as_mlir_value(tight), as_mlir_value(loose))
 
 
+def _slab_span_elems(rows, stride_seq, hdim):
+    """Elements in a `(batch, head)` slab, ending on its last **real** element.
+
+    `_bias_slab_num_records_bytes`'s problem, on the Q/K/V/O/DO/DK/DV slabs,
+    with the same answer: `stride_seq` is the distance between rows, `hdim` is
+    the width of one, and the two coincide only when the tensor is contiguous
+    in `(.., seqlen, hdim)` order. A BSHD caller hands us
+    `(batch, seqlen, head, hdim)`, where the row stride is `num_heads * hdim`
+    and the rest of it belongs to the *other heads* of that row -- so the
+    obvious `rows * stride_seq` overshoots the slab by `stride_seq - hdim`.
+
+    For an interior head that overshoot reads a neighbouring head's rows, which
+    `PADDED_HEAD`'s `discard` throws away regardless. For the **last** (batch,
+    head) slab it runs off the end of the tensor. Concretely, a `(3, 5, 64, 8)`
+    Q at strides `(2560, 8, 40, 1)`: the slab at `(batch 2, head 4)` is based
+    at element 5152 and bounded at 5152 + 64*40 = 7712, while the tensor ends
+    at 7680. `BLOCK_DMODEL` is 32 for `hdim_qk` 8, so `ParityQLoader` issues
+    the last row's load out to column 31 -- 24 elements past the allocation,
+    with the hardware range check permitting every one of them because they are
+    inside a `num_records` that should never have covered them. Whether that
+    faults is up to the page mapping, which is why it surfaced as intermittent
+    `pytest-xdist` worker deaths on the padded head dims rather than as a
+    reproducible failure. Ending on the last row's last real element clamps
+    exactly those accesses, and clamped is what they always assumed they were.
+
+    **Under BHSD this changes nothing, by construction.** There
+    `stride_seq == hdim`, so `(rows - 1) * stride_seq + hdim` *is*
+    `rows * stride_seq` -- the same descriptor, down to the
+    `oob_off == num_records` equality the D-tail store suppression relies on.
+    Elsewhere the bound only shrinks, so an `oob_off` of `rows * stride_seq`
+    stays at or past it and keeps being dropped.
+
+    **Do not round `hdim` up to the load's 8-element chunk.** That would buy
+    back the column a wide read loses to gfx950's per-dword range check at an
+    odd `hdim`, and it would buy it by reading memory the caller never handed
+    us -- the fault above, in miniature. The chunk containing `hdim` is
+    allocation slack for a BSHD interior head and is off the end of the tensor
+    for the last one.
+
+    The subtraction wraps at `rows == 0` -- a varlen empty sequence -- and an
+    index that wraps becomes a `num_records` covering all of memory, which is a
+    bigger version of this bug rather than a smaller one. The `rows > 0` select
+    pins that case back to the untightened 0.
+    """
+    rows_v = fx.Index(rows)
+    trim = fx.Index((rows_v > fx.Index(0)).select(fx.Index(stride_seq) - fx.Index(hdim), fx.Index(0)))
+    return rows_v * fx.Index(stride_seq) - trim
+
+
 def _score_column_runs(kv_vectorized):
     """`[(element_index, column_offset, width)]` covering one score vector.
 
@@ -1085,15 +1134,17 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         elems = batch_idx * fx.Index(s0) + head_idx * fx.Index(s1) + row_off * fx.Index(s2)
         return elems * fx.Index(self.traits.BF16_BYTES)
 
-    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows, batch_idx=None):
-        """A buffer view over one (batch, head) slab, bounded at `rows` rows.
+    def _slab_view(self, tensor, s0, s1, s2, row_off, head_idx, rows, hdim, batch_idx=None):
+        """A buffer view over one (batch, head) slab, bounded at its last element.
 
-        The bound is `rows * stride_seq`, so a row past the sequence is out of
-        the descriptor and reads as zero rather than faulting -- the same
-        mechanism the production kernel uses for its ragged tail, restated over
-        a stride the caller chose.
+        A row past the sequence is out of the descriptor and reads as zero
+        rather than faulting -- the same mechanism the production kernel uses
+        for its ragged tail, restated over a stride the caller chose.
+
+        `hdim` is the row's real extent, `s2` the distance between rows; see
+        `_slab_span_elems` for why the second is not a bound for the first.
         """
-        span_elems = rows * fx.Index(s2)
+        span_elems = _slab_span_elems(rows, s2, hdim)
         return dualwave._make_rebased_view(
             fx.get_iter(tensor),
             self._slab_byte_base(s0, s1, s2, row_off, head_idx, batch_idx=batch_idx),
@@ -1175,6 +1226,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            self.hdim_qk,
         )
         self.o_div = self._slab_view(
             self.O,
@@ -1184,6 +1236,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            self.hdim_vo,
         )
         if const_expr(not traits.PAGED):
             self.k_div = self._slab_view(
@@ -1194,6 +1247,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
+                self.hdim_qk,
                 batch_idx=self.kv_batch_idx,
             )
             self.v_div = self._slab_view(
@@ -1204,6 +1258,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
                 self.kv_row_off,
                 self.kv_head_idx,
                 self.seqlen_kv_v,
+                self.hdim_vo,
                 batch_idx=self.kv_batch_idx,
             )
 
