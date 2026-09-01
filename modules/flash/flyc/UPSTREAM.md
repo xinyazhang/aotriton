@@ -1123,20 +1123,50 @@ not known. Candidates not ruled out: the producer writing the *first* register
 of the SrcB tuple, and the intervening instruction being scalar rather than
 merely short.
 
+**A second, deterministic demonstration — the 32-row dQ.** The failure above is
+a timing race; this one is not, which makes it the easier reproducer to hand
+upstream. `flyc_bwd_dq`, `Q='*bf16:16' BLOCK_DMODEL=64 PADDED_HEAD=False
+CAUSAL_TYPE=0 BIAS_TYPE=0`, GEMM3 `dq[m,d] = sum_n dS[m,n]·K[n,d]`: the
+scheduler put all four `dS` packs in one register quad `v[32:35]` and issued the
+first `D_CHUNKS` accumulator's MFMA in the slot right after the last
+`v_cvt_pk_bf16_f32` of each pack —
+
+```
+v_cvt_pk_bf16_f32 v33, v42, v43
+s_waitcnt lgkmcnt(2)
+v_mfma_f32_32x32x16_bf16 v[0:15], v[52:55], v[32:35], v[0:15]
+```
+
+— gaps of 1, 2, 2 and 0 vector-pipe instructions at the four sites. The second
+chunk's MFMA reads the same quad one slot later and is shielded by the first, so
+the damage is confined to the head-dim columns chunk 0 owns, `[0, 32)`: 39%
+relative L2 on dQ against 7% on `[32, 64)`, reproducible bit for bit across
+runs, dQ only. The f16 build of the same shape is clean because its
+`v_cvt_f16_f32` packs land 8–36 instructions clear of the MFMA — the hazard is
+the schedule, not the dtype.
+
 **Fix:** model the hazard in `GCNHazardRecognizer`, or supply the wait state in
 `flash_attn_utils.py` where `_bf16_trunc_pack_v8` builds the operand. Patched
 locally by `mfma_operand_wait_state` in `fmha_dualwave_gfx950.py` — the same
 tied-operand inline-asm shape as `exp2_wait_state` and for the same reason, with
-`s_nop 1` for two wait states — applied at the three pack sites the shadow layer
-owns: `M16SoftmaxHelper.pack_group` (where it was demonstrated),
-`BwdDkDvSoftmaxHelper.pack_half` and `M16DqSoftmax.pack_ds`. Free on the
-demonstrated kernel: `vgpr_count` 202 → 200, `vgpr_spill_count` 0 → 0,
-`sgpr_spill_count` 115 → 115, and the compile metadata otherwise byte-identical.
+`s_nop 1` for two wait states — applied at every pack site the shadow layer
+owns: `M16SoftmaxHelper.pack_group` (where it was first demonstrated),
+`BwdDkDvSoftmaxHelper.pack_half`, `M16DqSoftmax.pack_ds`,
+`BwdDqSoftmaxHelper.cast_p` (the deterministic one above) and
+`ParitySoftmaxHelper.cast_p` (the forward). Free on the first demonstrated
+kernel: `vgpr_count` 202 → 200, `vgpr_spill_count` 0 → 0, `sgpr_spill_count`
+115 → 115, and the compile metadata otherwise byte-identical.
 
-**Still exposed:** the forward and the 32-row dQ build their packs in upstream's
-`DualwaveSoftmaxHelper.cast_p`, which the shadow layer does not override, so the
-126 kernels of those two families keep the gap. Overriding `cast_p` would close
-them, and has not been done because neither has been observed to fail.
+**Exposure, measured rather than estimated.** Scanning the built binaries for a
+`v_cvt_pk_*_f32` write reaching an MFMA SrcA/SrcB with fewer than two
+intervening wait states — crediting `s_nop N` as `N+1`, stopping the chain at
+any redefinition of the destination, and expanding `v[a:b]` operand ranges,
+without which a fixed site still reads as gap 0 — gave, before the last two
+patches: `flyc_bwd_dq` and `flyc_bwd_dkdv` clean, `flyc_attn_fwd` **44 of 216
+kernels** still exposed, `ENABLE_DROPOUT=True` in most of them. Barriering
+`ParitySoftmaxHelper.cast_p` closes those. The forward has never been *observed*
+to return a wrong answer from this; it was fixed on the strength of being the
+same gap in the same instruction pair.
 
 ### 12. `VARLEN` and `CROSS_SEQLEN` are build traits that need not exist
 
