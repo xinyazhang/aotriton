@@ -59,6 +59,31 @@ if [ -n "${PARTIAL_INFO_DIR:-}" ]; then
   fi
 fi
 
+# Resume mode: skip<pass>.txt names tests to EXCLUDE, which is the shape you want
+# after a long pass that did not finish -- list what already passed and re-run
+# the rest, rather than enumerating the rest. The two are not the same thing: a
+# torn-down session leaves tests that were never dispatched and therefore appear
+# in no outcome line at all, so an exclude list covers them and an include list
+# cannot without also knowing the full collection.
+#
+# Passed through UNMODIFIED, unlike sel above: pytest-select matches an entry
+# against `item.nodeid` OR `item.name`, so full "path.py::test[params]" ids work
+# as-is, and they are what a `grep` over a .out file produces. Prefer them --
+# a bare `item.name` can collide between two test files, a nodeid cannot.
+#
+# Missing entries (a test that passed once and no longer exists) are a warning,
+# not an error. Note pytest-select builds that warning by joining every missing
+# name into one string, so a skip file written against a different FOR_RELEASE
+# can print a very large warning; the run is still correct.
+DESELECT_FROM=""
+if [ -n "${PARTIAL_INFO_DIR:-}" ]; then
+  skipsrc="${PARTIAL_INFO_DIR}/skip${pass}.txt"
+  if [ -f "$skipsrc" ]; then
+    DESELECT_FROM="--deselect-from-file $skipsrc"
+    echo "run-test.sh: excluding $(wc -l < "$skipsrc") test(s) listed in ${skipsrc}"
+  fi
+fi
+
 if [ -n "${USE_ADIFFS_TXT:-}" ]; then
   if [ -f "$USE_ADIFFS_TXT" ]; then
     echo "USE_ADIFFS_TXT: $USE_ADIFFS_TXT ($(wc -l < "$USE_ADIFFS_TXT") lines)"
@@ -136,6 +161,7 @@ fi
     --timeout=300 \
     -p no:cacheprovider \
     ${SELECT_FROM} \
+    ${DESELECT_FROM} \
     modules/flash/tests \
     -v \
     1>>"${outdir}/${fnprefix}${pass}.out" \
