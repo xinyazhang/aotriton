@@ -743,6 +743,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         traits,
         *,
         strides,
+        o_strides=(0, 0, 0),
         sm_scale,
         num_head_q,
         num_head_k,
@@ -763,7 +764,7 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         **kwargs,
     ):
         super().__init__(traits, **kwargs)
-        # 12 strides in launch order: Q, K, V, O, each (batch, head, seq).
+        # 9 strides in launch order: Q, K, V, each (batch, head, seq).
         # Numerically named per `sdpa-feature-gap.md`'s porting instruction --
         # the `z/h/m/k` suffixes it warns about have caused real bugs.
         (
@@ -776,10 +777,15 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.stride_v_batch,
             self.stride_v_head,
             self.stride_v_seq,
-            self.stride_o_batch,
-            self.stride_o_head,
-            self.stride_o_seq,
         ) = strides
+        # O's own three, separate from the rest because two of the three
+        # kernels built on this class have no O at all: the dQ kernel writes
+        # dQ and the dK/dV kernel writes dK and dV, each under its own name
+        # with its own strides. Those two leave `O` at None and these at zero,
+        # and `init_descriptors` builds no O view for them. Folding dQ's
+        # strides in here instead is what made `stride_o_*` a name for
+        # whichever tensor happened to be in the slot.
+        self.stride_o_batch, self.stride_o_head, self.stride_o_seq = o_strides
         self.sm_scale_arg = sm_scale
         self.num_head_q = num_head_q
         self.num_head_k = num_head_k
@@ -1154,6 +1160,26 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             _elem_ir=self.elem_ir,
         )
 
+    def q_row_slab(self, tensor, s0, s1, s2, hdim):
+        """A Q-row-shaped output slab, with the sentinel that suppresses stores.
+
+        Returns `(view, oob_off)`. The three kernels' per-Q-row outputs -- the
+        forward's O and the backward's dQ -- are all indexed
+        (batch, head, q row, d) over this workgroup's own q head and row
+        origin, so they differ only in the tensor, its three strides and its
+        row extent. Those are the arguments; nothing else varies, and none of
+        them is guessed from another tensor's.
+
+        `oob_off` is the first element past the *untightened* span, so a store
+        redirected there is dropped by the hardware bound -- which is how
+        `ParityStoreHelper` suppresses the D-tail chunks without branching.
+        `_slab_span_elems` can only shrink the descriptor below this, never
+        grow it past, so the two stay in the order the suppression needs;
+        under BHSD they are equal, which is out of range and always has been.
+        """
+        view = self._slab_view(tensor, s0, s1, s2, self.q_row_off, self.q_head_idx, self.seqlen_q_v, hdim)
+        return view, self.seqlen_q_v * fx.Index(s2)
+
     def init_descriptors(self, **kwargs):
         """Rebuild Q/K/V/O over arbitrary strides; everything else stays.
 
@@ -1165,7 +1191,11 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         duplicating the half of the method that has nothing to do with strides.
         """
         traits = self.traits
-        super().init_descriptors(**kwargs)
+        # `o_tensor` explicitly, because upstream defaults it to `self.O` and
+        # builds one throwaway view from it (`flash_attn_utils.py:3448`) that
+        # the code below replaces or drops. A kernel with no O still has to
+        # hand it a live pointer for that dead view, so it lends Q's.
+        super().init_descriptors(o_tensor=self.Q if self.O is None else self.O, **kwargs)
 
         # Token origins, straight from the decode. Dense is not a case here:
         # `decode_addressing` returns a zero row offset at `varlen_bits == 0`,
@@ -1180,11 +1210,6 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # Head folded into the base, so what remains per access is `s * stride`.
         self.q_gmem_elem_offset = self.q_start * self.stride_q_seq_v
         self.kv_gmem_elem_offset = fx.Index(0)
-
-        # First element past O's descriptor. A store redirected here is dropped
-        # by the hardware bound, which is how `ParityStoreHelper` suppresses
-        # the D-tail chunks without branching.
-        self.o_oob_off = self.seqlen_q_v * self.stride_o_seq_v
 
         if const_expr(traits.BIAS_TYPE):
             # Same slab shape as Q, which is the point: bias is indexed by
@@ -1228,16 +1253,10 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
             self.seqlen_q_v,
             self.hdim_qk,
         )
-        self.o_div = self._slab_view(
-            self.O,
-            self.stride_o_batch,
-            self.stride_o_head,
-            self.stride_o_seq,
-            self.q_row_off,
-            self.q_head_idx,
-            self.seqlen_q_v,
-            self.hdim_vo,
-        )
+        if self.O is not None:
+            self.o_div, self.o_oob_off = self.q_row_slab(
+                self.O, self.stride_o_batch, self.stride_o_head, self.stride_o_seq, self.hdim_vo
+            )
         if const_expr(not traits.PAGED):
             self.k_div = self._slab_view(
                 self.K,

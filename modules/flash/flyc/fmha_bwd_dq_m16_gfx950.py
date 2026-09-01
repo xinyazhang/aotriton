@@ -664,15 +664,16 @@ class M16DqStore:
     def __init__(self, ctx):
         self.ctx = ctx
         self.traits = ctx.traits
-        span = _slab_span_elems(ctx.seqlen_q_v, ctx.stride_o_seq, ctx.hdim_vo)
-        self.oob = ctx.o_oob_off
+        self.oob = ctx.dq_oob_off
+        # `hdim_qk`, not `hdim_vo`: dQ is Q-shaped, as `store` says again.
+        span = _slab_span_elems(ctx.seqlen_q_v, ctx.stride_dq_seq, ctx.hdim_qk)
         self.rsrc = buffer_ops.create_buffer_resource(
-            ctx.O,
+            ctx.DQ,
             max_size=False,
             num_records_bytes=as_mlir_value(span * fx.Index(self.traits.BF16_BYTES)),
             base_byte_offset=as_mlir_value(
                 ctx._slab_byte_base(
-                    ctx.stride_o_batch, ctx.stride_o_head, ctx.stride_o_seq, ctx.q_row_off, ctx.q_head_idx
+                    ctx.stride_dq_batch, ctx.stride_dq_head, ctx.stride_dq_seq, ctx.q_row_off, ctx.q_head_idx
                 )
             ),
         )
@@ -680,7 +681,7 @@ class M16DqStore:
     def store(self, v_dq, q_row, lane):
         ctx, traits = self.ctx, self.traits
         n = acc_elems(traits)
-        row_base = q_row * ctx.stride_o_seq_v
+        row_base = q_row * ctx.stride_dq_seq_v
         in_row = q_row < ctx.seqlen_q_v
         col_lane = fx.Index(4) * (lane // fx.Index(MFMA16_M))
         for c in range_constexpr(d_chunks16(traits)):

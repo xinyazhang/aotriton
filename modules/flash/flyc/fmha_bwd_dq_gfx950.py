@@ -95,7 +95,8 @@ store writes dQ, which is Q-shaped:
 - two `BwdDqKvLdsToVgprLoader` instances, one per tile, differing in the LDS
   pitch *and* in which extent their padded-head mask is written against
   (plus `HDIM_VO_FLOOR`, the vo counterpart of `HDIM_QK_FLOOR`);
-- `BwdDqStoreHelper`, which rebinds `hdim_vo` to the qk extent.
+- `BwdDqStoreHelper`, which points the inherited store at dQ's descriptor,
+  stride, sentinel and `hdim_qk` width.
 
 They coincide in every symmetric build, so only `test_asymmetric_hdim` can tell
 the fix from its absence.
@@ -319,32 +320,56 @@ _COMPILE_HINTS = {
 
 
 class BwdDqKernelContext(ParityKernelContext):
-    """The forward's parity context plus dO, dB and the two row inputs.
+    """The forward's parity context plus dQ, dO, dB and the two row inputs.
 
     Subclassed rather than ported, per the contract: the strides, the padded
-    head, the varlen decode and the descriptor machinery are all inherited, and
-    `O` is bound to `dQ` so `ParityStoreHelper` writes the gradient with no
-    change at all. What is added is one more Q-shaped tensor (`dO`), one
-    score-shaped output (`dB`), and the LSE/delta pair.
+    head, the varlen decode and the descriptor machinery are all inherited.
+    What is added is this kernel's output (`dQ`), one more Q-shaped input
+    (`dO`), one score-shaped output (`dB`), and the LSE/delta pair.
+
+    **There is no `O` here.** dQ used to be handed to the base class's `O`
+    slot, which made `stride_o_*` dQ's strides, `o_div` dQ's descriptor and
+    `hdim_vo` -- the head dim of V or O -- the bound on a tensor that is
+    Q-shaped and therefore `hdim_qk` wide. At an asymmetric head dim that
+    bound is simply the wrong number, and the D-tail stores it was supposed to
+    admit were dropped instead. dQ is spelled `DQ` here, with `stride_dq_*`,
+    `dq_div` and `dq_oob_off`; the base's `O` stays None and its O view is not
+    built. `BwdDqStoreHelper` is the one place upstream's `o_*` store
+    vocabulary is bound to them.
     """
 
-    def __init__(self, traits, *, do_strides, db_strides=(0, 0, 0), DO=None, DB=None, Delta=None, **kwargs):
+    def __init__(
+        self,
+        traits,
+        *,
+        dq_strides,
+        do_strides,
+        db_strides=(0, 0, 0),
+        DQ=None,
+        DO=None,
+        DB=None,
+        Delta=None,
+        **kwargs,
+    ):
         super().__init__(traits, **kwargs)
+        self.stride_dq_batch, self.stride_dq_head, self.stride_dq_seq = dq_strides
         self.stride_do_batch, self.stride_do_head, self.stride_do_seq = do_strides
         # `_seq_q` for the reason `ParityKernelContext` gives for the bias
         # input's: dB is `(batch, head, seqlen_q, seqlen_k)` and a bare `_seq`
         # does not say which of the two it is.
         self.stride_db_batch, self.stride_db_head, self.stride_db_seq_q = db_strides
+        self.DQ = DQ
         self.DO = DO
         self.DB = DB
         self.Delta = Delta
 
     def init_runtime_indices(self, **kwargs):
         super().init_runtime_indices(**kwargs)
+        self.stride_dq_seq_v = fx.Index(self.stride_dq_seq)
         self.stride_do_seq_v = fx.Index(self.stride_do_seq)
 
     def init_descriptors(self, **kwargs):
-        """The forward's four views, plus dO's and dB's.
+        """The forward's four views, plus dQ's, dO's and dB's.
 
         `dO` gets exactly Q's treatment -- same slab shape, same row origin,
         same `seqlen_q` bound -- because it *is* Q-shaped: (batch, head, q row,
@@ -354,6 +379,13 @@ class BwdDqKernelContext(ParityKernelContext):
         """
         traits = self.traits
         super().init_descriptors(**kwargs)
+        # dQ is Q-shaped -- (batch, head, q row, d) with the *qk* head dim --
+        # so it gets Q's slab treatment against `hdim_qk`. Not `hdim_vo`: at
+        # an asymmetric head dim the two are different numbers and only one of
+        # them is dQ's row width.
+        self.dq_div, self.dq_oob_off = self.q_row_slab(
+            self.DQ, self.stride_dq_batch, self.stride_dq_head, self.stride_dq_seq, self.hdim_qk
+        )
         self.do_div = self._slab_view(
             self.DO,
             self.stride_do_batch,
@@ -884,21 +916,33 @@ class BwdDqKvLdsToVgprLoader(ParityKvLdsToVgprLoader):
 
 
 class BwdDqStoreHelper(ParityStoreHelper):
-    """The O store, told that its output is `hdim_qk` wide.
+    """The inherited store, pointed at dQ.
 
-    `_final_o_global` suppresses chunks starting at or past `self.hdim_vo`,
-    because in the forward the tensor it writes *is* O. Here it writes dQ,
-    which is Q-shaped and `hdim_qk` wide. The two coincide in every symmetric
-    build and cross the moment they do not -- the second of the two sites the
-    plan's B2 outcome names.
+    Upstream's `DualwaveStoreHelper` has exactly one output vocabulary and it
+    is spelled `o_*`: `o_div` is the descriptor it writes through,
+    `stride_o_seq_v` the row pitch it addresses with, `o_oob_off` the sentinel
+    it redirects suppressed chunks to, and `hdim_vo` the width it suppresses
+    past. This kernel's output is dQ, so those four names are bound to dQ's
+    here -- in one block, at the boundary with the code that owns them. The
+    context below spells the tensor `DQ`, its strides `stride_dq_*` and its
+    descriptor `dq_div`, so nothing outside this block has to know that the
+    inherited store calls it O.
 
-    Rebinding the attribute rather than overriding the method: the suppression
-    is one comparison inside a method that also computes the address, and a
-    copy of it would be a copy of both.
+    `hdim_qk`, not `hdim_vo`, for the width: dQ is Q-shaped. The two coincide
+    in every symmetric build and cross the moment they do not -- the second of
+    the two sites the plan's B2 outcome names.
+
+    Rebinding attributes rather than overriding methods: the store helper is a
+    dict copy of the context, and the suppression is one comparison inside a
+    method that also computes the address, so a copy of it would be a copy of
+    both.
     """
 
     def __init__(self, ctx):
         super().__init__(ctx)
+        self.o_div = ctx.dq_div
+        self.o_oob_off = ctx.dq_oob_off
+        self.stride_o_seq_v = ctx.stride_dq_seq_v
         self.hdim_vo = ctx.hdim_qk
 
 
@@ -1113,8 +1157,6 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
         Delta = wire_view(Delta)
         ctx = BwdDqKernelContext(
             traits,
-            # dQ occupies the `O` slot: it is the tensor this kernel writes
-            # with `ParityStoreHelper`, and that helper reads `stride_o_*`.
             strides=(
                 stride_q_batch,
                 stride_q_head,
@@ -1125,10 +1167,8 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
                 stride_v_batch,
                 stride_v_head,
                 stride_v_seq,
-                stride_dq_batch,
-                stride_dq_head,
-                stride_dq_seq,
             ),
+            dq_strides=(stride_dq_batch, stride_dq_head, stride_dq_seq),
             do_strides=(stride_do_batch, stride_do_head, stride_do_seq),
             db_strides=(stride_db_batch, stride_db_head, stride_db_seq_q),
             sm_scale=sm_scale,
@@ -1146,14 +1186,10 @@ def build_fmha_bwd_dq_gfx950_module_primary(meta, knobs):
             Q=Q,
             K=K,
             V=V,
-            O=DQ,
+            DQ=DQ,
             DO=DO,
             DB=DB,
             Delta=Delta,
-            DebugCounts=DQ,
-            CuSeqQ=Q,
-            CuSeqKv=Q,
-            BlockTable=Q,
             Bias=B,
             bias_strides=(stride_b_batch, stride_b_head, stride_b_seq_q),
             philox=(philox_seed_ptr, philox_offset1, philox_offset2, None, None),
