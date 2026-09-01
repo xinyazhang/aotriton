@@ -136,6 +136,7 @@ from fmha_dualwave_gfx950 import (
     _bias_slab_num_records_bytes,
     _ds_read_tr_v4f16_imm,
     _score_column_runs,
+    _slab_span_elems,
     _v_imm_lo,
     exp2_wait_state,
     mfma_operand_wait_state,
@@ -602,7 +603,9 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.bind_q_head()
 
         # Resident, and the two outputs: all four are (batch, kv head) slabs
-        # bounded at `seqlen_kv` rows.
+        # bounded at the last real element of their `seqlen_kv`th row. K and dK
+        # are `hdim_qk` wide, V and dV `hdim_vo` -- the extents are what bounds
+        # the slab, not the row stride; see `_slab_span_elems`.
         self.k_res_div = self._slab_view(
             self.K,
             self.stride_k_batch,
@@ -611,6 +614,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            self.hdim_qk,
             batch_idx=self.kv_batch_idx,
         )
         self.v_res_div = self._slab_view(
@@ -621,6 +625,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            self.hdim_vo,
             batch_idx=self.kv_batch_idx,
         )
         self.dk_div = self._slab_view(
@@ -631,6 +636,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            self.hdim_qk,
             batch_idx=self.kv_batch_idx,
         )
         self.dv_div = self._slab_view(
@@ -641,6 +647,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.kv_row_off,
             self.kv_head_idx,
             self.seqlen_kv_v,
+            self.hdim_vo,
             batch_idx=self.kv_batch_idx,
         )
         self.o_div = self.dk_div
@@ -648,19 +655,29 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # Raw bounded resources over the same four slabs, for the 16-row
         # family's 64-bit loads and stores. A `_slab_view` carries a copy atom
         # whose width is fixed at 128 bits; these take an element offset and a
-        # width per access, and they bound identically -- `rows * stride_seq`
-        # elements, so a row past the sequence reads zero and a store to one is
-        # dropped.
-        self.k_res_rsrc = self._slab_rsrc(self.K, self.stride_k_batch, self.stride_k_head, self.stride_k_seq)
-        self.v_res_rsrc = self._slab_rsrc(self.V, self.stride_v_batch, self.stride_v_head, self.stride_v_seq)
-        self.dk_rsrc = self._slab_rsrc(self.DK, self.stride_dk_batch, self.stride_dk_head, self.stride_dk_seq)
-        self.dv_rsrc = self._slab_rsrc(self.DV, self.stride_dv_batch, self.stride_dv_head, self.stride_dv_seq)
+        # width per access, and they bound identically, so a row past the
+        # sequence reads zero and a store to one is dropped.
+        self.k_res_rsrc = self._slab_rsrc(
+            self.K, self.stride_k_batch, self.stride_k_head, self.stride_k_seq, self.hdim_qk
+        )
+        self.v_res_rsrc = self._slab_rsrc(
+            self.V, self.stride_v_batch, self.stride_v_head, self.stride_v_seq, self.hdim_vo
+        )
+        self.dk_rsrc = self._slab_rsrc(
+            self.DK, self.stride_dk_batch, self.stride_dk_head, self.stride_dk_seq, self.hdim_qk
+        )
+        self.dv_rsrc = self._slab_rsrc(
+            self.DV, self.stride_dv_batch, self.stride_dv_head, self.stride_dv_seq, self.hdim_vo
+        )
 
         self.k_res_elem_base = self.kv_start * self.stride_k_seq_v
         self.v_res_elem_base = self.kv_start * self.stride_v_seq_v
-        # First element past each output's descriptor. A store redirected here
-        # is dropped by the hardware bound, which is how the padded-head D tail
-        # is suppressed without a branch.
+        # At or past the end of each output's descriptor, so a store redirected
+        # here is dropped by the hardware bound -- which is how the padded-head
+        # D tail is suppressed without a branch. `_slab_span_elems` can only
+        # shrink those descriptors below this, never grow one past it, so the
+        # order the suppression needs holds for both the `_slab_view` and the
+        # `_slab_rsrc` over the same slab.
         self.dk_oob_off = self.seqlen_kv_v * self.stride_dk_seq_v
         self.dv_oob_off = self.seqlen_kv_v * self.stride_dv_seq_v
 
@@ -689,6 +706,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            self.hdim_qk,
         )
         self.v_div = self._slab_view(
             self.DO,
@@ -698,6 +716,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            self.hdim_vo,
         )
         self.q_div = self.k_div
 
@@ -780,14 +799,18 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.q_head_idx = self.gqa_q_head_base + g
         self.bind_q_head()
 
-    def _slab_rsrc(self, tensor, s0, s1, s2):
+    def _slab_rsrc(self, tensor, s0, s1, s2, hdim):
         """A raw buffer resource over this workgroup's KV slab, bounded at its rows.
 
         Only the four KV-side tensors need one, so the head, the row origin and
         the batch index are the KV ones rather than parameters -- which is also
         what stops Q's batch index reaching them under `0x040B`.
+
+        Bounded through `_slab_span_elems`, the same as the `_slab_view` over
+        the same slab: these are two access shapes over one region, and a
+        region cannot have two ends.
         """
-        span_bytes = self.seqlen_kv_v * fx.Index(s2) * fx.Index(self.traits.BF16_BYTES)
+        span_bytes = _slab_span_elems(self.seqlen_kv_v, s2, hdim) * fx.Index(self.traits.BF16_BYTES)
         return dualwave._make_ws_rsrc(
             fx.Int64(fx.ptrtoint(fx.get_iter(tensor))),
             self._slab_byte_base(s0, s1, s2, self.kv_row_off, self.kv_head_idx, batch_idx=self.kv_batch_idx),

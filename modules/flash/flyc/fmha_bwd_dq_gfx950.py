@@ -235,6 +235,7 @@ from fmha_dualwave_gfx950 import (
     ParityQLoader,
     ParitySoftmaxHelper,
     ParityStoreHelper,
+    _bias_slab_num_records_bytes,
     _score_column_runs,
     wire_ptr,
     wire_view,
@@ -361,6 +362,7 @@ class BwdDqKernelContext(ParityKernelContext):
             self.q_row_off,
             self.q_head_idx,
             self.seqlen_q_v,
+            self.hdim_vo,
         )
         self.do_gmem_elem_offset = self.q_start * self.stride_do_seq_v
         if const_expr(traits.STORE_DB):
@@ -369,14 +371,31 @@ class BwdDqKernelContext(ParityKernelContext):
             # contiguous -- and a raw resource for the same reason: the stores
             # are per-lane at an address the lane computes, which is
             # `buffer_ops.buffer_store`'s shape and not the copy atom's.
-            db_span = self.seqlen_q_v * fx.Index(self.stride_db_seq_q)
-            # First element past the descriptor. A store redirected here is
-            # dropped by the hardware bound; see `BwdDbStoreHelper`.
-            self.db_oob_off = db_span
+            # First element past the *untightened* span. A store redirected
+            # here is dropped by the hardware bound; see `BwdDbStoreHelper`.
+            # It stays untightened deliberately: a sentinel only has to sit at
+            # or past `num_records`, and the bound below only shrinks, which
+            # moves it further out of range rather than back into it.
+            self.db_oob_off = self.seqlen_q_v * fx.Index(self.stride_db_seq_q)
+            # Bounded through the forward's own helper, and for its reason: a
+            # BSHD caller's `stride_db_seq_q` is `num_heads * seqlen_k`, so
+            # `seqlen_q * stride_db_seq_q` overshoots this head's slab by the
+            # other heads of the last row -- which for the last (batch, head)
+            # is off the end of dB. Storing there would corrupt a neighbouring
+            # head's gradient, or fault.
+            #
+            # The load-side caveat in that helper's docstring -- a wide read
+            # losing the last column to the per-dword range check at an odd
+            # `seqlen_k` -- has no store-side counterpart here: this is a
+            # *2-byte* store per element, already predicated on
+            # `col < seqlen_k`, so every live one lands inside the tight bound
+            # whatever the parity.
             self.db_rsrc = buffer_ops.create_buffer_resource(
                 self.DB,
                 max_size=False,
-                num_records_bytes=as_mlir_value(db_span * fx.Index(traits.BF16_BYTES)),
+                num_records_bytes=_bias_slab_num_records_bytes(
+                    self.seqlen_q_v, self.seqlen_kv_v, self.stride_db_seq_q, traits.BF16_BYTES
+                ),
                 base_byte_offset=as_mlir_value(
                     self._slab_byte_base(
                         self.stride_db_batch,

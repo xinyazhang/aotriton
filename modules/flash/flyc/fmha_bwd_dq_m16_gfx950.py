@@ -67,6 +67,7 @@ import fmha_common_gfx1201 as fmha  # noqa: F401  (kept for the shared row addre
 from fmha_dualwave_gfx950 import (  # ParityKernelContext documents the base this rides on
     ParityKernelContext,  # noqa: F401
     _ds_read_tr_v4f16_imm,
+    _slab_span_elems,
     mfma_operand_wait_state,
 )
 from fmha_mfma16_gfx950 import MFMA16_M
@@ -650,13 +651,21 @@ class M16DqStore:
     A run may write up to three columns into the caller's pad, which the 8xD
     contract guarantees exists -- and is stricter than the 32-row path, whose
     128-bit store can overrun by eight.
+
+    The descriptor is bounded at the last row's last real element rather than
+    at `rows * stride`, which is what makes that pad claim true for the *last*
+    (batch, head) slab of a BSHD dQ, where the row stride is `num_heads * hdim`
+    and the pad it would otherwise write into is off the end of the tensor.
+    See `_slab_span_elems`. `oob` stays the untightened span: a sentinel only
+    has to sit at or past `num_records`, and shrinking the bound moves it
+    further out of range rather than back into it.
     """
 
     def __init__(self, ctx):
         self.ctx = ctx
         self.traits = ctx.traits
-        span = ctx.seqlen_q_v * ctx.stride_o_seq_v
-        self.oob = span
+        span = _slab_span_elems(ctx.seqlen_q_v, ctx.stride_o_seq, ctx.hdim_vo)
+        self.oob = ctx.o_oob_off
         self.rsrc = buffer_ops.create_buffer_resource(
             ctx.O,
             max_size=False,
