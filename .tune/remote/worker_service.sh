@@ -215,6 +215,10 @@ daemonize() {
     # Fork and run in background, redirect I/O
     # Do NOT chdir to / - stay in current directory
     (
+        # No core dumps. A GPU worker that faults dumps its VRAM mapping, which
+        # is hundreds of MiB of nothing anyone reads, written into the workdir.
+        ulimit -c 0
+
         # Close stdin
         exec 0</dev/null
 
