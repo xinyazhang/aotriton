@@ -238,6 +238,7 @@ from fmha_dualwave_gfx950 import (
     ParityStoreHelper,
     _bias_slab_num_records_bytes,
     _score_column_runs,
+    mfma_operand_wait_state,
     wire_ptr,
     wire_view,
 )
@@ -719,8 +720,33 @@ class BwdDqSoftmaxHelper(ParitySoftmaxHelper):
         It fails loudly today only by accident -- the forward's block reads
         `tile_idx`, which this call site does not pass. That is a bad reason to
         be safe, so the override is explicit.
+
+        **Every pack leaves through `mfma_operand_wait_state`, and here that is
+        load-bearing rather than prophylactic.** `dS` is GEMM3's B operand, and
+        at `BLOCK_DMODEL=64, PADDED_HEAD=False, bf16` the scheduler put all
+        four packs in one register quad and issued the *first* `D_CHUNKS`
+        accumulator's MFMA in the slot right after the last
+        `v_cvt_pk_bf16_f32` of each pack -- one intervening vector-pipe
+        instruction at the best site and zero at the worst:
+
+            v_cvt_pk_bf16_f32 v33, v42, v43
+            s_waitcnt lgkmcnt(2)                        <- scalar, no wait state
+            v_mfma_f32_32x32x16_bf16 v[0:15], v[52:55], v[32:35], v[0:15]
+
+        The second chunk's MFMA reads the same quad one slot later and is
+        shielded by the first one, so the damage is confined to head-dim
+        columns `[0, 32)`: measured 39% relative L2 on dQ against 7% on
+        `[32, 64)`, deterministic, dQ only, and invisible in an f16 build,
+        whose `v_cvt_f16_f32` packs the scheduler happened to hoist 8-36
+        instructions clear. That is `UPSTREAM.md` issue 11 with a wrong answer
+        attached rather than a suspicion; `fmha_bwd_dq_m16_gfx950.pack_ds`
+        already carried the barrier on the strength of the suspicion alone.
         """
-        return dualwave.DualwaveSoftmaxHelper.cast_p(self, v_p)
+        p_lo_packs, p_hi_packs = dualwave.DualwaveSoftmaxHelper.cast_p(self, v_p)
+        return (
+            [mfma_operand_wait_state(p) for p in p_lo_packs],
+            [mfma_operand_wait_state(p) for p in p_hi_packs],
+        )
 
     def dropout_dp(self, dp_lists, tile_idx, q_row):
         """`dP <- keep ? dP * (1/(1-p)) : 0`, on the **dP** rather than on P.
