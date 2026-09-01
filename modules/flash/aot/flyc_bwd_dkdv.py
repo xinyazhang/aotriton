@@ -286,10 +286,11 @@ def flyc_bwd_dkdv(arch, choices, hints):
             dtype_str='bf16' if '*bf16' in choices.arg('Q') else 'f16',
             bias=bool(choices.BIAS_TYPE),
             dropout=bool(choices.ENABLE_DROPOUT),
-            # varlen/lse_layout_th left at their False defaults: AOTriton's
-            # varlen encoding is a runtime bit either way (flyc_varlen_bits),
-            # and lse_layout_th is a build axis this operator never asks for
-            # ((H, T) only) -- see BwdDkDvInputMetadata's own docstring.
+            # There is no varlen field to set: the kernel decodes the bits
+            # flyc_varlen_bits() puts on the wire unconditionally, and a dense
+            # call is bits == 0. lse_layout_th stays at its False default --
+            # that one IS a build axis, and this operator never asks for
+            # anything but (H, T); see BwdDkDvInputMetadata's own docstring.
         )
         knobs = bwd_dkdv_knobs(
             arch,

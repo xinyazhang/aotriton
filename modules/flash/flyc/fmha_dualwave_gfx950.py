@@ -882,13 +882,26 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         the same thing on both architectures, and a second copy of a wire
         format is a second thing to keep in step.
 
-        Three things about the shape of this:
+        **Unconditional, and dense is not a separate case.** `varlen_bits == 0`
+        decodes to BHSD / MAX / IMPLIED, for which `decode_addressing` returns
+        `(max_seqlen, 0, z)` -- which is dense addressing, spelled once. Every
+        array read inside it is branched over rather than selected, so the null
+        `seqinfo` pointers a dense call passes are never dereferenced and the
+        bits-zero path costs a not-taken scalar branch. Compiling the decode
+        away for dense would buy that branch back and cost a second binary,
+        which is the trade gfx1201 already declined.
+
+        Four things about the shape of this:
 
         - **`z` is not `batch_idx`.** The workgroup's `z` selects a *sequence*;
           the decode says which *batch slice* that sequence lives in, which is
           `z` for a batched layout and 0 for a packed one. Overwriting
           `batch_idx` here is what keeps `_slab_byte_base` correct without a
           varlen branch inside it.
+        - **`z` outlives that overwrite**, as `seq_idx_i32`. Anything indexed by
+          *sequence* rather than by batch slice needs it, and after this method
+          runs there is nowhere else to get it: `init_philox` is the caller that
+          found this out the hard way.
         - **The reads are scalar.** `z` is workgroup-uniform, so these land in
           SGPRs and cost nothing against the VGPR budget.
         - **Row offsets stay separate from the batch index.** A packed tensor
@@ -897,13 +910,8 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
           `batch * s_batch + row_off * s_seq`, which is why the descriptors
           need no varlen case at all.
         """
-        traits = self.traits
-        if const_expr(not traits.VARLEN):
-            super().init_sequence_lengths(**kwargs)
-            self.lse_tokens_i32 = fx.Int32(self.seq_len_v)
-            self.kv_batch_idx = self.batch_idx
-            return
         z = fx.Int32(self.batch_idx)
+        self.seq_idx_i32 = z
         q_len, q_row, q_batch = fmha.decode_addressing(
             self.varlen_bits_arg, 0, self.seq_len_v, self.seqinfo_q0, self.seqinfo_q1, z
         )
@@ -952,11 +960,20 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         `BLOCK_M`/`BLOCK_N`, so re-tuning the tile geometry cannot move a single
         random. From this phase onward that is a constraint on the tuner, not
         just a property of today's code.
+
+        **The plane is indexed by the grid's sequence, not by `batch_idx`.**
+        Those two differ exactly when they matter: `init_sequence_lengths`
+        resolves `batch_idx` to the *batch slice* a sequence lives in, and a
+        stacked layout puts every sequence in slice 0. Reading it here would
+        give a whole packed batch one plane, so N sequences would draw the same
+        mask -- finite, self-consistent between the forward and the backward,
+        and statistically wrong in a way no allclose can see. `seq_idx_i32` is
+        the raw `z`, which is what gfx1201 uses.
         """
         if const_expr(not self.traits.ENABLE_DROPOUT):
             return
         self.philox_rng = Philox.for_arch("gfx950")
-        plane = fx.Int32(self.batch_idx) * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        plane = self.seq_idx_i32 * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
         seed = fmha.philox_seed_value(self.philox_seed_ptr)
         offset = fmha.philox_offset_base(self.philox_offset1, self.philox_offset2)
         fmha.philox_report(self.philox_seed_output, self.philox_offset_output, seed, offset)
@@ -1099,18 +1116,15 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         traits = self.traits
         super().init_descriptors(**kwargs)
 
-        # Varlen token origins. Dense is 0 on both sides: the batch axis has a
-        # real stride here, so it must not also be spent as a token offset.
-        # Under varlen these come from the decode, and the pairing is what
-        # makes one expression serve every mode -- a packed tensor gets
-        # `batch = 0` with a large `row_off`, a padded one a real batch with
-        # `row_off = 0`.
-        if const_expr(traits.VARLEN):
-            self.q_row_off = self.varlen_q_row_off
-            self.kv_row_off = self.varlen_kv_row_off
-        else:
-            self.q_row_off = fx.Index(0)
-            self.kv_row_off = fx.Index(0)
+        # Token origins, straight from the decode. Dense is not a case here:
+        # `decode_addressing` returns a zero row offset at `varlen_bits == 0`,
+        # which is the same 0 a dense branch would have written. The pairing
+        # with `batch_idx` is what makes one expression serve every mode -- a
+        # packed tensor gets `batch = 0` with a large `row_off`, a padded one a
+        # real batch with `row_off = 0` -- and the batch axis has a real stride
+        # here, so it must not also be spent as a token offset.
+        self.q_row_off = self.varlen_q_row_off
+        self.kv_row_off = self.varlen_kv_row_off
 
         # Head folded into the base, so what remains per access is `s * stride`.
         self.q_gmem_elem_offset = self.q_start * self.stride_q_seq_v
@@ -1873,13 +1887,10 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         must not both count it; that works for either layout because a batch's
         rows are contiguous in both, `H * tokens` of them.
 
-        Non-varlen builds keep the production row expression exactly --
-        `q_head_idx * seq_len_v + q_row`. It is what the `VarlenBits` form
-        generalizes to at `varlen_bits == 0`, `row_off == 0` and
-        `tokens == seq_len_v` -- but only as a *runtime* equality, and emitting
-        a select per store to rediscover a constant is not worth it on the path
-        every dense build takes. What both branches share is the descriptor,
-        and one term in it is **not** the production one: the head count.
+        The production row expression `q_head_idx * seq_len_v + q_row` is not a
+        second case to keep: it is what this form *is* at `varlen_bits == 0`,
+        `row_off == 0` and `tokens == seq_len_v`. One term in the descriptor is
+        **not** the production one, though: the head count.
 
         Upstream's `_store_lse_row` sizes the per-batch slice with
         `traits.NUM_HEADS_Q`, a compile-time trait, because upstream compiles a
@@ -1893,13 +1904,9 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
         also what gfx1201 feeds `lse_row_addressing`. Two scalar ops; the
         stores are unchanged.
         """
-        traits = self.traits
         # The runtime head count, NOT `traits.NUM_HEADS_Q` -- see above.
         num_heads_q = fx.Index(self.num_head_q)
-        if const_expr(traits.VARLEN):
-            tokens = fx.Index(self.lse_tokens_i32)
-        else:
-            tokens = self.seq_len_v
+        tokens = fx.Index(self.lse_tokens_i32)
         per_batch = num_heads_q * tokens
         per_batch_bytes = per_batch * fx.Index(4)
         rsrc = dualwave._make_ws_rsrc(
@@ -1912,18 +1919,15 @@ class ParityStoreHelper(dualwave.DualwaveStoreHelper):
             dualwave.fmath.log(as_mlir_value(l_row), fastmath=self.fm_fast),
             self.fm_fast,
         )
-        if const_expr(traits.VARLEN):
-            base, pitch = fmha.lse_row_addressing(
-                self.varlen_bits_arg,
-                fx.Index(0),
-                self.q_head_idx,
-                num_heads_q,
-                tokens,
-                self.q_row_off,
-            )
-            lse_local = base + q_row * pitch
-        else:
-            lse_local = self.q_head_idx * tokens + q_row
+        base, pitch = fmha.lse_row_addressing(
+            self.varlen_bits_arg,
+            fx.Index(0),
+            self.q_head_idx,
+            num_heads_q,
+            tokens,
+            self.q_row_off,
+        )
+        lse_local = base + q_row * pitch
         # One writer per row: low half-wave, in-bounds row; everything else is
         # redirected to the sentinel the buffer bound drops.
         off_row = (q_row < self.seqlen_q_v).select(lse_local, per_batch)
