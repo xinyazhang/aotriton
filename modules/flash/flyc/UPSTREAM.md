@@ -1137,3 +1137,35 @@ demonstrated kernel: `vgpr_count` 202 → 200, `vgpr_spill_count` 0 → 0,
 `DualwaveSoftmaxHelper.cast_p`, which the shadow layer does not override, so the
 126 kernels of those two families keep the gap. Overriding `cast_p` would close
 them, and has not been done because neither has been observed to fail.
+
+### 12. `VARLEN` and `CROSS_SEQLEN` are build traits that need not exist
+
+`DualwaveSwpTraits` carries `VARLEN: bool` and `CROSS_SEQLEN: bool`
+(`flash_attn_utils.py:1064, 1510, 1791`), read at `:2146`, `:3373`, `:3597` and
+`:4469`. They compile out the ragged-batch addressing, which doubles the binary
+count for a property the caller supplies at runtime.
+
+**Upstream's own newer kernel already disagrees.** `flash_attn_func_gfx1201_aiw.py`
+has no `VARLEN` trait and calls `decode_addressing` unconditionally, with the
+reasoning written down at its call site: at `varlen_bits == 0` the decode returns
+`(max_seqlen, 0, z)` — dense addressing — and every array read inside it is a real
+branch rather than a select, so the null `seqinfo` pointers a dense call passes are
+never dereferenced and the bits-zero path costs one not-taken scalar branch.
+
+gfx950 now matches gfx1201: `fmha_traits_gfx950.make_traits` takes no `varlen=` or
+`cross_seqlen=` argument and emits `VARLEN=True` / `CROSS_SEQLEN=bool(causal)` as
+constants, purely to satisfy the upstream dataclass. `VARLEN=True` is the value that
+makes the one inherited reader, `compute_active_guard` (`:3593-3603`), return the
+unconditional guard the runtime-decode design needs.
+
+**Cost, measured, so the trade is on the record.** dK/dV at head_dim 224, 32 rows —
+the one rung already at the register cap — goes from 512 VGPR / 0 spills / 1199
+TFLOP/s (causal, tight) to 512 / 20 / 858 with the decode compiled in, and from
+486 / 0 / 798 to 486 / 0 / 720 non-causal. Every other head dim spills zero either
+way. That is the price of one binary instead of two, and it is a tuning-table
+question rather than a reason to keep the axis.
+
+**Fix:** delete both fields and their four readers upstream, taking the varlen arm
+in each. `flyc_polyfill.py`'s copy of the dataclass and
+`assert_dualwave_swp_traits_equivalent` follow field-for-field and must be updated
+in the same change.
