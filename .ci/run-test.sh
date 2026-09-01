@@ -166,7 +166,42 @@ fi
     -v \
     1>>"${outdir}/${fnprefix}${pass}.out" \
     2>"${outdir}/${fnprefix}${pass}.err" || true
-  grep '^FAILED' "${outdir}/${fnprefix}${pass}.out"|sed 's/^FAILED //' | sed 's/].*/]/' > "${outdir}/sel${pass}.txt"
+  _out="${outdir}/${fnprefix}${pass}.out"
+  # Per-test ids by outcome, read from pytest's VERBOSE stream
+  # (`[gw12] [ 43%] PASSED <nodeid>`), not from the short summary at the end.
+  #
+  # That distinction is the whole point. A session that xdist tears down --
+  # which it does when two workers crash close enough together, and GPU faults
+  # make that a matter of time on a run this long -- never prints a summary. Of
+  # the four Level-3 passes so far, three left a 0-byte sel<N>.txt for exactly
+  # that reason, on the runs that most needed resuming.
+  _ids_by_outcome() {  # $1: alternation, e.g. 'PASSED|SKIPPED'
+    sed -nE "s/^.*\] ($1) ([^ ].*[^ ])[[:space:]]*$/\2/p" "$_out" | sort -u
+  }
+
+  # sel: what to RE-RUN. Summary first, so a completed run's file is byte-for-byte
+  # what it always was; the verbose stream only as a fallback, which is where a
+  # torn-down run gets a usable file instead of an empty one.
+  grep '^FAILED' "$_out" | sed 's/^FAILED //' | sed 's/].*/]/' > "${outdir}/sel${pass}.txt"
+  if [ ! -s "${outdir}/sel${pass}.txt" ]; then
+    _ids_by_outcome 'FAILED|ERROR' > "${outdir}/sel${pass}.txt"
+    if [ -s "${outdir}/sel${pass}.txt" ]; then
+      echo "run-test.sh: no short summary (session torn down?); recovered" \
+           "$(wc -l < "${outdir}/sel${pass}.txt") failure(s) from the verbose stream"
+    fi
+  fi
+
+  # skip: what NOT to re-run. Feed it back as PARTIAL_INFO_DIR/skip<N>.txt and the
+  # next pass covers the failures AND everything the torn-down session never
+  # dispatched -- which an include list cannot do, since a test that never ran
+  # appears in no outcome line at all.
+  #
+  # SKIPPED joins PASSED because a skip here is a deterministic property of the
+  # parameter set, not a result that could differ next time; re-running them is
+  # tens of thousands of instant no-ops for no information.
+  _ids_by_outcome 'PASSED|SKIPPED' > "${outdir}/skip${pass}.txt"
+  echo "run-test.sh: skip${pass}.txt has $(wc -l < "${outdir}/skip${pass}.txt") settled" \
+       "test(s); PARTIAL_INFO_DIR=${outdir} bash .ci/run-test.sh <next> ${test_level} ${backend} resumes"
   if [ -n "${RECORD_ADIFFS_TO:-}" ]; then
     SCRIPT_DIR_ABS="$(cd "${SCRIPT_DIR}" && pwd)"
     bash "${SCRIPT_DIR_ABS}/../.tune/bin/append_oom_to_adiffs.sh" "${outdir}/${fnprefix}${pass}.out" >> "${RECORD_ADIFFS_TO}"
