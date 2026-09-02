@@ -6,8 +6,18 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 usage() {
-  echo 'Usage: build-test.sh [--database_root <dir>] [--flydsl_kernel_root <dir>] [--name_suffix <suffix>] [--no_mold] [--altwheel_config <yaml>] <target arch> [optional pre-compiled triton wheel]' >&2
+  echo 'Usage: build-test.sh [--database_root <dir>] [--flydsl_kernel_root <dir>] [--flydsl_wheel <whl>] [--name_suffix <suffix>] [--no_mold] [--altwheel_config <yaml>] <target arch> [optional pre-compiled triton wheel]' >&2
   echo '<target arch> can be semicolon separated list of arches.' >&2
+  echo '' >&2
+  echo '--flydsl_wheel is OPTIONAL and installs a flydsl wheel from local disk into' >&2
+  echo 'the build venv instead of the version pinned by' >&2
+  echo 'third_party/flydsl-compiler.txt. Use it for an unreleased build -- one' >&2
+  echo 'carrying a compiler patch, say. Once that build is published, move the pin' >&2
+  echo 'instead. The wheel must match the build venv Python: flydsl wheels are' >&2
+  echo 'CPython-ABI specific.' >&2
+  echo '' >&2
+  echo 'The compiler wheel and the kernel source tree are independent pins, so a' >&2
+  echo 'patched wheel may or may not want a matching --flydsl_kernel_root.' >&2
   echo '' >&2
   echo '--flydsl_kernel_root is OPTIONAL and points the flyc backend at an existing' >&2
   echo 'FlyDSL source tree. Left unset, CMake shallow-clones the ref named by' >&2
@@ -22,7 +32,7 @@ usage() {
   echo 'gfx950 kernel-root pin is stricter than gfx1201s".' >&2
 }
 
-TEMP=$(getopt -o '' --long database_root:,flydsl_kernel_root:,name_suffix:,no_mold,altwheel_config: -n 'build-test.sh' -- "$@")
+TEMP=$(getopt -o '' --long database_root:,flydsl_kernel_root:,flydsl_wheel:,name_suffix:,no_mold,altwheel_config: -n 'build-test.sh' -- "$@")
 if [ $? != 0 ]; then
   usage
   exit 1
@@ -32,6 +42,7 @@ eval set -- "$TEMP"
 
 database_root=""
 flydsl_kernel_root=""
+flydsl_wheel=""
 name_suffix=""
 no_mold=false
 altwheel_config=""
@@ -43,6 +54,10 @@ while true; do
       ;;
     --flydsl_kernel_root)
       flydsl_kernel_root="$2"
+      shift 2
+      ;;
+    --flydsl_wheel)
+      flydsl_wheel="$2"
       shift 2
       ;;
     --name_suffix)
@@ -90,6 +105,11 @@ fi
 
 if [ -n "$flydsl_kernel_root" ]; then
   build_args+=("-DAOTRITON_FLYDSL_KERNEL_ROOT=$(realpath "$flydsl_kernel_root")")
+fi
+
+# realpath is what satisfies cmake's absolute-path requirement on this variable.
+if [ -n "$flydsl_wheel" ]; then
+  build_args+=("-DAOTRITON_USE_LOCAL_FLYDSL_WHEEL=$(realpath "$flydsl_wheel")")
 fi
 
 if [ -n "$name_suffix" ]; then
