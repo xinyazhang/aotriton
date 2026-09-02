@@ -1183,10 +1183,32 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         `hdim` is the row's real extent, `s2` the distance between rows; see
         `_slab_span_elems` for why the second is not a bound for the first.
         """
+        # Span first, then base -- the order the body had before the split, and
+        # the order the emitted MLIR therefore still has. Reversing it is
+        # semantically free and cost 230 lines of scheduling churn in every
+        # forward binary when this was first written the other way round.
         span_elems = _slab_span_elems(rows, s2, hdim)
+        base_bytes = self._slab_byte_base(s0, s1, s2, row_off, head_idx, batch_idx=batch_idx)
+        return self._slab_view_at(tensor, base_bytes, span_elems)
+
+    def _slab_view_at(self, tensor, base_bytes, span_elems):
+        """`_slab_view` over a base and an extent the caller already computed.
+
+        Split out so a caller that rebinds one slab to a *different head* can
+        hoist everything that does not move with the head. `_slab_byte_base` is
+        affine in `head_idx` and `_slab_span_elems` does not read it at all, so
+        such a caller needs one add per tensor rather than the three strides
+        those two expressions between them read.
+
+        That matters on gfx950 for a reason beyond tidiness: keeping the strides
+        live across the GQA walk is what drove the backward kernel's scalar
+        spilling, and the walk is the largest region in that kernel.
+        `BwdDkDvKernelContext._init_q_head_invariants` is the caller this exists
+        for, and carries the measurements.
+        """
         return dualwave._make_rebased_view(
             fx.get_iter(tensor),
-            self._slab_byte_base(s0, s1, s2, row_off, head_idx, batch_idx=batch_idx),
+            base_bytes,
             span_elems * fx.Index(self.traits.BF16_BYTES),
             fx.make_layout(fx.Int32(span_elems), fx.Int32(1)),
             _buf_flags_i32=self.buf_flags_i32,

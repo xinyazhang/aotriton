@@ -537,9 +537,14 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # *query* head and the slot is a function of the KV column alone.
         self.philox_slot = fx.Index(self.kv_row) % fx.Index(self.philox_rng.randoms_per_offset)
         # The plane is `(batch, q head)` and therefore moves with the group, so
-        # it is bound in `bind_q_head` rather than here. This call gives the
+        # it is bound alongside the other query-side state. This call gives the
         # prologue a plane for the group's first head; the loop rebinds it.
-        self.bind_q_head()
+        #
+        # `_bind_philox_plane` and not the whole of `bind_q_head`: the plane is
+        # the only thing missing at this point, and rebuilding six descriptors
+        # to reach it emitted a second copy of all of their address arithmetic
+        # for the canonicaliser to fold back out.
+        self._bind_philox_plane()
 
     def compute_active_guard(self):
         """Whether this workgroup's KV block exists in *this* sequence.
@@ -603,8 +608,11 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.kv_gmem_elem_offset = fx.Index(0)
 
         # Everything keyed on the *query* head, built once here for the first
-        # head of the group and rebuilt per group iteration under GQA.
-        self.bind_q_head()
+        # head of the group and rebuilt per group iteration under GQA. The
+        # invariants come first and are hoisted deliberately -- see
+        # `_init_q_head_invariants`.
+        self._init_q_head_invariants()
+        self.bind_q_head(fx.Index(0))
 
         # Resident, and the two outputs: all four are (batch, kv head) slabs
         # bounded at the last real element of their `seqlen_kv`th row. K and dK
@@ -684,44 +692,58 @@ class BwdDkDvKernelContext(ParityKernelContext):
         self.dk_oob_off = self.seqlen_kv_v * self.stride_dk_seq_v
         self.dv_oob_off = self.seqlen_kv_v * self.stride_dv_seq_v
 
-    def bind_q_head(self):
-        """Every descriptor keyed on `q_head_idx`, in one place.
+    def _init_q_head_invariants(self):
+        """Everything `bind_q_head` needs that does **not** move with the head.
 
-        **This exists because of GQA**, and it is the whole of the addressing
-        side of that feature: several query heads reduce into one KV head, so a
-        workgroup walks the group and re-points the query side at each head in
-        turn while K, V, dK and dV stay exactly where they are. Collected into
-        one method rather than left inline so that the loop and the prologue
-        cannot drift -- there is one description of what "the query side" is.
+        **This split is a scalar-pressure change and nothing more. Read the last
+        paragraph before you attribute any correctness property to it.**
 
-        Called once from `init_descriptors` for the first head of the group,
-        and again per group iteration from `retarget_q_head`. At
-        `num_kv_heads == num_heads` the group is one head wide, the loop runs
-        once, and every value here is what it was before B7.
+        `bind_q_head` runs inside the GQA loop, whose trip count is a runtime
+        value and so cannot fold away, which means every value it reads is live
+        across the largest region in the kernel. Reading the nine Q/dO/bias
+        strides there kept nine `i64` kernargs live across the whole tile walk.
+
+        What makes the hoist possible is that all of it is affine in the head:
+        `_slab_byte_base` moves by `stride_head` per head, `lse_row_addressing`'s
+        base by `lse_row_step_per_head`, and the spans and bounds -- which read
+        the *seq* strides, the wide ones -- do not move at all. So the loop needs
+        one add per tensor and none of the strides.
+
+        Measured over all 216 built configurations: `sgpr_spill_count` median
+        97 -> 87, 180 improved / 32 worse / 4 unchanged, -2147 in total, and
+        zero-spill builds 4 -> 16. VGPR is flat. That is the whole of the claim.
+
+        **It does not fix the gfx950 lost-`s_mov_b64` miscompile, and it was
+        wrong to expect it to.** The hypothesis was that the long stride live
+        ranges were the precondition for the backend dropping a staging copy.
+        They are not. Across the same 216 builds the defect went 42 -> 28, but
+        the *set* churned: 32 cleared and **18 previously-clean builds newly
+        acquired it**, 14 of those while their spill count went down. It also
+        survives forcing scratch spilling instead of lane spilling
+        (`amdgpu-spill-sgpr-to-vgpr=false`, which flags an identical 28) and
+        both existing `_COMPILE_HINTS` flags, and 19 builds are flagged under
+        every setting tried. So spill pressure is not the control variable and
+        this file cannot reach the bug. See
+        `flydsl-issue-gfx950-lost-sgpr-copy-REPRO.md` for the ISA and the
+        wheel-only reproducer; only a backend fix closes it.
         """
+        elem_bytes = fx.Index(self.traits.BF16_BYTES)
+        head0 = self.gqa_q_head_base
+
         # Streamed. Bounded at `seqlen_q` rows, which is what makes the ragged
-        # tail stage as zeros instead of faulting.
-        self.k_div = self._slab_view(
-            self.Q,
-            self.stride_q_batch,
-            self.stride_q_head,
-            self.stride_q_seq,
-            self.q_row_off,
-            self.q_head_idx,
-            self.seqlen_q_v,
-            self.hdim_qk,
+        # tail stage as zeros instead of faulting. Q rides the forward's K slot
+        # and dO its V slot; see the class docstring.
+        self.q_slab_span_elems = _slab_span_elems(self.seqlen_q_v, self.stride_q_seq, self.hdim_qk)
+        self.q_slab_base0_bytes = self._slab_byte_base(
+            self.stride_q_batch, self.stride_q_head, self.stride_q_seq, self.q_row_off, head0
         )
-        self.v_div = self._slab_view(
-            self.DO,
-            self.stride_do_batch,
-            self.stride_do_head,
-            self.stride_do_seq,
-            self.q_row_off,
-            self.q_head_idx,
-            self.seqlen_q_v,
-            self.hdim_vo,
+        self.q_head_step_bytes = fx.Index(self.stride_q_head) * elem_bytes
+
+        self.do_slab_span_elems = _slab_span_elems(self.seqlen_q_v, self.stride_do_seq, self.hdim_vo)
+        self.do_slab_base0_bytes = self._slab_byte_base(
+            self.stride_do_batch, self.stride_do_head, self.stride_do_seq, self.q_row_off, head0
         )
-        self.q_div = self.k_div
+        self.do_head_step_bytes = fx.Index(self.stride_do_head) * elem_bytes
 
         # LSE and delta, through **the same function the forward writes LSE
         # with**. Both are always compact -- their strides are a function of
@@ -738,59 +760,102 @@ class BwdDkDvKernelContext(ParityKernelContext):
         # very negative LSE would make it `+inf` -- then `inf * 0` from the
         # zero-staged dO is a NaN in dV, where a zero gives `P = 1` and a clean
         # zero contribution.
-        lse_base, lse_pitch = fmha.lse_row_addressing(
+        lse_base, self.lse_pitch = fmha.lse_row_addressing(
             self.varlen_bits_arg,
             self.batch_idx,
-            self.q_head_idx,
+            head0,
             fx.Index(self.num_head_q),
             fx.Index(self.lse_tokens_i32),
             self.q_row_off,
         )
-        self.lse_pitch = lse_pitch
-        row_span_bytes = self.seqlen_q_v * lse_pitch * fx.Index(4)
-        base_bytes = lse_base * fx.Index(4)
-        self.lse_rsrc = dualwave._make_ws_rsrc(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), base_bytes, row_span_bytes)
-        self.delta_rsrc = dualwave._make_ws_rsrc(
-            fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), base_bytes, row_span_bytes
+        self.lse_base0_bytes = lse_base * fx.Index(4)
+        self.lse_head_step_bytes = (
+            fmha.lse_row_step_per_head(self.varlen_bits_arg, fx.Index(self.lse_tokens_i32)) * fx.Index(4)
         )
+        self.lse_row_span_bytes = self.seqlen_q_v * self.lse_pitch * fx.Index(4)
 
         # The bias is `(batch, q head, q row, kv col)`, so it moves with the
-        # query head too. `ParityKernelContext.init_descriptors` built one for
-        # the prologue's head already; this is the binding that survives, and
-        # it is the same expression because `_slab_byte_base` is shared.
+        # query head too -- but only its base does. The bound is a function of
+        # the two sequence lengths and the row stride, none of which are the
+        # head's, so it is computed once here.
+        if const_expr(self.traits.BIAS_TYPE):
+            self.bias_num_records_bytes = _bias_slab_num_records_bytes(
+                self.seqlen_q_v, self.seqlen_kv_v, self.stride_b_seq_q, self.traits.BF16_BYTES
+            )
+            self.bias_base0_bytes = self._slab_byte_base(
+                self.stride_b_batch, self.stride_b_head, self.stride_b_seq_q, self.q_row_off, head0
+            )
+            self.bias_head_step_bytes = fx.Index(self.stride_b_head) * elem_bytes
+
+    def bind_q_head(self, g):
+        """Every descriptor keyed on the query head, in one place.
+
+        **This exists because of GQA**, and it is the whole of the addressing
+        side of that feature: several query heads reduce into one KV head, so a
+        workgroup walks the group and re-points the query side at each head in
+        turn while K, V, dK and dV stay exactly where they are. Collected into
+        one method rather than left inline so that the loop and the prologue
+        cannot drift -- there is one description of what "the query side" is.
+
+        `g` is the group-relative head index, an `Index`: 0 from the prologue in
+        `init_descriptors`, the loop variable from `retarget_q_head`. Each
+        descriptor is its head-0 base plus `g` head steps rather than a fresh
+        derivation from the strides -- see `_init_q_head_invariants` for what
+        that difference buys, which is scalar pressure and only that. At
+        `num_kv_heads == num_heads` the group is one head wide, the loop runs
+        once, `g` is 0, and every value here is what it was before B7.
+        """
+        self.q_head_idx = self.gqa_q_head_base + g
+
+        self.k_div = self._slab_view_at(
+            self.Q, self.q_slab_base0_bytes + g * self.q_head_step_bytes, self.q_slab_span_elems
+        )
+        self.v_div = self._slab_view_at(
+            self.DO, self.do_slab_base0_bytes + g * self.do_head_step_bytes, self.do_slab_span_elems
+        )
+        self.q_div = self.k_div
+
+        base_bytes = self.lse_base0_bytes + g * self.lse_head_step_bytes
+        self.lse_rsrc = dualwave._make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), base_bytes, self.lse_row_span_bytes
+        )
+        self.delta_rsrc = dualwave._make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.Delta))), base_bytes, self.lse_row_span_bytes
+        )
+
         if const_expr(self.traits.BIAS_TYPE):
             self.bias_rsrc = buffer_ops.create_buffer_resource(
                 self.Bias,
                 max_size=False,
-                num_records_bytes=_bias_slab_num_records_bytes(
-                    self.seqlen_q_v, self.seqlen_kv_v, self.stride_b_seq_q, self.traits.BF16_BYTES
-                ),
-                base_byte_offset=as_mlir_value(
-                    self._slab_byte_base(
-                        self.stride_b_batch,
-                        self.stride_b_head,
-                        self.stride_b_seq_q,
-                        self.q_row_off,
-                        self.q_head_idx,
-                    )
-                ),
+                num_records_bytes=self.bias_num_records_bytes,
+                base_byte_offset=as_mlir_value(self.bias_base0_bytes + g * self.bias_head_step_bytes),
             )
 
-        # The philox plane is `(sequence, q head)`, so a GQA group draws a
-        # *different* mask per head -- which is the forward's behaviour, since
-        # the forward has one program per query head and this must reproduce it
-        # bit for bit. `seq_idx_i32` and not `batch_idx` for the same reason the
-        # forward uses it: the decode collapses every stacked sequence to batch
-        # 0, which would hand a whole packed batch one plane. Guarded on the
-        # attribute rather than on the trait because `init_philox` runs after
-        # `init_descriptors`; the prologue call finds no RNG and the loop's
-        # calls do.
-        if const_expr(self.traits.ENABLE_DROPOUT):
-            if getattr(self, "philox_rng", None) is not None:
-                plane = self.seq_idx_i32 * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
-                self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
-                    self.philox_offset_base_v, plane, self.seq_len_v, self.seq_len_kv_v
-                )
+        self._bind_philox_plane()
+
+    def _bind_philox_plane(self):
+        """This query head's philox plane.
+
+        The plane is `(sequence, q head)`, so a GQA group draws a *different*
+        mask per head -- which is the forward's behaviour, since the forward has
+        one program per query head and this must reproduce it bit for bit.
+        `seq_idx_i32` and not `batch_idx` for the same reason the forward uses
+        it: the decode collapses every stacked sequence to batch 0, which would
+        hand a whole packed batch one plane.
+
+        Guarded on the attribute rather than on the trait because `init_philox`
+        runs *after* `init_descriptors`: the prologue's `bind_q_head` finds no
+        RNG and does nothing, `init_philox` then calls this directly, and the
+        loop's calls find one.
+        """
+        if const_expr(not self.traits.ENABLE_DROPOUT):
+            return
+        if getattr(self, "philox_rng", None) is None:
+            return
+        plane = self.seq_idx_i32 * fx.Int32(self.num_head_q) + fx.Int32(self.q_head_idx)
+        self.philox_plane_base, self.philox_row_stride = self.philox_rng.grid_plane(
+            self.philox_offset_base_v, plane, self.seq_len_v, self.seq_len_kv_v
+        )
 
     def retarget_q_head(self, g):
         """Point the query side at head `g` of this KV head's group.
@@ -799,8 +864,7 @@ class BwdDkDvKernelContext(ParityKernelContext):
         accumulators they feed -- is untouched by construction: nothing below
         `bind_q_head` reads `q_head_idx`.
         """
-        self.q_head_idx = self.gqa_q_head_base + g
-        self.bind_q_head()
+        self.bind_q_head(g)
 
     def _slab_rsrc(self, tensor, s0, s1, s2, hdim):
         """A raw buffer resource over this workgroup's KV slab, bounded at its rows.
