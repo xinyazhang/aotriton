@@ -45,7 +45,7 @@ AOTRITON_DEBUG_SKIP_TRITON_KERNELS = bool(int(os.getenv('AOTRITON_DEBUG_SKIP_TRI
 # Triton kernels that keep their image rules even under the flag above, because a
 # non-Triton backend cannot run without them and FlyDSL has no equivalent:
 #
-#   bwd_preprocess / bwd_preprocess_varlen  produce Delta = rowsum(dO * O), which
+#   bwd_preprocess                          produces Delta = rowsum(dO * O), which
 #       both flyc backward kernels read and neither produces (metro_bwd_flyc)
 #   debug_simulate_encoded_softmax          the dropout-mask debug step that
 #       metro_fwd_flyc deliberately keeps on Triton
@@ -59,7 +59,6 @@ AOTRITON_DEBUG_SKIP_TRITON_KERNELS = bool(int(os.getenv('AOTRITON_DEBUG_SKIP_TRI
 # kernel.
 AOTRITON_SKIP_TRITON_KEEP_KERNELS = frozenset({
     'bwd_preprocess',
-    'bwd_preprocess_varlen',
     'debug_simulate_encoded_softmax',
 })
 

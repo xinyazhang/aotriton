@@ -84,8 +84,10 @@ def metro_bwd(params):
 # and dQ kernels both READ `Delta = rowsum(dO * O)` and neither produces it
 # (FlyDSL's own interfaces compute it in torch, on the host). bwd_preprocess
 # computes exactly that quantity in fp32, so it feeds them directly with no
-# adapter -- and the num_seqlens branch selecting the varlen variant is
-# unchanged, since that is a property of the layout rather than of the DSL.
+# adapter -- for every layout, since the varlen_bits port merged
+# bwd_preprocess_varlen into bwd_preprocess and the merged kernel decodes the
+# layout itself. This metro therefore calls it unconditionally, exactly as
+# metro_bwd does.
 #
 # No @ati.hints.union_precedence: a flyc kdesc contributes no func_cfields
 # (ir/flyc/kdesc.py), so this metro adds nothing to the operator's params-struct
@@ -93,10 +95,7 @@ def metro_bwd(params):
 @ati.start
 @ati.metro_kernel
 def metro_bwd_flyc(params):
-    if params.num_seqlens > 0:
-        bwd_preprocess_varlen(params)
-    else:
-        bwd_preprocess(params)
+    bwd_preprocess(params)
     flyc_bwd_dkdv(params)
     flyc_bwd_dq(params)
 
