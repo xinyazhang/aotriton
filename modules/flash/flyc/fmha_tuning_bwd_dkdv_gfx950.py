@@ -148,7 +148,7 @@ LDS_CAP_BYTES = 163840
 #      64      32     4     1      64      128        0      0       735
 #      96      16     4     1      64       64        0      0       733
 #     128      16     4     1      64       64        0      0       775
-#     160      32     4     2      64      128      100      0       735
+#     160      32     4     1      64      128      100      0       735  (*)
 #     192      16     4     1      32       64        0      0       849
 #     224      32     4     1      64      128      230      0       799
 #     256      16     4     1      32       64        0      0       743
@@ -158,6 +158,37 @@ LDS_CAP_BYTES = 163840
 # **No rung shards and none is single-buffered any more**, and every one
 # compiles with zero scratch. Builds peak at under three seconds, far inside
 # plan B3's eight-minute cap.
+#
+# **(*) head_dim 160 was 2 and is now 1, because 2 was never granted.** The
+# backend said so on every build of this rung -- "failed to meet occupancy
+# target given by 'amdgpu-waves-per-eu': desired occupancy was 2, final
+# occupancy is 1" -- and the reason is LDS, not registers: the workgroup takes
+# 87040 B, so two of them want 174080 B against `LDS_CAP_BYTES` and the second
+# never lands however few registers the wave holds. That makes this rung
+# structurally different from head_dim 32, the other rung asking for 2, which
+# takes 17408 B and does get it.
+#
+# An unmet hint is not automatically an inert one -- it is still a register
+# budget for the scheduler, which is note 1's whole point -- so the question
+# was settled on the artifacts rather than assumed. Both tables were built at
+# 1 and at 2 and the 24 head_dim 160 hsacos compared: **byte-identical, 24 of
+# 24**, same sizes, same VGPR/AGPR counts, same zero scratch. At this rung the
+# budget is slack -- occupancy 1 already allows the full register file, so
+# asking for 2 constrains nothing the allocator was going to exceed -- and the
+# hint's entire observable effect is whether the backend prints the warning.
+#
+# So this is a build-log change, not a performance change, and it is stated
+# that way deliberately: an interleaved A/B did appear to show the dense arm
+# 5.5% faster at 1, reproducibly, across two runs. It was position in the
+# round, not the knob. Each variant ran second in its pair, right after an arm
+# that streams a 512 MB bias tensor through L2; reversing the order moved the
+# same 5.5% to the other arm. Given byte-identical binaries no A/B here can
+# measure anything else, which is what makes the reversal the check worth
+# running -- `bench_dkdv160_wpe_ab.py`'s `WPE_ORDER` exists for it.
+#
+# Both tables move, for the one reason that survives: a request the hardware
+# provably cannot satisfy, and provably does not change the code, is a false
+# signal in the build log 24 times per build.
 #
 # 96, 160 and 224 are the granule-32 rungs, and two of the three keep 32 rows
 # for a structural reason: at granule 32 a staged tile has `SMEM_N_RPT = 4`
@@ -266,6 +297,13 @@ _TIGHT_REGISTERS = {
 # `varlen=True` twin, because the decode never moved the right geometry; now
 # that the decode is unconditional there is nothing to twin. The rows below are
 # the surviving halves, unchanged.
+#
+# `(160, False, True)` asked for `waves_per_eu=2` and is now 1, with
+# `_GEOMETRY[160]` and for the same reason: the rung's 87040 B of LDS makes a
+# second workgroup impossible, so 2 was a request the backend refused on every
+# build, and the hsaco is byte-identical either way. See the `(*)` note on the
+# geometry table. head_dim 32 keeps its 2 -- it takes 17408 B, the hint is
+# granted, and nothing here applies to it.
 _FEATURE_OVERRIDES = {
     # (head_dim, causal, bias): (waves, waves_per_eu, shards, rows, block_q, tight)
     (224, True, False): (4, 1, 1, 32, 64, True),
@@ -273,7 +311,7 @@ _FEATURE_OVERRIDES = {
     # one above.
     (32, False, True): (4, 2, 1, 16, 64, False),
     (64, False, True): (4, 1, 1, 32, 64, True),
-    (160, False, True): (4, 2, 1, 16, 64, False),
+    (160, False, True): (4, 1, 1, 16, 64, False),
     (224, False, True): (4, 1, 1, 32, 64, True),
 }
 
@@ -292,7 +330,7 @@ _GEOMETRY = {
     64: (4, 1, 1, 32, 64),
     96: (4, 1, 1, 16, 64),
     128: (4, 1, 1, 16, 64),
-    160: (4, 2, 1, 32, 64),
+    160: (4, 1, 1, 32, 64),
     192: (4, 1, 1, 16, 32),
     224: (4, 1, 1, 32, 64),
     256: (4, 1, 1, 16, 32),
