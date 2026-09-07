@@ -19,16 +19,16 @@ namespace AOTRITON_NS::v3::flash {
 
 namespace {
 
-// `VarlenType` itself never reaches here -- attn_fwd.cc:99 already collapsed it
-// into the sign of Num_seqlens by the time this context sees params. Note the
-// capitalised field names: the forward operator spells them `Num_seqlens` and
-// `Q` where the backward spells the first one lowercase, which is why
-// flyc_classify_varlen takes scalars rather than a params struct.
+// Note the capitalised field names: the forward operator spells them
+// `Varlen_bits` and `Max_seqlen_q` where the backward spells both lowercase,
+// which is why flyc_classify_varlen takes operands rather than a params struct.
 FlycVarlenRow
 classify(const OpAttnFwdParams& params) {
-  return flyc_classify_varlen(params.Num_seqlens,
-                              static_cast<int32_t>(params.Q->size(0)),
-                              static_cast<bool>(*params.seq_strides_q));
+  return flyc_classify_varlen(params.Varlen_bits,
+                              *params.Q,
+                              *params.seqinfo_q0,
+                              *params.seqinfo_q1,
+                              params.Max_seqlen_q);
 }
 
 } // anonymous namespace

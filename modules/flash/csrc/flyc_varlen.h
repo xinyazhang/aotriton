@@ -8,9 +8,15 @@
 //
 // The canonical specification is FlyDSL's
 // `kernels/attention/parity/sdpa-varlen-plan.md` (§1 for the axes, §2 for the
-// encoding). This header is the C++ transcription of it, and exists because the
-// AOTriton side has to BUILD these words while the kernel side only decodes
-// them.
+// encoding). This header is the C++ transcription of it.
+//
+// AOTriton's own transcription of the same spec is `varlen.h`, which arrived
+// later, when varlen_bits replaced the tri-state Num_seqlens in the public API.
+// The two agree, and the static_asserts at the bottom of this file are what
+// keep them agreeing -- so a flyc launch forwards the word AOTriton built
+// rather than rebuilding it. That is why nothing here is called on the launch
+// path any more: these constants remain as the named, checkable statement of
+// what the four legacy configurations mean.
 //
 // Why name the fields at all rather than paste the four hex constants the spec
 // tabulates: the hex is a *result*, not the definition. `0x0B0B` says nothing
@@ -44,6 +50,8 @@
 // Only the HOST builds these. Nothing here is shared with device code.
 
 #include <aotriton/config.h>
+
+#include "varlen.h"
 
 #include <bit>
 #include <cstdint>
@@ -147,12 +155,11 @@ flyc_varlen_bits(uint32_t stacked, uint32_t length, uint32_t position,
        | (lse_layout << FlycVarlenShift::LSE_LAYOUT);
 }
 
-// --- the four configurations AOTriton can produce ----------------------------
+// --- the four configurations the legacy API can produce ----------------------
 //
-// Named for AOTriton's VarlenType, which is what the caller was thinking in,
-// even though that enum has already been erased by the time the shim runs (see
-// modules/flash/csrc/attn_fwd.cc, where it collapses into the sign of
-// Num_seqlens plus the nullness of seq_strides_q/k).
+// Named for VarlenType, the retired public enum (now internal, in varlen.h) --
+// which is what a caller on the kVersion 3/6 ABI was thinking in. A caller on
+// the current ABI hands over a VarlenBits and is not restricted to these four.
 
 constexpr uint32_t kFlycVarlenDense = flyc_varlen_bits(
     FlycVarlenStacked::BHSD, FlycVarlenLength::MAX, FlycVarlenPosition::IMPLIED);
@@ -174,6 +181,55 @@ static_assert(kFlycVarlenDense   == 0x0000u, "dense must encode as 0x0000");
 static_assert(kFlycVarlenCompact == 0x0B0Bu, "compact varlen must encode as 0x0B0B");
 static_assert(kFlycVarlenPadded  == 0x0202u, "padded varlen must encode as 0x0202");
 static_assert(kFlycVarlenStrided == 0x1313u, "strided varlen must encode as 0x1313");
+
+// --- pinned to AOTriton's own encoding ---------------------------------------
+//
+// AOTriton used to have no varlen word of its own: the host passed a tri-state
+// Num_seqlens and this header was where a FlyDSL word got BUILT, so it had only
+// the spec to answer to. varlen.h now encodes the same layout for AOTriton's own
+// kernels, which makes the two headers two spellings of one wire format -- and
+// nothing above them would notice a divergence, because a launch simply forwards
+// the word.
+//
+// So they are pinned rather than trusted, and pinned twice over. The SHIFTS are
+// the real check: they cover the whole space, including the mixed-mode words the
+// legacy four rows cannot reach. The four rows are checked as well because they
+// are what the encodings are FOR, and a shift table can agree while an axis
+// constant does not.
+//
+// A failure here is a build error, which is the entire point: divergence would
+// otherwise be a kernel decoding a plausible wrong layout at runtime.
+
+static_assert(FlycVarlenShift::STACKED    == internal::VarlenShift::STACKED);
+static_assert(FlycVarlenShift::LENGTH     == internal::VarlenShift::LENGTH);
+static_assert(FlycVarlenShift::POSITION   == internal::VarlenShift::POSITION);
+static_assert(FlycVarlenShift::K_SIDE     == internal::VarlenShift::K_SIDE);
+static_assert(FlycVarlenShift::LSE_LAYOUT == internal::VarlenShift::LSE_LAYOUT);
+
+// T1HD is FlyDSL's spelling of what AOTriton calls THD. Same axis, same value.
+static_assert(FlycVarlenStacked::BHSD == VarlenStacked::BHSD);
+static_assert(FlycVarlenStacked::T1HD == VarlenStacked::THD);
+static_assert(FlycVarlenLength::MAX          == VarlenLength::MAX);
+static_assert(FlycVarlenLength::CUMULATIVE   == VarlenLength::CUMULATIVE);
+static_assert(FlycVarlenLength::INDIVIDUAL   == VarlenLength::INDIVIDUAL);
+static_assert(FlycVarlenPosition::IMPLIED == VarlenPosition::IMPLIED);
+static_assert(FlycVarlenPosition::REUSE   == VarlenPosition::REUSE);
+static_assert(FlycVarlenPosition::ARRAY   == VarlenPosition::ARRAY);
+static_assert(FlycVarlenLseLayout::HT == VarlenLseLayout::HT);
+static_assert(FlycVarlenLseLayout::TH == VarlenLseLayout::TH);
+
+static_assert(kFlycVarlenDense == internal::varlen_to_wire(
+    internal::varlen_bits_of(internal::VarlenType::None, false, false)),
+    "dense must encode identically in both headers");
+static_assert(kFlycVarlenCompact == internal::varlen_to_wire(
+    internal::varlen_bits_of(internal::VarlenType::CompactVarlen, true, false)),
+    "compact varlen must encode identically in both headers");
+static_assert(kFlycVarlenPadded == internal::varlen_to_wire(
+    internal::varlen_bits_of(internal::VarlenType::PaddedVarlen, true, false)),
+    "padded varlen must encode identically in both headers");
+static_assert(kFlycVarlenStrided == internal::varlen_to_wire(
+    internal::varlen_bits_of(internal::VarlenType::StridedVarlen, true, true)),
+    "strided varlen must encode identically in both headers");
 
 // The check the language will not let us make at compile time: that the
 // bitfield view decodes what the shift encoder produced. Returns true, or

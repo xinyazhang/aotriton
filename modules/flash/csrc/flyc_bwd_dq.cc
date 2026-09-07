@@ -21,9 +21,11 @@ namespace {
 
 FlycVarlenRow
 classify(const OpAttnBwdParams& params) {
-  return flyc_classify_varlen(params.num_seqlens,
-                              static_cast<int32_t>(params.Q->size(0)),
-                              static_cast<bool>(*params.seq_strides_q));
+  return flyc_classify_varlen(params.varlen_bits,
+                              *params.Q,
+                              *params.seqinfo_q0,
+                              *params.seqinfo_q1,
+                              params.max_seqlen_q);
 }
 
 } // anonymous namespace

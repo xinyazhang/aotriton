@@ -5,28 +5,27 @@
 #define AOTRITON_MODULES_FLASH_CSRC_FLYC_COMMON_H
 
 // The host-side translations every flyc flash kernel needs: AOTriton's varlen
-// encoding into FlyDSL's, and AOTriton's float dropout probability into
-// FlyDSL's threshold/scale pair.
+// layout word into the two extra numbers a FlyDSL launch wants, and AOTriton's
+// float dropout probability into FlyDSL's threshold/scale pair.
 //
 // These were `FlycAttnFwdContext` member functions until the backward kernels
-// arrived. They are free functions taking plain scalars rather than a params
+// arrived. They are free functions taking plain operands rather than a params
 // struct, because the two params structs are different types that spell the
-// same field differently -- `OpAttnFwdParams::Num_seqlens` against
-// `OpAttnBwdParams::num_seqlens` -- so neither a shared base nor a template
-// over the struct would bind. Passing the three inputs explicitly is the only
-// spelling that serves both, and it has the side benefit of being directly
-// unit-testable (modules/flash/tests/test_flyc_varlen_translation.cc) without
-// constructing a context.
+// same field differently -- `OpAttnFwdParams::Varlen_bits` against
+// `OpAttnBwdParams::varlen_bits` -- so neither a shared base nor a template
+// over the struct would bind.
 //
-// `flyc_varlen.h` stays separate and holds the bit encoding itself. This
-// header is the AOTriton-to-FlyDSL mapping that decides WHICH encoding a given
-// call needs; that file is what those encodings ARE.
+// `flyc_varlen.h` stays separate and holds FlyDSL's bit encoding, which is the
+// same encoding as AOTriton's `varlen.h`; that file is now what PINS the two
+// together rather than what converts between them.
 
 #include <aotriton/config.h>
+#include <aotriton/flash.h>
 #include <aotriton/_internal/log.h>
 #include <aotriton/_internal/pon.h>
 
 #include "flyc_varlen.h"
+#include "varlen.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -49,49 +48,55 @@ struct FlycVarlenRow {
   int32_t nseq_idx() const { return num_seqlens != 0 ? num_seqlens : batch_size; }
 };
 
-// Classifies a call into one row of the varlen table and, in the same place,
-// checks the one invariant that makes the classification safe to trust: the
-// kernel's `nseq_idx` must agree with what AOTriton computes independently
-// from Num_seqlens and Q's batch axis. A silent disagreement here is not a
-// crash -- it is a kernel launched over the wrong number of programs,
-// addressing an in-bounds row that is simply the wrong one.
+// Fills that row from the layout word AOTriton now hands over directly.
 //
-// `num_seqlens` is AOTriton's SIGNED three-way value (>0 packed, 0 dense, <0
-// BHSD-padded); `q_batch` is Q->size(0), which is not Batch under packed
-// varlen; `seq_strides_q_present` is whether a dedicated position array was
-// supplied, the only thing separating strided varlen from compact.
+// There is no longer a varlen encoding to translate. `varlen_bits` IS the word
+// the FlyDSL kernel decodes -- flyc_varlen.h static_asserts that the two
+// headers allocate the same bits to the same axes -- so it passes straight
+// through and this function exists only for the two DERIVED numbers, which
+// AOTriton has no field for because its own kernels take neither.
+//
+// This used to infer the layout instead, from the sign of a tri-state
+// `Num_seqlens` plus the nullness of `seq_strides_q`. That inference, and the
+// nseq_idx cross-check that made it safe to trust, both moved upstream: the
+// operator shims (attn_fwd.cc / attn_bwd.cc) run varlen_valid(), max_seqlen_ok(),
+// extents_ok() and the seq_count()/independent_seq_count() comparison before
+// any backend is chosen. Repeating any of it here would be a second spelling of
+// a check that has already passed.
+//
+// Q side only: the launch's N comes off Q, and both the grid's z extent and
+// FlyDSL's num_seqlens are properties of the output's addressing.
 inline FlycVarlenRow
-flyc_classify_varlen(int32_t num_seqlens, int32_t q_batch, bool seq_strides_q_present) {
-  FlycVarlenRow row;
-  if (num_seqlens == 0) {
-    // Dense: nothing packed, Q is BHSD with q_batch == B.
-    row = { static_cast<int32_t>(kFlycVarlenDense), q_batch, 0 };
-  } else if (num_seqlens < 0) {
-    // Padded varlen: BHSD, one sequence per batch slot, q_batch == N. The
-    // count already arrived via Q's own batch axis, so num_seqlens is 0 --
-    // FlyDSL's num_seqlens means "how many sequences are packed into a 1THD
-    // tensor", and padded packs nothing.
-    row = { static_cast<int32_t>(kFlycVarlenPadded), q_batch, 0 };
-  } else if (!seq_strides_q_present) {
-    // Compact varlen: 1THD, position reused from the cumulative length array,
-    // so no seq_strides_q tensor is supplied.
-    row = { static_cast<int32_t>(kFlycVarlenCompact), q_batch, num_seqlens };
-  } else {
-    // Strided varlen: 1THD, position read from a dedicated array.
-    row = { static_cast<int32_t>(kFlycVarlenStrided), q_batch, num_seqlens };
+flyc_classify_varlen(int32_t varlen_bits, const T4& q,
+                     const T1& seqinfo_q0, const T1& seqinfo_q1,
+                     int32_t max_seqlen_q) {
+  const auto v = internal::varlen_from_wire(static_cast<uint32_t>(varlen_bits));
+  const auto q_addr = internal::varlen_addressing_of(v.qmode, q, seqinfo_q0,
+                                                     seqinfo_q1, max_seqlen_q);
+  const int32_t nseq = q_addr.seq_count();
+  if (nseq < 0) {
+    // A stacked side with LENGTH == MAX whose token axis is not a whole
+    // multiple of max_seqlen. There is no array to count and rounding would
+    // give in-bounds addresses of the wrong rows, so refuse rather than guess
+    // -- the same contract seq_count() documents for its -1.
+    AOTRITON_LOG(LOG_ERROR,
+                 "flyc varlen: varlen_bits=0x%08x gives no derivable sequence count "
+                 "(Q token axis %d is not a whole multiple of max_seqlen_q=%d) "
+                 "-- refusing to launch",
+                 static_cast<unsigned>(varlen_bits),
+                 static_cast<int>(q.size(2)), max_seqlen_q);
+    throw std::runtime_error("flyc varlen: underivable sequence count");
   }
 
-  const int32_t expected = num_seqlens == 0 ? q_batch
-                          : (num_seqlens < 0 ? -num_seqlens : num_seqlens);
-  if (row.nseq_idx() != expected) {
-    AOTRITON_LOG(LOG_ERROR,
-                 "flyc varlen translation mismatch: kernel's nseq_idx would be %d "
-                 "(batch_size=%d, num_seqlens=%d) but AOTriton independently computes "
-                 "%d from Num_seqlens=%d, Q->size(0)=%d -- refusing to launch",
-                 row.nseq_idx(), row.batch_size, row.num_seqlens, expected, num_seqlens, q_batch);
-    throw std::runtime_error("flyc varlen translation mismatch (nseq_idx)");
-  }
-  return row;
+  // FlyDSL's num_seqlens is narrower than N: it means "how many sequences are
+  // packed into a 1THD tensor", so a BHSD side reports 0 however many sequences
+  // it holds, and the count reaches the kernel through Q's batch axis instead.
+  const bool stacked = v.qmode.stacked != VarlenStacked::BHSD;
+  return FlycVarlenRow {
+    varlen_bits,
+    static_cast<int32_t>(q.size(0)),
+    stacked ? nseq : 0,
+  };
 }
 
 // The i32 dropout threshold. FlyDSL's `philox.dropout_threshold` (in
