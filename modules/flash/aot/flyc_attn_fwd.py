@@ -211,12 +211,15 @@ def _flyc_fwd_disabled(f):
 # LSE is always compact: the kernel derives both pitches from LSE_LAYOUT,
 # num_head_q and the token count, so it has no stride arguments by design.
 @ati.tensor('LSE', '*fp32:16', rank=2, wires_to='L')
-# varlen seqinfo: FlyDSL splits each side into a (base, stride) pair rather than
-# AOTriton's cu_seqlens/seq_strides naming; the operands are the same tensors.
-@ati.tensor('seqinfo_q0', '*i32:16', rank=1, wires_to='cu_seqlens_q')
-@ati.tensor('seqinfo_q1', '*i32:16', rank=1, wires_to='seq_strides_q')
-@ati.tensor('seqinfo_k0', '*i32:16', rank=1, wires_to='cu_seqlens_k')
-@ati.tensor('seqinfo_k1', '*i32:16', rank=1, wires_to='seq_strides_k')
+# varlen seqinfo. These were once a rename: FlyDSL splits each side into a
+# (length source, position source) pair, where AOTriton spelled the same two
+# tensors cu_seqlens_?/seq_strides_?. Upstream's varlen_bits port adopted the
+# role-based naming, so the wiring is now identity -- kept explicit to match the
+# operand wires above.
+@ati.tensor('seqinfo_q0', '*i32:16', rank=1, wires_to='seqinfo_q0')
+@ati.tensor('seqinfo_q1', '*i32:16', rank=1, wires_to='seqinfo_q1')
+@ati.tensor('seqinfo_k0', '*i32:16', rank=1, wires_to='seqinfo_k0')
+@ati.tensor('seqinfo_k1', '*i32:16', rank=1, wires_to='seqinfo_k1')
 #
 # --- item C: gfx950-only folded constexpr real arguments ----------------------
 #

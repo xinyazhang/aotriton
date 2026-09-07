@@ -101,12 +101,12 @@ def _flyc_bwd_dkdv_disabled(f):
 # tensor's.
 @ati.tensor('LSE',   '*fp32:16', rank=2, wires_to='L')
 @ati.tensor('Delta', '*fp32:16', rank=2, wires_to='D')
-# varlen seqinfo: FlyDSL splits each side into a (base, stride) pair rather than
-# AOTriton's cu_seqlens/seq_strides naming; the operands are the same tensors.
-@ati.tensor('seqinfo_q0', '*i32:16', rank=1, wires_to='cu_seqlens_q')
-@ati.tensor('seqinfo_q1', '*i32:16', rank=1, wires_to='seq_strides_q')
-@ati.tensor('seqinfo_k0', '*i32:16', rank=1, wires_to='cu_seqlens_k')
-@ati.tensor('seqinfo_k1', '*i32:16', rank=1, wires_to='seq_strides_k')
+# varlen seqinfo. Identity wiring since upstream's varlen_bits port adopted the
+# same role-based names; see flyc_attn_fwd.py for the history.
+@ati.tensor('seqinfo_q0', '*i32:16', rank=1, wires_to='seqinfo_q0')
+@ati.tensor('seqinfo_q1', '*i32:16', rank=1, wires_to='seqinfo_q1')
+@ati.tensor('seqinfo_k0', '*i32:16', rank=1, wires_to='seqinfo_k0')
+@ati.tensor('seqinfo_k1', '*i32:16', rank=1, wires_to='seqinfo_k1')
 #
 # --- the two layout arguments that are not a rename --------------------------
 #
