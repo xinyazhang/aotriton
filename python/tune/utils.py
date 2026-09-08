@@ -40,13 +40,15 @@ def safeload(s):
     return json.loads(s) if s else None
 
 def parse_python(line: str) -> dict:
-    args = line.split(';')
-    d = {}
-    for assignment in args:
-        # print(f'{assignment=}', file=sys.stderr)
-        k, v = assignment.split('=', maxsplit=1)
-        d[k] = eval(v)
-    return d
+    """Deprecated alias for `aotriton.utils.pon.parse_pon`. Use that directly.
+
+    Kept only so an out-of-tree caller does not break on import. This used to
+    `eval()` each value, which executed whatever arrived over the exaid pipe;
+    parse_pon uses ast.literal_eval, which accepts the literals this format is
+    made of and raises on anything else.
+    """
+    from aotriton.utils.pon import parse_pon
+    return parse_pon(line)
 
 def asdict_shallow(obj) -> dict:
     return {field.name: getattr(obj, field.name) for field in fields(obj)}
