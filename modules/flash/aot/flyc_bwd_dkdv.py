@@ -288,9 +288,21 @@ def flyc_bwd_dkdv(arch, choices, hints):
             dropout=bool(choices.ENABLE_DROPOUT),
             # There is no varlen field to set: the kernel decodes the bits
             # flyc_varlen_bits() puts on the wire unconditionally, and a dense
-            # call is bits == 0. lse_layout_th stays at its False default --
-            # that one IS a build axis, and this operator never asks for
-            # anything but (H, T); see BwdDkDvInputMetadata's own docstring.
+            # call is bits == 0.
+            #
+            # lse_layout_th stays at its False default, and that default no
+            # longer decides anything. It used to: the row read was specialised
+            # at build time, so a binary compiled False and handed (T, H) bits
+            # read the wrong elements -- which is what test_varlen.py's
+            # lse_layout=['HT', 'TH'] axis was hitting, 1193 failures of it.
+            # Since the row read branches on the runtime pitch instead, one
+            # build serves both layouts and this field survives only in the
+            # metadata and the cache key, as a record of which layout a build
+            # was tuned against.
+            #
+            # It is deliberately NOT promoted to a functional axis: compiling
+            # both variants would double the dK/dV binary count and buy no
+            # correctness, because the binary already handles both.
         )
         knobs = bwd_dkdv_knobs(
             arch,

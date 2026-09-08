@@ -260,11 +260,12 @@ _TIGHT_REGISTERS = {
 # that becomes unacceptable it is an override to re-measure (the 16-row family
 # is the candidate), not a flag to restore.
 #
-# **Varlen itself is nearly free here, but only after the logsumexp layout
-# became a build axis.** Before that the row-tensor read took the
-# sixteen-scalar path in every varlen build, and 224 went to 232 spills and 257
-# TFLOP/s -- which for a while looked like a second override wanting the 16-row
-# family. The register pressure was the workaround's, not the feature's; see
+# **Varlen itself is nearly free here, and what made it look otherwise was the
+# row-tensor read.** When every varlen build took the sixteen-scalar path, 224
+# went to 232 spills and 257 TFLOP/s -- which for a while looked like a second
+# override wanting the 16-row family. Making the layout a build axis fixed the
+# symptom; selecting the arm once outside the tile loop fixed it properly, and
+# without a build axis that could disagree with the runtime bits. See
 # `BwdDkDvInputMetadata.lse_layout_th`.
 #
 # **B7's bias needed four more, and the reason is not register pressure at
@@ -542,15 +543,26 @@ class BwdDkDvInputMetadata:
     # here.
     #
     # B5. Whether the logsumexp and delta tensors use Transformer Engine's
-    # `(T, H)` layout rather than AOTriton's `(H, T)`. **A build axis rather
-    # than a runtime bit**, unlike everything else in `VarlenBits`, and the
-    # reason is measured: `_HT` makes the row pitch 1, so a lane's four
-    # accumulator rows are adjacent and one `dwordx4` fetches them; `_TH` makes
-    # it `num_heads` and the same four rows need four scalar loads. Deciding it
-    # at runtime would cost every build the scalar path, which measured 0.68x
-    # at head_dim 64 -- the row-tensor reads are per q tile and do not scale
-    # with the head dim, so the narrow rungs pay most. `_args` checks the
-    # descriptor's bits against the build.
+    # `(T, H)` layout rather than AOTriton's `(H, T)`. `_HT` makes the row
+    # pitch 1, so a lane's four accumulator rows are adjacent and one `dwordx4`
+    # fetches them; `_TH` makes it `num_heads` and the same four rows need four
+    # scalar loads.
+    #
+    # **This is a tuning record, not a build axis, and no longer reaches
+    # emitted code.** It was an axis, on the measurement that deciding at
+    # runtime costs every build the scalar path -- 0.68x at head_dim 64. That
+    # measurement was of the wrong runtime branch: put it *inside* the row read
+    # and the `scf.if` is a scheduling barrier the loads cannot be hoisted
+    # across, so the loop performs as if it always took the scalar arm. One
+    # branch outside the tile loop, selecting between two traced bodies, costs
+    # the wide arm nothing.
+    #
+    # Being an axis was also wrong, not merely expensive: `lse_row_addressing`
+    # decodes the layout from `VarlenBits` at runtime, so a build compiled for
+    # one layout and handed the other read the wrong elements, with only
+    # `_args` -- which AOTriton's C++ launcher never calls -- in the way. The
+    # field survives here and in the cache key so a build still records which
+    # layout it was tuned against; nothing reads it at trace time.
     lse_layout_th: bool = False
     # B6. Whether this build regenerates the forward's philox mask. The rate,
     # the seed and the counter are runtime arguments; only the decision to
