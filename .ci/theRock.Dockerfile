@@ -1,7 +1,7 @@
 FROM aotriton:base
 
-ARG THEROCK_VERSION=7.14.0a20260624
-ARG THEROCK_PIP_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+ARG THEROCK_VERSION=7.14.1
+ARG THEROCK_PIP_INDEX_URL=https://repo.amd.com/rocm/whl-multi-arch/
 
 # Create the venv at /opt/therock, install rocm wheels into it, then let
 # rocm-sdk init copy/link the actual ROCm tree into place. ROCM_PATH is

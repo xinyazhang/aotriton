@@ -69,7 +69,7 @@ SUITE_SELECT_RUNTIME=-1
 # TheRock runtimes are pre-release/nightlies and must use the long version
 # string (e.g. 7.15.0a20260707). The last entry is also the default GPU image
 # ROCm (IMAGE_ROCMVER), so keep a gfx1250-capable TheRock build last.
-SUITE_RUNTIME_LIST=(6.4.4 7.0.3 7.1.1 7.2.4 7.14.0a20260624 7.15.0a20260707)
+SUITE_RUNTIME_LIST=(6.4.4 7.0.3 7.1.1 7.2.4 7.14.1 10.1.0a20260822)
 CMDLIST=()
 SUITE_DEFAULT_SELECTION=1
 SUITE_YAML=""
@@ -254,6 +254,12 @@ function build_inside() {
     if printf '%s\n%s\n' "7.10" "${rocmver}" | sort -V -C; then
       DOCKERFILE="theRock.Dockerfile"
       BUILD_ARG=(--build-arg "THEROCK_VERSION=${rocmver}")
+      if [[ "${rocmver}" =~ 0a[0-9]{8} ]]; then
+        THEROCK_PIP_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
+      else
+        THEROCK_PIP_INDEX_URL="https://repo.amd.com/rocm/whl-multi-arch/"
+      fi
+      BUILD_ARG+=(--build-arg "THEROCK_PIP_INDEX_URL=${THEROCK_PIP_INDEX_URL}")
     else
       DOCKERFILE="rocm.Dockerfile"
       BUILD_ARG=(--build-arg "ROCM_VERSION_IN_URL=${rocmver}")
