@@ -481,8 +481,15 @@ def _bias_slab_num_records_bytes(seqlen_q, seqlen_kv, stride_b_seq_q, elem_bytes
     untightened span pins that case back to 0 and is a no-op everywhere else,
     since `seqlen_k <= stride_b_seq_q` always holds.
 
-    **Do not round this up, and do not widen it back to `loose`.** Ending on
-    the last valid element costs the *readers* something: gfx950 range-checks a
+    **Do not round this up, and do not widen it back to `loose`** -- and note
+    that this is where the sibling above and this function part company, on
+    purpose. `_slab_span_elems` *does* round, because the D pitch carries an
+    8-element alignment contract that `_check_8x_d_contract` enforces, so the
+    chunk it rounds into is the caller's by agreement. `seqlen_k` carries no
+    such contract: there is no promise that anything follows the last bias
+    column, so rounding here reads memory nobody gave us.
+
+    Ending on the last valid element costs the *readers* something: gfx950 range-checks a
     multi-dword buffer op per dword and drops any dword not wholly inside
     `num_records`, so for odd `seqlen_k` a wide read of the last row loses
     column `seqlen_k-1` to the out-of-range column `seqlen_k` sharing its
@@ -530,12 +537,35 @@ def _slab_span_elems(rows, stride_seq, hdim):
     Elsewhere the bound only shrinks, so an `oob_off` of `rows * stride_seq`
     stays at or past it and keeps being dropped.
 
-    **Do not round `hdim` up to the load's 8-element chunk.** That would buy
-    back the column a wide read loses to gfx950's per-dword range check at an
-    odd `hdim`, and it would buy it by reading memory the caller never handed
-    us -- the fault above, in miniature. The chunk containing `hdim` is
-    allocation slack for a BSHD interior head and is off the end of the tensor
-    for the last one.
+    **`hdim` is rounded up to the load's 8-element chunk, and this is the only
+    axis where anything is rounded up at all.** This file used to end on the
+    last *real* element and warn against the round-up, on the grounds that the
+    chunk containing `hdim` is off the end of the tensor for a last (batch,
+    head) slab. That is the right instinct and the wrong axis: the D pitch is
+    the one place where an 8-element chunk is inside the caller's allocation
+    *by contract*, not by luck. `flash_attn_func_gfx950`'s module docstring
+    states it -- "the kernel rounds each row up to `ceil8(head_dim)`, so those
+    extra columns must belong to the caller" -- and `_check_8x_d_contract`
+    exists to refuse an input that does not provide them.
+
+    Ending on the last real element instead **clips columns the kernel
+    legitimately reads.** gfx950 range-checks a multi-dword buffer op per dword
+    and drops any dword not wholly inside `num_records`, so at `hdim = 73`
+    (bf16, two elements per dword) the dword holding columns 72 and 73 falls
+    outside a bound ending at 73 and takes the *real* column 72 with it.
+    Upstream imported the unrounded form first and measured exactly that: 36
+    failures in their padded-head test, all at `hdim % 8 == 1`.
+
+    The round-up does not weaken the fix above. On that same `(3, 5, 64, 8)` Q,
+    `ceil8(8)` is 8, so the bound is `63*40 + 8 = 2528` -- exactly the 2528
+    elements the tensor has left after that slab's base, where the loose
+    `64*40 = 2560` overran by 32.
+
+    **No other axis may round.** `_bias_slab_num_records_bytes` bounds the bias
+    slab by `seqlen_k`, which is a *sequence* extent with no alignment contract
+    behind it, and it stays exact -- the last bias column at odd `seqlen_k` is
+    bought back by narrowing the load, not by widening the descriptor. See
+    `narrow_tail`.
 
     The subtraction wraps at `rows == 0` -- a varlen empty sequence -- and an
     index that wraps becomes a `num_records` covering all of memory, which is a
@@ -543,7 +573,14 @@ def _slab_span_elems(rows, stride_seq, hdim):
     pins that case back to the untightened 0.
     """
     rows_v = fx.Index(rows)
-    trim = fx.Index((rows_v > fx.Index(0)).select(fx.Index(stride_seq) - fx.Index(hdim), fx.Index(0)))
+    # `ceil8`, at runtime, because `hdim` is a kernarg.
+    width = ((fx.Index(hdim) + fx.Index(7)) // fx.Index(8)) * fx.Index(8)
+    # A row stride narrower than the chunk would make this negative; clamp, so
+    # the bound can only shrink and never grow past the untightened span.
+    over = fx.Index(stride_seq) - width
+    trim = fx.Index(
+        (rows_v > fx.Index(0)).select((over > fx.Index(0)).select(over, fx.Index(0)), fx.Index(0))
+    )
     return rows_v * fx.Index(stride_seq) - trim
 
 
