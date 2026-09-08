@@ -271,11 +271,20 @@ as in both docstrings.
 Rounding is permitted **on the hdim axis only**, because the D pitch is the one
 place an 8-element chunk is inside the caller's allocation *by contract*:
 `flash_attn_func_gfx950`'s module docstring states it and `_check_8x_d_contract`
-refuses an input that does not provide it. Ending on the last real element
-instead clips a real column — gfx950 range-checks a multi-dword buffer op per
-dword, so at `hdim = 73` the dword holding columns 72 and 73 falls outside a
-bound of 73 and takes column 72 with it (upstream measured 36 such failures, all
-at `hdim % 8 == 1`; our `PRIME_HEADDIMS` reaches 73, 89, 113, 241).
+refuses an input that does not provide it. Upstream's argument for rounding is
+that ending on the last real element clips a real column — gfx950 range-checks a
+multi-dword buffer op per dword, so at `hdim = 73` the dword holding columns 72
+and 73 falls outside a bound of 73 and takes column 72 with it. They measured 36
+such failures, all at `hdim % 8 == 1`.
+
+**That does not reproduce here, in either direction.** `test_prime_hdim` covers
+73/89/113/241 with the contract-satisfying allocation, and it passes on the
+`ceil8` bound *and* on the exact one; a probe of the only place the two can
+differ — the final row of the final `(batch, head)` slab — finds its error
+indistinguishable from the bulk under both. So we hold `ceil8` because it is
+upstream's form and the contract supports it, **not** because we have seen it
+fix anything. If a reason ever appears to go back to the exact bound, no
+evidence here argues against it.
 
 `seqlen_k` carries no such contract — nothing promises anything follows the last
 bias column — so the bias slab stays exact and the last column at odd `seqlen_k`
