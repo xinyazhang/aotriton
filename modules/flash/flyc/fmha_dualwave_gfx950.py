@@ -948,6 +948,12 @@ class ParityKernelContext(_ParityKvStaging, dualwave.DualwaveKernelContext):
         # so a build with matching counts schedules identically.
         num_head_k = fx.Index(self.num_head_k)
         gqa_group = fx.Index(self.num_head_q) // num_head_k
+        # Published, because the dK/dV group loop's trip count is this same
+        # quantity and `q_head_idx` -- the head that loop walks from -- is
+        # derived from it two lines down. Recomputing it at the loop is how a
+        # trait and a kernarg drifted apart in the first place (issue 9); one
+        # source is what stops them disagreeing again.
+        self.gqa_group = gqa_group
         self.h_kv_idx = self.h_idx % num_head_k
         self.group_id = self.h_idx // num_head_k
         self.q_head_idx = self.h_kv_idx * gqa_group + self.group_id

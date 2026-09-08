@@ -1876,18 +1876,19 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
             # (it is one program per query head and never folds).
             #
             # Runtime is what the rest of the parity path already assumes:
-            # `ParityKernelContext.init_thread_mapping` re-derives `gqa_group`
-            # as `num_head_q // num_head_k` for exactly this reason, and
-            # `gqa_q_head_base` -- the head this loop walks from -- is its
-            # answer. Taking the bound from anywhere else is what let the two
-            # drift.
+            # `ParityKernelContext.init_thread_mapping` derives `gqa_group` as
+            # `num_head_q // num_head_k` for exactly this reason, and
+            # `q_head_idx` -- the head this loop walks from -- is built from it
+            # there. So the bound is *read* from `ctx.gqa_group` rather than
+            # recomputed here: recomputing is what let a trait and a kernarg
+            # drift apart, and a second spelling of the same quantity is the
+            # same mistake one level down.
             #
             # Not `range_constexpr`: that would unroll the whole tile loop
             # `group` times, which is 8 copies of the largest region in the
             # kernel at MQA and would put the wide rungs through the build cap.
             # It is also no longer available -- the bound is not a constant.
-            gqa_group = fx.Index(ctx.num_head_q) // fx.Index(ctx.num_head_k)
-            for g, group_args in range(fx.Index(0), gqa_group, fx.Index(1), init=init_args):
+            for g, group_args in range(fx.Index(0), ctx.gqa_group, fx.Index(1), init=init_args):
                 # Point the query side at this head. K, V, dK and dV do not
                 # move, and neither do the accumulators.
                 ctx.retarget_q_head(g)
@@ -1935,10 +1936,20 @@ def build_fmha_bwd_dkdv_gfx950_module_primary(meta, knobs):
                 # workgroup-uniform and every wave reaches the same
                 # `s_barrier` -- which is the property a barrier under a branch
                 # needs and the reason this one is safe.
-                if fx.Int32(g) != fx.Int32(0):
-                    dualwave._waitcnt_vm_n(0)
-                    dualwave._sched_barrier(0)
-                    dualwave._s_barrier()
+                #
+                # **Inside a `@flyc.jit`, so the `if` is traced.** A bare
+                # Python `if` on an `fx` comparison out here is decided while
+                # tracing, not on the device, and what it decides is not the
+                # question being asked. The jit boundary is what turns it into
+                # the `scf.if` this comment describes.
+                @flyc.jit
+                def _drain_between_heads(g):
+                    if g != fx.Index(0):
+                        dualwave._waitcnt_vm_n(0)
+                        dualwave._sched_barrier(0)
+                        dualwave._s_barrier()
+
+                _drain_between_heads(g)
 
                 # Prime every buffer. From here each tile's DMA is issued by
                 # the body `NUM_STREAM_BUFFERS` tiles earlier, so this is the
