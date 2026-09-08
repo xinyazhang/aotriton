@@ -145,7 +145,7 @@ LDS_CAP_BYTES = 163840
 #
 #   head_dim  rows  waves  wpe  block_q  BLOCK_KV  AGPR  spills   TFLOP/s
 #      32      32     4     2      64      128        0      0       504
-#      64      32     4     1      64      128        0      0       735
+#      64      32     4     1      64      128        0      0       735  (**)
 #      96      16     4     1      64       64        0      0       733
 #     128      16     4     1      64       64        0      0       775
 #     160      32     4     1      64      128      100      0       735  (*)
@@ -158,6 +158,14 @@ LDS_CAP_BYTES = 163840
 # **No rung shards and none is single-buffered any more**, and every one
 # compiles with zero scratch. Builds peak at under three seconds, far inside
 # plan B3's eight-minute cap.
+#
+# **(**) head_dim 64's non-causal, bias-free build no longer uses this row's
+# `wpe`.** It takes `waves_per_eu=2` from `_FEATURE_OVERRIDES` instead, on this
+# geometry and no other change; the 735 above was measured before the logsumexp
+# layout became a runtime branch, and afterwards the rung wants 276 registers
+# rather than 234 and stops reaching two waves per SIMD on its own. Causal,
+# bias and every other head dim still read `wpe` from here. See that entry for
+# the numbers and for why this 2 is grantable where 160's is not.
 #
 # **(*) head_dim 160 was 2 and is now 1, because 2 was never granted.** The
 # backend said so on every build of this rung -- "failed to meet occupancy
@@ -237,13 +245,20 @@ _TIGHT_REGISTERS = {
 #     causal,        32 tight     512     0      1199    <- override
 #     causal+varlen, 32 tight     512    20       858    <- override
 #     dense+varlen,  32 loose     486     0       720
+#     dense+varlen,  32 tight       -     -       723    <- override, added on
+#                                                           upstream's measurement
 #
-# **The last two rows are what ships now**, since the varlen decode stopped
-# being a build axis and there is no dense binary to fall back to. This rung is
-# the only one that pays: 20 spills and 858 against the 1199 a causal-only
-# build reached, and 720 against 798 non-causal. Every other head dim spills
-# zero either way. If that becomes unacceptable it is an override to re-measure
-# (the 16-row family is the candidate), not a flag to restore.
+# **The last two rows are the ones that can ship**, since the varlen decode
+# stopped being a build axis and there is no dense binary to fall back to; the
+# tight one is what does, under `(224, False, False)` below. Non-causal at this
+# rung had drifted to 473 by the time upstream re-measured it after the row
+# address rewrite, which is what earns the override -- 1.5x rather than the
+# 720-vs-798 the loose row shows here.
+#
+# Causal+varlen is still the rung that pays: 20 spills and 858 against the 1199
+# a causal-only build reached. Every other head dim spills zero either way. If
+# that becomes unacceptable it is an override to re-measure (the 16-row family
+# is the candidate), not a flag to restore.
 #
 # **Varlen itself is nearly free here, but only after the logsumexp layout
 # became a build axis.** Before that the row-tensor read took the
@@ -313,6 +328,34 @@ _FEATURE_OVERRIDES = {
     (64, False, True): (4, 1, 1, 32, 64, True),
     (160, False, True): (4, 1, 1, 16, 64, False),
     (224, False, True): (4, 1, 1, 32, 64, True),
+    # **Three rungs the runtime logsumexp layout moved**, measured upstream at
+    # `B=2 H=8 S=4096` packed varlen. `BwdDkDvSoftmaxHelper.load_row_values` now
+    # emits both row-read arms and picks between them once outside the tile
+    # loop, and the 32-row family -- thirty-two accumulator elements per lane to
+    # the 16-row family's four -- is the one that gives way.
+    #
+    # Upstream keys these on `varlen`; we have no such axis, so their varlen
+    # halves are simply our rows. Their dense halves are unreachable here and
+    # are not copied.
+    #
+    #   head_dim  64 causal        policy  917   16-row      1017
+    #   head_dim  64 non-causal    wpe 1   635   wpe 2        734
+    #   head_dim 224 non-causal    policy  473   32 tight     723
+    (64, True, False): (4, 1, 1, 16, 64, False),
+    (224, False, False): (4, 1, 1, 32, 64, True),
+    # **This one asks for the occupancy, not a geometry** -- the five other
+    # fields are `_GEOMETRY[64]`'s. A dense build reaches two waves per SIMD on
+    # its own at 234 VGPRs; ours wants 276 and, told `waves_per_eu=1`, LLVM has
+    # a 512-register budget and no reason to stop. It buys the second wave for
+    # 24 scratch slots: the spills cost 2%, the wave is worth 15%. This is the
+    # only rung where that trade has to be made rather than won outright.
+    #
+    # Unlike `(160, ...)` and `_GEOMETRY[160]` this 2 *is* grantable -- the rung
+    # is nowhere near the LDS cliff that makes a second workgroup impossible at
+    # 160 -- and the build log is the check: an `amdgpu-waves-per-eu` warning on
+    # a head_dim 64 dK/dV build means this entry asked for something the backend
+    # refused, and it should go rather than sit there unmet.
+    (64, False, False): (4, 2, 1, 32, 64, False),
 }
 
 
