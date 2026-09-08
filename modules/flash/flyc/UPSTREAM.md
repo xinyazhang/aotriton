@@ -26,7 +26,7 @@ path:   kernels/attention/parity/
 ```
 repo:   git@github.com:xinyazhang/FlyDSL.git
 branch: xinyazhang/sdpa-gfx950-feature-bwd
-commit: 7cd69444  (was 70b2dbc5)
+commit: 74ec63e6  (was 7cd69444, was 70b2dbc5)
 path:   kernels/attention/parity/
 ```
 
@@ -46,7 +46,7 @@ since been pulled forward, so the per-file truth is:
 |---|---|---|
 | `fmha_abi_gfx1201.py` | `caee9257` | gfx1201 |
 | `philox.py` | `caee9257` | gfx1201 |
-| `fmha_common_gfx1201.py` | **`7cd69444`** | **gfx950** |
+| `fmha_common_gfx1201.py` | **`74ec63e6`** | **gfx950** |
 
 `fmha_common_gfx1201.py` moved because `fmha_dualwave_gfx950.py` at `7cd69444`
 constructs `MaskedAxis(..., bitmask=True)`, and the `caee9257` copy has no such
@@ -115,12 +115,20 @@ fmha_wide_gfx950.py                 wide-tile device helpers
 fmha_mfma16_gfx950.py               MFMA16 addressing constants
 ```
 
-**Ten of the twelve are byte-identical to upstream and must stay that way**
+**Two of the twelve are byte-identical to upstream and must stay that way**
 (`diff` each against `git show <commit>:kernels/attention/parity/<basename>` and
-expect empty). The other two, `flash_attn_func_gfx950.py` and
-`fmha_dualwave_gfx950.py`, carry the three edits recorded in "Vendored edits
-(1c)" below. There are **zero** import rewrites for gfx950 — see "Import rewrites
-(1a)" for why, and what it cost.
+expect empty): `fmha_wide_gfx950.py` and `fmha_mfma16_gfx950.py`. The other ten
+carry the edits recorded in "Vendored edits (1c)" below, and the diff against
+upstream is expected to show exactly those and nothing else.
+
+**This used to say ten of twelve, which stopped being true long before the
+`74ec63e6` re-sync.** Every gfx950 defect fixed here since `a5b8f247` landed in
+a vendored file, and upstream has since imported most of them — so the count
+moved twice, once as we diverged and once as upstream converged. Re-derive it
+on every re-sync rather than trusting the sentence.
+
+There are **zero** import rewrites for gfx950 — see "Import rewrites (1a)" for
+why, and what it cost.
 
 **Not vendored for gfx950:** `gfx950_standalone.py` (we author our own — see
 below), `kernels/attention/flash_attn_utils.py` (polyfilled — see below), every
@@ -218,134 +226,63 @@ one.
 `third_party/flydsl-kernel.txt` is bumped to a tag containing it. Then the
 vendored emitters go and the `dualwave.` call sites come back.
 
-## Vendored edits (1c) — gfx950 only, exactly eight
+## Vendored edits (1c) — gfx950 only
 
-gfx1201 has none of these; its coupling is all in table 1a. gfx950 inverts that:
-zero import rewrites and eight edits across five files. They fall into two
-groups, and it is worth reading them that way rather than file by file.
+**Most of what this table used to hold is upstream now.** The `74ec63e6`
+re-sync imported eight of our fixes back into FlyDSL — the `~{scc}` clobber
+(issue 7), the KV tail mask (issue 8), the GQA trip count (issue 9), the two
+wait states (issues 10 and 11), the null-`LSE` guard, the LSE head count, the
+slab bounds, the dO/dK/dV stride names, the O-slot aliasing, the odd-`seqlen_k`
+bias column and the dQ 256→16-row move. Those regions are no longer *edits*: we
+and upstream now hold equivalent code, and the diff there is prose. Reading
+this table as "what we changed" would therefore overstate it; read it as **what
+still differs, and why**.
 
-**One binary per functional, not one kernel per shape.** The two edits in
-`fmha_dualwave_gfx950.py` and the trip count in `fmha_bwd_dkdv_gfx950.py` are
-all the same mistake in three places: a shape upstream knows at compile time is
-a kernarg here, and the vendored code reads the trait. Read them together.
+The `74ec63e6` merge was done incrementally against the files as they stood,
+not by re-copying them, precisely so that these did not have to be removed and
+re-applied. Keep that shape on the next re-sync: `git merge-file --diff3` with
+base = the previously vendored commit. Use real temp files — process
+substitution makes `diff3` fail with `input file shrank` and hand back ours
+unchanged, which reads as a clean merge and is not one.
 
-**Straight upstream bugs**, unrelated to AOT: the `~{scc}` clobber (issue 7),
-the KV tail mask (issue 8) and the `s_nop` after `exp2` (issue 10). Each has a
-"retire when" that is upstream's fix landing, not an AOTriton change.
+### Divergences that are ours to keep
 
-The split-K deletion belongs to neither group; it exists so the file holds one
-`@flyc.kernel`. Nor does the DS-transpose vendoring: that one is not a bug at
-all but a *reachability* edit, upstream's own code copied verbatim because no
-pin can reach the commit it lives on.
-
-| file | what changes | why | retire when |
+| file(s) | what differs | why | retire when |
 |---|---|---|---|
-| `flash_attn_func_gfx950.py` | **deleted:** the `# Split-K combine.` comment, `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, and the whole `@flyc.kernel def flash_attn_splitk_combine_kernel` (block 1, 45 lines at `7cd69444`: 917–961; was 38 lines at 888–925 at `70b2dbc5`) **and** the `if const_expr(traits.SPLITK):` block in the launcher that computes `combine_rows` and launches it (block 2, 7 lines: 1137–1143; was 1101–1107) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1`, so `traits.SPLITK` is always false and it is never traced | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
-| `flash_attn_func_gfx950.py` | **added:** a local `def _stagger_extra_barrier_if_zero`, replacing the `= dualwave._stagger_extra_barrier_if_zero` alias in the primitive block (the alias line is deleted; `_stagger_extra_barrier_if_one`'s stays). The body is upstream's verbatim except the constraint string, `"s,~{scc}"` for `"s"`. Needs two imports the vendored file did not have: `from flydsl._mlir import ir` and `from flydsl._mlir.dialects import llvm` | the asm runs `s_cmp_eq_u32`/`s_cbranch_scc0` and so destroys SCC, but does not say so, and LLVM schedules a compare across it. The victim is the null-`LSE` guard two rows down. See below | upstream adds the clobber (issue 7) |
-| `fmha_dualwave_gfx950.py` | **added:** `ParityStoreHelper._store_lse_row` is split in two — the vendored body is renamed `_store_lse_row_unguarded` verbatim, and a new `_store_lse_row` wraps it in a `@flyc.jit` `if fx.ptrtoint(LSE) != 0` | AOTriton's LSE output is **optional at runtime** (`attn_fwd_params::L`: *"Can be `T2::get_null_tensor()`"*), and the gfx950 kernel had no null test, so an inference caller's null `L` became a buffer descriptor based at address 0 and the store faulted. See below | upstream adds the guard itself |
-| `flash_attn_func_gfx950.py` | **added:** `_KvTailCausalMaskMixin`, and `softmax_helper` is built from `_ParitySoftmaxHelper` / `_WideSoftmaxHelper` (the mixin over the two upstream helpers) instead of `ParitySoftmaxHelper` / `WideSoftmaxHelper`. The mixin overrides `causal_mask_prologue_if_needed` to run `seq_pad_mask_if_needed` *before* delegating | upstream drops the KV tail mask from every causal build, on an argument that holds for `delta = seqlen_kv - seqlen_q` and not for the `delta_i32` a window build re-points at `window_right`. Top-left causal is `window_right == 0`, so rows past `seqlen_kv` attend to columns the K buffer does not have; those read back as 0, which is a logit and not `-inf`. Every `seqlen_q > seqlen_k` case came out too small. See below | upstream masks the tail in window builds (issue 8) |
-| `fmha_bwd_dkdv_gfx950.py` | **changed:** the GQA group loop's trip count is `ctx.num_head_q // ctx.num_head_k`, not `traits.GQA_GROUP_SIZE`; the drain before the loop's staging prologue is guarded on the runtime `g != 0` instead of `const_expr(traits.GQA_GROUP_SIZE > 1)` | the grid is one workgroup per **KV** head with the group's query heads summed inside (`flyc_bwd_dkdv.py`, `FlycBwdDkdvContext::grid_calculator()`), so the loop is what performs the reduction. `num_heads` is not a functional axis and the description pins it to 1, so every build carried `GQA_GROUP_SIZE == 1` and the loop folded away: dK and dV were short by every query head but the first. `_args`, which upstream relies on to reject that mismatch, is a host-side wrapper the C++ launcher never calls | AOT grows a head-count axis, which it will not — the test suite alone uses group 5 (issue 9) |
-| `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dkdv_gfx950.py` | **added:** `exp2_wait_state(...)` around the `exp2` batch in both families' `probabilities` | `v_exp_f32` is a quarter-rate transcendental and needs a wait state before a VALU consumer; `GCNHazardRecognizer` does not insert one for gfx950. With the trip count above making the loop runtime, the scheduler put `v_exp_f32` immediately before the `v_cvt_pk_bf16_f32` that reads it, and that element of the dV B operand carried the pre-`exp2` score. A bare `_s_nop` does not hold the gap — see below | upstream supplies the wait state, or LLVM models the hazard (issue 10) |
-| `fmha_dualwave_gfx950.py` | **added:** `exp2_wait_state` | the tied-operand inline-asm barrier the two rows above call. Not upstream's to keep either way; it exists only because of issue 10 | same as above |
-| `fmha_dualwave_gfx950.py`, and the call sites in `fmha_bwd_dkdv_gfx950.py`, `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dq_m16_gfx950.py` | **added:** `_lds_ptr_ty`, `_lds_ptr_with_imm`, `_tag_lds_alias`, `_ds_read_tr16_b64_imm` and `_ds_read_tr_v4f16_imm`, copied verbatim from `flash_attn_utils.py` at `0a9c5906` with `ir`/`llvm`/`vector` reached through `dualwave.`. The six `dualwave._ds_read_tr*_imm(...)` call sites drop the `dualwave.` prefix and import the local names instead | the pin emits these reads as **inline asm**, which `SIInsertWaitcnts` cannot see through, so no `s_waitcnt lgkmcnt` is placed before uses; above head_dim 128 the allocator spills to AGPRs and puts `v_accvgpr_write` copies of the destination ahead of the kernel's own wait — 22 unwaited uses at 192, 160 at 256, 0 at 64 and 128 — giving non-deterministic NaN. The op form also takes the alias scopes that keep `buffer_load ... lds` from forcing a `vmcnt(0)` drain, worth ~10% at head_dim 64. Every primitive the op form needs (`rocdl.ds_read_tr16_b64`, `llvm.GEPNoWrapFlags.inbounds`, both `_dualwave_lds_*_scopes`) is already present at the pin; only these five functions are not | `0a9c5906` merges upstream and the pin is bumped to a tag containing it |
-| `fmha_dualwave_gfx950.py` | **changed:** in `_store_lse_row_unguarded`, the head count in LSE's descriptor and row formula is `fx.Index(self.num_head_q)` instead of `traits.NUM_HEADS_Q`; the non-varlen branch spells the production row expression inline rather than delegating to `super()`, since upstream's copy bakes the trait | `NUM_HEADS_Q` is compile-time because upstream compiles per shape. AOT compiles one binary for every head count and pins `num_heads=1`, so the trait made the per-batch slice `1 * tokens`: the batch stride advanced by one head and the buffer bound dropped every head but `h == 0`. `L` came back written for head 0 and NaN elsewhere. The runtime count is already a kernarg, and is what gfx1201 feeds `lse_row_addressing`. See below | upstream takes the head count from the kernarg, **or** AOT stops pinning `num_heads=1` |
+| `flash_attn_func_gfx950.py` | **deleted:** `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, the whole `@flyc.kernel def flash_attn_splitk_combine_kernel`, and the `if const_expr(traits.SPLITK):` block in the launcher that launches it (at `74ec63e6`: `1031-1033`, `1035-…`, `1251-1253`) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1` | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
+| `fmha_dualwave_gfx950.py`, and call sites in `fmha_bwd_dkdv_gfx950.py`, `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dq_m16_gfx950.py` | **added:** `_lds_ptr_ty`, `_lds_ptr_with_imm`, `_tag_lds_alias`, `_ds_read_tr16_b64_imm`, `_ds_read_tr_v4f16_imm`, copied verbatim from `flash_attn_utils.py` at `0a9c5906`; the six `dualwave._ds_read_tr*_imm` call sites drop the prefix | the pin emits these reads as **inline asm**, which `SIInsertWaitcnts` cannot see through, so no `s_waitcnt lgkmcnt` is placed before uses — non-deterministic NaN above head_dim 128. `flash_attn_utils.py` did **not** change between `7cd69444` and `74ec63e6`, so no value of `third_party/flydsl-kernel.txt` reaches `0a9c5906` and this is still unreachable | `0a9c5906` merges upstream and the pin is bumped to a tag containing it |
+| `fmha_dualwave_gfx950.py` | **changed:** `_slab_span_elems` rounds `hdim` up to `ceil8`, as upstream's does — but `hdim` is **required**, with no `hdim=None` untightened fallback | every caller here passes it. An optional bound is one a future caller can forget, and forgetting it restores the overrun the function exists to stop | never; this one is a deliberate tightening of upstream's signature |
+| `fmha_dualwave_gfx950.py` | **added:** `mfma_operand_wait_state` at the `q_pack` site | upstream barriered the P packs and the forward's `cast_p`, not this one. Same instruction pair, same MFMA shape | upstream barriers it, or LLVM models the hazard (issue 11) |
+| `fmha_dualwave_gfx950.py`, `fmha_common_gfx1201.py`, `fmha_bwd_dkdv_gfx950.py` | **added:** `_slab_view_at`, `_init_q_head_invariants`, `lse_row_step_per_head` — the GQA head-invariant hoist | keeping the strides live across the GQA walk drove the backward kernel's scalar spilling, and the walk is the largest region in that kernel. Upstream did not import it; `bf2faf86` attacks the same liveness from the addressing side, so **whether this still pays is unmeasured** | an A/B on an idle GPU shows it inert on top of `bf2faf86` |
+| `fmha_bwd_dq_gfx950.py` | **not taken:** upstream's `O=DQ` and `o_strides=_dq_strides` in the launcher | upstream's shared `init_descriptors` builds the O view unconditionally and so still needs the slot; ours has `if self.O is not None` (fed5dcdc), and dQ is passed by its own name. Aliasing a tensor into a slot named for another is the defect both trees spent a commit removing | upstream adds the guard |
+| `fmha_bwd_dkdv_gfx950.py`, `fmha_bwd_dq_gfx950.py` | **not taken:** upstream's "this build was not compiled for varlen" check in `_args` | there is no such build here — `make_traits` pins `VARLEN=True` — so it could never fire | upstream drops `varlen` as an axis (issue 12) |
+| `fmha_traits_gfx950.py` | **changed:** `make_traits` takes no `varlen=`/`cross_seqlen=`; it pins `VARLEN=True` and `CROSS_SEQLEN=bool(causal)` | the kernel decodes `VarlenBits` unconditionally, so a ragged batch is a property of the *call*. Upstream reached the same behaviour by defaulting the knob to `True` (`54c16ec4`) while keeping the axis; we removed the axis, so there is no `knobs.varlen` to pass through and the pin has to stay | upstream removes the axis (issue 12) |
+| `fmha_tuning_gfx950.py`, `fmha_tuning_bwd_dkdv_gfx950.py`, `fmha_tuning_bwd_dq_gfx950.py` | **changed:** no `varlen` / `cross_seqlen` fields; `_FEATURE_OVERRIDES` is keyed `(head_dim, causal, bias)` rather than upstream's 4-tuple with a varlen axis | same reason. Upstream's varlen-half entries are simply our rows; their dense halves are unreachable and not copied | same |
+| `fmha_tuning_gfx950.py` | **added:** `_with_occupancy_target`, deriving `waves_per_eu` from the build's own LDS | upstream's `_GFX950_FALLBACK` asks for 2 unconditionally, and LDS refuses a second workgroup at head_dim ≥ 160 — a warning on every such build. A blanket 1 is also wrong: at head_dim 96 the hint genuinely binds as a register budget | upstream derives it |
+| `fmha_tuning_bwd_dkdv_gfx950.py` | **changed:** head_dim 160 asks `waves_per_eu=1`, in `_GEOMETRY` and in the override | 87040 B of LDS, so two workgroups want 174080 B against a 163840 B cap; the request was refused on every build and the hsacos are byte-identical either way | same |
 
-Both split-K blocks go, not just the first: leaving the call site would be a
-`NameError` at trace time if SPLITK were ever enabled, which is a worse failure
-than the honest one.
+### The `ceil8` ruling, and the axis it applies to
 
-**Re-derive the line numbers from the AST on every re-sync; do not trust the
-ones above.** The deletion is verified by:
+`_slab_span_elems` rounds a row up to `ceil8(hdim)`; `_bias_slab_num_records_bytes`
+does **not** round `seqlen_k`. That asymmetry is deliberate and is the one place
+we differ from upstream by policy rather than by pin, so it is recorded here as well
+as in both docstrings.
 
-```bash
-python3 -c "
-import ast; t=ast.parse(open('modules/flash/flyc/flash_attn_func_gfx950.py').read())
-ks=[n.name for n in ast.walk(t) if isinstance(n,ast.FunctionDef)
-    and any(getattr(d.func if isinstance(d,ast.Call) else d,'attr',None)=='kernel'
-            for d in n.decorator_list)]
-assert ks==['flash_attn_func_gfx950_kernel'], ks"
-grep -n 'COMBINE_\|splitk_combine' modules/flash/flyc/flash_attn_func_gfx950.py   # expect nothing
-diff <(git -C <flydsl checkout> show <commit>:kernels/attention/parity/flash_attn_func_gfx950.py) \
-     modules/flash/flyc/flash_attn_func_gfx950.py
-# expect ONLY: the two deleted split-K blocks; the two added `flydsl._mlir`
-# imports; the `_stagger_extra_barrier_if_zero` alias replaced by a local def;
-# `_KvTailCausalMaskMixin` and the two helper subclasses; and the one line in
-# the builder that names them.
-```
+Rounding is permitted **on the hdim axis only**, because the D pitch is the one
+place an 8-element chunk is inside the caller's allocation *by contract*:
+`flash_attn_func_gfx950`'s module docstring states it and `_check_8x_d_contract`
+refuses an input that does not provide it. Ending on the last real element
+instead clips a real column — gfx950 range-checks a multi-dword buffer op per
+dword, so at `hdim = 73` the dword holding columns 72 and 73 falls outside a
+bound of 73 and takes column 72 with it (upstream measured 36 such failures, all
+at `hdim % 8 == 1`; our `PRIME_HEADDIMS` reaches 73, 89, 113, 241).
 
-This costs the zero-vendored-edit property the `gfx950_standalone.py` design
-otherwise achieves, and that is a deliberate trade: in exchange the file has one
-`@flyc.kernel` and neither uniqueness assertion can fire at all.
+`seqlen_k` carries no such contract — nothing promises anything follows the last
+bias column — so the bias slab stays exact and the last column at odd `seqlen_k`
+is bought back by narrowing the *load*. Upstream agrees on this half.
 
-### The null-`LSE` guard, and why it is not `return_lse`
-
-Upstream already accepts this contract on the *other* arch: gfx1201's
-`flash_attn_func_gfx1201_aiw.py` computes
-`_l_valid = fx.Int64(fx.ptrtoint(L)) != fx.Int64(0)` and folds it into the store
-predicate, with a comment on why the log/scale/addressing all stay inside the
-guard (hoisting them cost 8% at head_dim 256, because the values then stay live
-across the epilogue for every wave — including the ones that never store). The
-gfx950 files simply never grew the equivalent; nothing about the algorithm
-resists it. AOTriton's Triton kernel spells the same contract as `L_not_null`
-(`modules/flash/kernel/fwd_kernel.py`: *"Allows null L for training=False"*).
-
-The knob that looks like it covers this, `return_lse`, does not. It is
-compile-time: `if const_expr(traits.RETURN_LSE)` deletes the store from the
-binary, so `return_lse=False` is not "LSE optional", it is "LSE never written" —
-and one AOT binary has to serve both the caller that wants the LSE and the one
-that passes null. So `modules/flash/aot/flyc_attn_fwd.py` pins `return_lse=True`
-(upstream's `_GFX950_FALLBACK` defaults it to `False`, an inference-production
-default) and the per-launch decision lives here.
-
-One choke point covers both forward bodies and both layouts: `WideStoreHelper`
-subclasses `ParityStoreHelper`, and both of that class's LSE paths funnel
-through `_store_lse_row`, which the wrapper encloses. The condition is
-wave-uniform, so it lowers to a scalar branch.
-
-### The head count in the LSE descriptor
-
-Turning the store on exposed a second, independent defect in the same method,
-and it is worth stating separately because it is the more general one: the
-guard is about a pointer AOTriton may pass as null, this is about a *shape*
-AOTriton cannot know at compile time.
-
-Upstream's `_store_lse_row` sizes LSE's per-batch slice as
-`traits.NUM_HEADS_Q * seq_len_v` and bases the buffer descriptor at
-`LSE + batch_idx * that`. `NUM_HEADS_Q` is a compile-time trait, which is
-correct upstream — a kernel is compiled per shape there. AOT compiles one binary
-for every head count, so `modules/flash/aot/flyc_attn_fwd.py` pins
-`num_heads=1`, on the documented assumption that the trait reaches the emitted
-code only through `STRIDE_TOKEN` (which sits behind `strides_constexpr`, pinned
-`False`). LSE's descriptor was the assumption's counterexample. With
-`NUM_HEADS_Q == 1` the slice covers one head's rows, `batch_idx` advances by one
-head instead of `H`, and the hardware bound silently drops the row for every
-head but the first: `L` comes back written for `h == 0` and untouched — NaN,
-under the test harness's fill — for the rest. Nothing reports an error; the
-launch succeeds.
-
-The real count is already in the kernarg vector as `num_head_q` (the generated
-`flyc_attn_fwd_pp_args_0` passes it, and `ParityKernelContext` stores it as
-`self.num_head_q`, which the store helper inherits via
-`DualwaveKernelContext.__dict__` copy-construction). Using it costs two scalar
-ops and leaves the stores themselves untouched. It is also what gfx1201 does:
-its `fmha.lse_row_addressing` call sites pass the runtime `num_head_q`, which is
-why gfx1201's identical `num_heads=1` pin is sound.
-
-The non-varlen branch stops delegating to `super()` as part of this: upstream's
-copy in `flash_attn_utils.py` is where the trait is baked, so there is nothing
-left to inherit. It now spells the production row expression
-(`q_head_idx * seq_len_v + q_row`) inline — three lines, unchanged in meaning —
-while sharing the corrected descriptor with the varlen branch.
-
-Re-sync check — the vendored body must still be byte-identical apart from these:
-
-```bash
-diff <(git -C <flydsl checkout> show <commit>:kernels/attention/parity/fmha_dualwave_gfx950.py) \
-     modules/flash/flyc/fmha_dualwave_gfx950.py
-# expect ONLY: the added `_store_lse_row` wrapper; the `def` line of the
-# original renamed to `_store_lse_row_unguarded`; and inside it, the head-count
-# and non-varlen-branch changes described above.
-```
+**No third axis may round.** A future tightening that wants to should have to
+name the contract that makes the extra bytes the caller's.
 
 ## Import rewrites (1a) — gfx1201 only; gfx950 has **none**
 
@@ -789,8 +726,31 @@ to notice.
 
 ## Open FlyDSL issues, verified against upstream
 
-Checked against `upstream/main` at `11c4174d`, **41 commits ahead of the vendored
-`9de9628a`**. All of them are still present there; none is fixed by re-syncing.
+**Status as of the `74ec63e6` re-sync.** Most of this list is closed. Do not
+re-report a closed one: a handover that repeats a fixed bug spends the reader's
+trust, and the whole point of the list is that each entry has been checked.
+
+| # | status | where |
+|---|---|---|
+| 1 | **open** | `jit_function.py:1494` still passes `targets=backend.gpu_module_targets()` alongside the `rocdl-attach-target` pass, in flydsl `0.3.1.dev1129` |
+| 2 | **fixed** in `0.3.1.dev1129` | `compile()` now early-returns `None` under `COMPILE_ONLY` instead of building an ExecutionEngine |
+| 3 | probably improved, **not verified** | `72e8e75b` finds ROCm through `rocm-sdk` before falling back to `/opt/rocm*`. That is the *finder*; whether a wrong `ROCM_PATH` still surfaces only as `lld invocation failed` was not re-tested |
+| 4 | **open** | the "96 is deliberately absent" prose is still above `LADDER` in upstream's `fmha_tuning_gfx950.py` at `74ec63e6` |
+| 5, 6 | **fixed** | `f14b9aba` took the null-`LSE` guard and the runtime LSE head count |
+| 7 | **fixed** | `e87210fe` declared the SCC clobber |
+| 8 | **fixed** | `1c62d7fd` masks the KV tail in window builds |
+| 9 | **fixed** | `24405a45` takes the GQA group count from the kernarg |
+| 10, 11 | **worked around upstream, root cause open** | `f14b9aba` carries both wait states, and says the scope of the `cvt_pk`→MFMA hazard is not established. LLVM still does not model either |
+| 12 | **partly** | `54c16ec4` defaults `varlen` on rather than removing the axis, so a build trait that need not exist still exists. We removed both fields; see "Vendored edits (1c)" |
+
+The prose under each entry below is the original report and is left as written —
+it is the evidence, and it is what an upstream reader needs even for a fixed
+one. The table above is the only place status lives.
+
+The earlier note on this section read: checked against `upstream/main` at
+`11c4174d`, **41 commits ahead of the vendored `9de9628a`**; all still present,
+none fixed by re-syncing. That was true when written and is the thing this
+re-sync changed.
 
 ### 1. Every kernel is compiled twice, and the wrong copy is the one that runs
 
