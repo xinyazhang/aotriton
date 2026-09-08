@@ -481,13 +481,10 @@ def _bias_slab_num_records_bytes(seqlen_q, seqlen_kv, stride_b_seq_q, elem_bytes
     untightened span pins that case back to 0 and is a no-op everywhere else,
     since `seqlen_k <= stride_b_seq_q` always holds.
 
-    **Do not round this up, and do not widen it back to `loose`** -- and note
-    that this is where the sibling above and this function part company, on
-    purpose. `_slab_span_elems` *does* round, because the D pitch carries an
-    8-element alignment contract that `_check_8x_d_contract` enforces, so the
-    chunk it rounds into is the caller's by agreement. `seqlen_k` carries no
-    such contract: there is no promise that anything follows the last bias
-    column, so rounding here reads memory nobody gave us.
+    **Do not round this up, and do not widen it back to `loose`.**
+    `_slab_span_elems` holds the same line on the D axis, for the same reason
+    and against upstream, which rounds there; that docstring carries the
+    evidence. Neither descriptor covers a byte the caller did not hand us.
 
     Ending on the last valid element costs the *readers* something: gfx950 range-checks a
     multi-dword buffer op per dword and drops any dword not wholly inside
@@ -537,35 +534,39 @@ def _slab_span_elems(rows, stride_seq, hdim):
     Elsewhere the bound only shrinks, so an `oob_off` of `rows * stride_seq`
     stays at or past it and keeps being dropped.
 
-    **`hdim` is rounded up to the load's 8-element chunk, and this is the only
-    axis where anything is rounded up at all.** This file used to end on the
-    last *real* element and warn against the round-up, on the grounds that the
-    chunk containing `hdim` is off the end of the tensor for a last (batch,
-    head) slab. That is the right instinct and the wrong axis: the D pitch is
-    the one place where an 8-element chunk is inside the caller's allocation
-    *by contract*, not by luck. `flash_attn_func_gfx950`'s module docstring
-    states it -- "the kernel rounds each row up to `ceil8(head_dim)`, so those
-    extra columns must belong to the caller" -- and `_check_8x_d_contract`
-    exists to refuse an input that does not provide them.
+    **Do not round `hdim` up to the load's 8-element chunk**, and this is a
+    deliberate departure from upstream, which does. Their argument is a good
+    one: the D pitch is the one axis carrying an 8-element alignment contract
+    (`flash_attn_func_gfx950`'s module docstring -- "the kernel rounds each row
+    up to `ceil8(head_dim)`, so those extra columns must belong to the caller"
+    -- enforced by `_check_8x_d_contract`), so `ceil8(hdim)` is inside the
+    caller's allocation by agreement rather than by luck. They measured the
+    exact bound clipping a real column, 36 failures at `hdim % 8 == 1`: gfx950
+    range-checks a multi-dword buffer op per dword, so at `hdim = 73` the dword
+    holding columns 72 and 73 straddles a bound ending at 73 and takes the real
+    column 72 with it.
 
-    Ending on the last real element instead **clips columns the kernel
-    legitimately reads.** gfx950 range-checks a multi-dword buffer op per dword
-    and drops any dword not wholly inside `num_records`, so at `hdim = 73`
-    (bf16, two elements per dword) the dword holding columns 72 and 73 falls
-    outside a bound ending at 73 and takes the *real* column 72 with it.
-    Upstream imported the unrounded form first and measured exactly that: 36
-    failures in their padded-head test, all at `hdim % 8 == 1`.
+    **That does not happen here, and it was checked rather than assumed.** The
+    round-up was carried for a while and then reverted, because
+    `test_prime_hdim` -- 73/89/113/241 with the allocation the contract asks
+    for, slack filled with NaN -- passes identically on both forms, and a probe
+    of the only place the two can differ (the final row of the final
+    `(batch, head)` slab; the exact bound clips nothing else) finds its error
+    indistinguishable from the bulk either way. There is no column to buy back.
 
-    The round-up does not weaken the fix above. On that same `(3, 5, 64, 8)` Q,
-    `ceil8(8)` is 8, so the bound is `63*40 + 8 = 2528` -- exactly the 2528
-    elements the tensor has left after that slab's base, where the loose
-    `64*40 = 2560` overran by 32.
+    So the tie is broken by what the two forms cost when they are wrong. The
+    exact bound cannot read a byte the caller did not hand us. The round-up can,
+    the moment an input arrives without the slack the contract asks for -- and
+    `_args`, which is where that contract is enforced, is a host-side wrapper
+    AOTriton's C++ launcher never calls. A descriptor is the last line of
+    defence for an input nothing else checks, so it ends on the last real
+    element.
 
-    **No other axis may round.** `_bias_slab_num_records_bytes` bounds the bias
-    slab by `seqlen_k`, which is a *sequence* extent with no alignment contract
-    behind it, and it stays exact -- the last bias column at odd `seqlen_k` is
-    bought back by narrowing the load, not by widening the descriptor. See
-    `narrow_tail`.
+    **No axis rounds, here or anywhere.** `_bias_slab_num_records_bytes` bounds
+    the bias slab by `seqlen_k` on the same principle, and the last bias column
+    at odd `seqlen_k` is bought back by narrowing the *load* -- see
+    `narrow_tail`. If the D axis ever needs its column back, that is the shape
+    the fix should take.
 
     The subtraction wraps at `rows == 0` -- a varlen empty sequence -- and an
     index that wraps becomes a `num_records` covering all of memory, which is a
@@ -573,14 +574,7 @@ def _slab_span_elems(rows, stride_seq, hdim):
     pins that case back to the untightened 0.
     """
     rows_v = fx.Index(rows)
-    # `ceil8`, at runtime, because `hdim` is a kernarg.
-    width = ((fx.Index(hdim) + fx.Index(7)) // fx.Index(8)) * fx.Index(8)
-    # A row stride narrower than the chunk would make this negative; clamp, so
-    # the bound can only shrink and never grow past the untightened span.
-    over = fx.Index(stride_seq) - width
-    trim = fx.Index(
-        (rows_v > fx.Index(0)).select((over > fx.Index(0)).select(over, fx.Index(0)), fx.Index(0))
-    )
+    trim = fx.Index((rows_v > fx.Index(0)).select(fx.Index(stride_seq) - fx.Index(hdim), fx.Index(0)))
     return rows_v * fx.Index(stride_seq) - trim
 
 

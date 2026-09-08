@@ -251,7 +251,7 @@ unchanged, which reads as a clean merge and is not one.
 |---|---|---|---|
 | `flash_attn_func_gfx950.py` | **deleted:** `COMBINE_BLOCK` / `COMBINE_LANES_PER_ROW` / `COMBINE_ROWS_PER_BLOCK`, the whole `@flyc.kernel def flash_attn_splitk_combine_kernel`, and the `if const_expr(traits.SPLITK):` block in the launcher that launches it (at `74ec63e6`: `1031-1033`, `1035-…`, `1251-1253`) | the file otherwise holds **two** `@flyc.kernel`, and two AOTriton sites locate the kernel by uniqueness (`specs/flyc.py:_flyc_kernel_stub`, `flyc_compile.py:kernel_function_of`). The combine kernel is dead for us: the descriptions pin `num_kv_splits=1` | AOTriton builds a split-K forward, **or** upstream moves the combine kernel to its own module |
 | `fmha_dualwave_gfx950.py`, and call sites in `fmha_bwd_dkdv_gfx950.py`, `fmha_bwd_dkdv_m16_gfx950.py`, `fmha_bwd_dq_m16_gfx950.py` | **added:** `_lds_ptr_ty`, `_lds_ptr_with_imm`, `_tag_lds_alias`, `_ds_read_tr16_b64_imm`, `_ds_read_tr_v4f16_imm`, copied verbatim from `flash_attn_utils.py` at `0a9c5906`; the six `dualwave._ds_read_tr*_imm` call sites drop the prefix | the pin emits these reads as **inline asm**, which `SIInsertWaitcnts` cannot see through, so no `s_waitcnt lgkmcnt` is placed before uses — non-deterministic NaN above head_dim 128. `flash_attn_utils.py` did **not** change between `7cd69444` and `74ec63e6`, so no value of `third_party/flydsl-kernel.txt` reaches `0a9c5906` and this is still unreachable | `0a9c5906` merges upstream and the pin is bumped to a tag containing it |
-| `fmha_dualwave_gfx950.py` | **changed:** `_slab_span_elems` rounds `hdim` up to `ceil8`, as upstream's does — but `hdim` is **required**, with no `hdim=None` untightened fallback | every caller here passes it. An optional bound is one a future caller can forget, and forgetting it restores the overrun the function exists to stop | never; this one is a deliberate tightening of upstream's signature |
+| `fmha_dualwave_gfx950.py` | **changed:** `_slab_span_elems` ends on the last **real** element, where upstream rounds `hdim` up to `ceil8`; `hdim` is also **required** here, with no `hdim=None` untightened fallback | a descriptor must not cover a byte the caller did not hand us, on any axis — see the section below for why the round-up buys nothing here. `hdim` is required because every caller passes it, and an optional bound is one a future caller can forget | never on the round-up; the required argument goes if upstream converts its own call sites |
 | `fmha_dualwave_gfx950.py` | **added:** `mfma_operand_wait_state` at the `q_pack` site | upstream barriered the P packs and the forward's `cast_p`, not this one. Same instruction pair, same MFMA shape | upstream barriers it, or LLVM models the hazard (issue 11) |
 | `fmha_dualwave_gfx950.py`, `fmha_common_gfx1201.py`, `fmha_bwd_dkdv_gfx950.py` | **added:** `_slab_view_at`, `_init_q_head_invariants`, `lse_row_step_per_head` — the GQA head-invariant hoist | keeping the strides live across the GQA walk drove the backward kernel's scalar spilling, and the walk is the largest region in that kernel. Upstream did not import it; `bf2faf86` attacks the same liveness from the addressing side, so **whether this still pays is unmeasured** | an A/B on an idle GPU shows it inert on top of `bf2faf86` |
 | `fmha_bwd_dq_gfx950.py` | **not taken:** upstream's `O=DQ` and `o_strides=_dq_strides` in the launcher | upstream's shared `init_descriptors` builds the O view unconditionally and so still needs the slot; ours has `if self.O is not None` (fed5dcdc), and dQ is passed by its own name. Aliasing a tensor into a slot named for another is the defect both trees spent a commit removing | upstream adds the guard |
@@ -261,37 +261,39 @@ unchanged, which reads as a clean merge and is not one.
 | `fmha_tuning_gfx950.py` | **added:** `_with_occupancy_target`, deriving `waves_per_eu` from the build's own LDS | upstream's `_GFX950_FALLBACK` asks for 2 unconditionally, and LDS refuses a second workgroup at head_dim ≥ 160 — a warning on every such build. A blanket 1 is also wrong: at head_dim 96 the hint genuinely binds as a register budget | upstream derives it |
 | `fmha_tuning_bwd_dkdv_gfx950.py` | **changed:** head_dim 160 asks `waves_per_eu=1`, in `_GEOMETRY` and in the override | 87040 B of LDS, so two workgroups want 174080 B against a 163840 B cap; the request was refused on every build and the hsacos are byte-identical either way | same |
 
-### The `ceil8` ruling, and the axis it applies to
+### The bound ends on the last real element, on every axis
 
-`_slab_span_elems` rounds a row up to `ceil8(hdim)`; `_bias_slab_num_records_bytes`
-does **not** round `seqlen_k`. That asymmetry is deliberate and is the one place
-we differ from upstream by policy rather than by pin, so it is recorded here as well
-as in both docstrings.
+Neither `_slab_span_elems` (the D axis) nor `_bias_slab_num_records_bytes` (the
+KV axis) rounds its extent up. Upstream rounds the first to `ceil8(hdim)`, so
+this is the one place we differ from them by policy rather than by pin, and the
+argument for rounding is good enough to be worth recording.
 
-Rounding is permitted **on the hdim axis only**, because the D pitch is the one
-place an 8-element chunk is inside the caller's allocation *by contract*:
-`flash_attn_func_gfx950`'s module docstring states it and `_check_8x_d_contract`
-refuses an input that does not provide it. Upstream's argument for rounding is
-that ending on the last real element clips a real column — gfx950 range-checks a
+**Their case.** The D pitch is the one axis carrying an alignment contract:
+`flash_attn_func_gfx950`'s module docstring says the kernel rounds each row up
+to `ceil8(head_dim)` and those extra columns must belong to the caller, and
+`_check_8x_d_contract` refuses an input that does not provide them. So
+`ceil8(hdim)` is inside the allocation by agreement rather than by luck. They
+measured the exact bound clipping a real column — gfx950 range-checks a
 multi-dword buffer op per dword, so at `hdim = 73` the dword holding columns 72
-and 73 falls outside a bound of 73 and takes column 72 with it. They measured 36
-such failures, all at `hdim % 8 == 1`.
+and 73 straddles a bound ending at 73 and takes column 72 with it — and reported
+36 such failures, all at `hdim % 8 == 1`.
 
-**That does not reproduce here, in either direction.** `test_prime_hdim` covers
-73/89/113/241 with the contract-satisfying allocation, and it passes on the
-`ceil8` bound *and* on the exact one; a probe of the only place the two can
-differ — the final row of the final `(batch, head)` slab — finds its error
-indistinguishable from the bulk under both. So we hold `ceil8` because it is
-upstream's form and the contract supports it, **not** because we have seen it
-fix anything. If a reason ever appears to go back to the exact bound, no
-evidence here argues against it.
+**It does not reproduce here.** `test_prime_hdim` covers 73/89/113/241 with the
+allocation the contract asks for (allocated at `ceil8`, handed over as a
+`[..., :73]` view, slack filled with NaN) and passes identically on both forms.
+A probe of the only place the two can differ — the final row of the final
+`(batch, head)` slab, since the exact bound clips nothing else — finds its error
+indistinguishable from the bulk either way. There is no column to buy back, so
+the round-up is not paying for anything.
 
-`seqlen_k` carries no such contract — nothing promises anything follows the last
-bias column — so the bias slab stays exact and the last column at odd `seqlen_k`
-is bought back by narrowing the *load*. Upstream agrees on this half.
+**So the tie breaks on what each form costs when it is wrong.** The exact bound
+cannot read a byte the caller did not hand us. The round-up can, the moment an
+input arrives without the slack — and `_args`, where that contract is enforced,
+is a host-side wrapper the C++ launcher never calls. A descriptor is the last
+line of defence for an input nothing else checks.
 
-**No third axis may round.** A future tightening that wants to should have to
-name the contract that makes the extra bytes the caller's.
+If the D axis ever does lose a column, the fix is the one the bias already uses:
+narrow the *load* (`narrow_tail`), not widen the descriptor.
 
 ## Import rewrites (1a) — gfx1201 only; gfx950 has **none**
 
