@@ -259,7 +259,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
         -o "${AKS2}"
         ${AKS2_OPTIONS}
         --hsaco_manifest "${HSACO_MANIFEST}"
-        DEPENDS aotriton_v2_compile
+        DEPENDS aotriton_v2_compile "${HSACO_MANIFEST}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_PARENT_DIR}"
         COMMAND_EXPAND_LISTS)
       list(APPEND ALL_AKS2 "${AKS2}")
@@ -296,7 +296,7 @@ if(NOT AOTRITON_NOIMAGE_MODE)
         -o "${AKS2}"
         --ignore_json
         --hsaco_manifest "${HSACO_MANIFEST}"
-        DEPENDS aotriton_v2_compile
+        DEPENDS aotriton_v2_compile "${HSACO_MANIFEST}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_PARENT_DIR}"
         COMMAND_EXPAND_LISTS)
       list(APPEND ALL_AKS2 "${AKS2}")
