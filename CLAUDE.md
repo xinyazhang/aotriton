@@ -6,6 +6,18 @@ Name products by their architecture identifier only (e.g. gfx1250, gfx942).
 Do not add commercial names, code names, or any other aliases. Only manual
 editing by the user may introduce alternative names.
 
+## Do Not Name Things "kind"
+
+Do not use `kind` in any identifier or term: variables, fields, columns,
+arguments, CLI flags, classes, or concepts in design documents. That includes
+compounds such as `subkind`, `runner_kind` and `task_kind`.
+
+The one exception is code that is closely tied to a compiler concept, or that is
+itself a component of a compiler. There, `kind` is established vocabulary (AST
+node kinds, token kinds). Outside compilers the word is rare and says nothing
+about what it names. Pick a word that describes the actual distinction, such
+as `type`, `role`, `level` or `mode`, or a domain-specific term.
+
 ## Python Version
 
 This project targets **Python 3.10 or newer** (dev environment is Python 3.12). Do not use syntax or features deprecated as of Python 3.10:
