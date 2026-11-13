@@ -412,6 +412,9 @@ class Gfx950Knobs(FmhaKnobs):
     setprio: bool | None = None
     stagger: bool | None = None
     lpt_tile_order: bool | None = None
+    # How workgroups map to (head, q block, batch), for L2 affinity across the
+    # eight XCDs; one of `fmha_traits_gfx950.XCD_MAPS`.
+    xcd_map: str | None = None
     # End the KV walk at the last live tile; see `EXACT_KV_TILES`. A speed
     # trade by sequence length, not accuracy: +69% at seqlen_k 64 and +33% at
     # 128, but 1.5-2% slower from four tiles up, so off unless `resolve` (or a
@@ -841,6 +844,7 @@ class Gfx950Knobs(FmhaKnobs):
             bias=meta.bias,
             dropout=meta.dropout,
             lpt_tile_order=self.lpt_tile_order,
+            xcd_map=self.xcd_map,
             exact_kv_tiles=self.exact_kv_tiles,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
@@ -932,7 +936,18 @@ _GFX950_FALLBACK = Gfx950Knobs(
     lazy_rescale=False,
     setprio=True,
     stagger=True,
-    lpt_tile_order=False,
+    # Causal builds only; bit-identical output. The launch order put the
+    # longest q blocks last and cost 20-40% at long S with few workgroups --
+    # S=4096 B=2 H=16 ran at 598 TF against 761 for four times the work. See
+    # `ParityKernelContext._lpt_order`; it now measures at or above the launch
+    # order everywhere, 835 TF at that shape.
+    lpt_tile_order=True,
+    # Measured within 1% of `none` on non-causal launches for every head count,
+    # and `pin_heads`/`head_slow` up to 2.5% and 25% behind on short sequences:
+    # with the head fastest the launch already keeps a head on one XCD when the
+    # head count is a multiple of 8, and the L2 affinity the others add for the
+    # remaining counts is worth under 1%. See `ParityKernelContext._map_workgroup`.
+    xcd_map="none",
     exact_kv_tiles=False,
     q_heads_per_wg=1,
     paged=False,
