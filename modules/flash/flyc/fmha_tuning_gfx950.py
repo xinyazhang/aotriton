@@ -431,6 +431,15 @@ class Gfx950Knobs(FmhaKnobs):
     block_n: int | None = None
     head_dim_granule: int | None = None
 
+    # GQA head packing: q heads of one GQA group per workgroup, with
+    # `block_m` then meaning the Q tile *per head*. Not one of the four
+    # geometry fields -- those decide the KV staging, which this leaves
+    # alone -- and not derived by policy either: whether it is legal depends
+    # on the *call's* group size, which no build knows, so the dispatcher picks
+    # it (see `ParityKernelContext._pack_q_heads`) and the host rejects a group
+    # it does not divide.
+    q_heads_per_wg: int | None = None
+
     # The two D-axis splits. Deliberately *not* part of the four-field geometry
     # pinning rule above: those four are one indivisible choice (a family),
     # while these are per-width policy that a sweep wants to vary on its own.
@@ -719,6 +728,7 @@ class Gfx950Knobs(FmhaKnobs):
         (8, 128, 64, 64),
         (4, 64, 64, 64),
         (8, 64, 64, 64),
+        (4, 32, 64, 64),  # 4-wave staging; only reachable with q_heads_per_wg 4
         (4, 128, 64, 32),  # family S -- granule 32, for widths off the 64 grid
     )
 
@@ -821,6 +831,7 @@ class Gfx950Knobs(FmhaKnobs):
             d_stages=self.d_stages,
             qk_shards=self.qk_shards,
             vo_shards=self.vo_shards,
+            q_heads_per_wg=self.q_heads_per_wg,
             v_half_wave=self.v_half_wave,
             v_n_group=self.v_n_group,
             v_k_substep=self.v_k_substep,
@@ -923,6 +934,7 @@ _GFX950_FALLBACK = Gfx950Knobs(
     stagger=True,
     lpt_tile_order=False,
     exact_kv_tiles=False,
+    q_heads_per_wg=1,
     paged=False,
     kv_cache_layout="linear",
     num_kv_splits=1,

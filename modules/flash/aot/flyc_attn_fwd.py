@@ -597,6 +597,10 @@ def flyc_attn_fwd(arch, choices, hints):
             'AOT gfx950 only ever pins paged=False, num_kv_splits=1 -- that pin '
             'is what makes the Workspace/BlockTable/block_table_stride constexpr '
             'fold (options=[0]) true; resolve() must not have overridden it')
+        assert knobs.q_heads_per_wg == 1, (
+            'GQA head packing launches num_head_q / q_heads_per_wg workgroups, '
+            'and FlycAttnFwdContext::grid_calculator does not divide yet -- a '
+            'packed binary would be launched with too many workgroups')
 
         def build():
             """Deferred: constructs the FlyDSL module. Imports flydsl transitively,
