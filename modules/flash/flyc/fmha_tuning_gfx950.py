@@ -412,6 +412,11 @@ class Gfx950Knobs(FmhaKnobs):
     setprio: bool | None = None
     stagger: bool | None = None
     lpt_tile_order: bool | None = None
+    # End the KV walk at the last live tile; see `EXACT_KV_TILES`. A speed
+    # trade by sequence length, not accuracy: +69% at seqlen_k 64 and +33% at
+    # 128, but 1.5-2% slower from four tiles up, so off unless `resolve` (or a
+    # caller) opts a shape in.
+    exact_kv_tiles: bool | None = None
 
     # Problem modes. Ordinary fields; see the class docstring.
     paged: bool | None = None
@@ -825,6 +830,7 @@ class Gfx950Knobs(FmhaKnobs):
             bias=meta.bias,
             dropout=meta.dropout,
             lpt_tile_order=self.lpt_tile_order,
+            exact_kv_tiles=self.exact_kv_tiles,
             dtype_str=meta.dtype_str,
             waves_per_eu=self.waves_per_eu,
             daz=self.daz,
@@ -916,6 +922,7 @@ _GFX950_FALLBACK = Gfx950Knobs(
     setprio=True,
     stagger=True,
     lpt_tile_order=False,
+    exact_kv_tiles=False,
     paged=False,
     kv_cache_layout="linear",
     num_kv_splits=1,
