@@ -15,10 +15,11 @@ from dataclasses import dataclass, replace
 
 from fmha_knobs import (
     GRID_AXIS_TILE_FASTEST,
+    FlycKVKnobs,
     FlycQKnobs,
 )
 
-__all__ = ["FmhaKnobs"]
+__all__ = ["BwdDkDvKnobs", "FmhaKnobs"]
 
 
 class _PolicyGridAxisOrder:
@@ -46,4 +47,24 @@ class FmhaKnobs(_PolicyGridAxisOrder, FlycQKnobs):
     FLYC_SOURCE = "gfx942/fwd.py"
     FLYC_KERNEL_NAME = "fmha_fwd_gfx942_kernel"
     # Non-causal; causal narrow and xwide builds take HEAD_FASTEST.
+    FLYC_GRID_AXIS_ORDER = GRID_AXIS_TILE_FASTEST
+
+
+
+@dataclass(frozen=True)
+class BwdDkDvKnobs(_PolicyGridAxisOrder, FlycKVKnobs):
+    """The dK/dV kernel's knobs. `None` means "policy decides". The head here is the kv head."""
+
+    body: str | None = None
+    # Narrow body.
+    num_waves: int | None = None
+    kv_blocks: int | None = None
+    interleave_valu: int | None = None
+    # Wide bodies: 16-key columns per wave or team.
+    kv_subs: int | None = None
+    waves_per_eu: int | None = None
+
+    FLYC_SOURCE = "gfx942/dkdv.py"
+    FLYC_KERNEL_NAME = "fmha_bwd_dkdv_gfx942_kernel"
+    # Non-causal; causal builds take HEAD_FASTEST.
     FLYC_GRID_AXIS_ORDER = GRID_AXIS_TILE_FASTEST
