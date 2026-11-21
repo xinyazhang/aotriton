@@ -7,6 +7,9 @@
 packs) are split so a schedule can overlap each with a different GEMM: head(j+1)
 with PV(j), tail(j) with QK(j+1). They read the kernel's run-time values from
 `ctx` and the S^T lane map from `ctx.qk`. Run-time branches are `@flyc.jit`.
+
+The LSE helpers at the end serve the backward too: its LSE and Delta rows share
+the forward's LSE layout.
 """
 
 import flydsl.compiler as flyc
@@ -15,8 +18,11 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as raw
 
+from kernels.common import buffer_ops
+
+import fmha_utils as fmha
 from . import flex_gemm
-from .utils import LOG2E, bias_load4, exp2, mask_band, pack_operand
+from .utils import LN2, LOG2E, bias_load4, exp2, mask_band, pack_operand
 
 
 def wave_any(pred):
@@ -119,3 +125,48 @@ def tail(ctx, kv_start):
         p = [flags[r].select(p[r], fx.Float32(0.0)) for r in range(ns)]
     elem = flex_gemm.elem_type(ctx.traits.dtype)
     return [pack_operand(p[4 * i:4 * i + 4], elem) for i in range(ns // 4)]
+
+
+# ---------------------------------------------------------------- LSE rows
+# Forward stores LSE; the backward reads LSE and Delta, which share the layout.
+
+def lse_of(m, l):
+    """Natural-base LSE of a finished row; +inf for a fully masked row (l = 0)."""
+    lse = (m + fx.Float32(fx.math.log2(l))) * fx.Float32(LN2)
+    return (l > fx.Float32(0.0)).select(lse, fx.Float32(float('inf')))
+
+
+def lse_rsrc(ptr,
+             rows,
+             varlen_bits,
+             batch,
+             head,
+             num_head_q,
+             max_seqlen_q,
+             seqinfo_q0,
+             seqinfo_q1,
+             num_seqlens,
+             row_off):
+    """(rsrc, pitch) of one (batch, head)'s LSE or Delta rows; a null `ptr` gets an empty range."""
+    tokens = fmha.lse_token_pitch(varlen_bits,
+                                  0,
+                                  max_seqlen_q,
+                                  seqinfo_q0,
+                                  seqinfo_q1,
+                                  num_seqlens)
+    row0, pitch = fmha.lse_row_addressing(varlen_bits,
+                                          batch,
+                                          head,
+                                          num_head_q,
+                                          tokens,
+                                          row_off)
+    addr = fx.Int64(fx.ptrtoint(ptr))
+    base = addr + fx.Int64(row0) * fx.Int64(4)
+    n_bytes = (addr == fx.Int64(0)).select(fx.Int64(0), fx.Int64(rows * pitch) * fx.Int64(4))
+    return buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=n_bytes), pitch
+
+
+def lse_store(rsrc, pitch, lse, row, row_ok, lh):
+    """One lane of each row pair stores (lane half `lh` == 0)."""
+    off = row * pitch
+    buffer_ops.buffer_store(lse, rsrc, off, mask=row_ok & (lh == fx.Index(0)))

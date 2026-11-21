@@ -12,13 +12,12 @@ from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Vector as Vec
-from kernels.common import buffer_ops
+from flydsl.expr import const_expr, gpu, rocdl
 
 import fmha_utils as fmha
 from . import flex_gemm
 from . import softmax
+from . import tensor_io
 from . import tuning_fwd as tuning
 from .flex_gemm import (
     gemm_dma,
@@ -31,7 +30,6 @@ from .flex_gemm import (
     gemm_stage,
 )
 from .utils import (
-    LN2,
     WAVE,
     Lds,
     alias_scopes,
@@ -143,7 +141,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
     qk, pv = tr.gemms()
     lds_bytes = 2 * qk.a.tile_bytes + 2 * pv.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'flex_' + flex_gemm.cache_tag(tr, flex_gemm, softmax)
+    tag = 'flex_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
@@ -410,32 +408,35 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         if const_expr(dropout):
             inv_l = inv_l * fx.Float32(dropout_scale)
         q_ok = q_row < sq
-        for dt in range_constexpr(pv.out_tiles):
-            o = Vec(results[2 + dt]) * fx.full(16, fx.Float32(inv_l), fx.Float32)
-            for i in range_constexpr(4):
-                vals = [o[4 * i + jj] for jj in range(4)]
-                packed = Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem)
-                d = fx.Index(32 * dt + 8 * i) + lh * 4
-                off = q_row * o_row_stride + d
-                ok = q_ok
-                if const_expr(32 * dt + 8 * i + 8 > tr.pad_floor):
-                    ok = ok & (fx.Int32(d) < row_vo)
-                buffer_ops.buffer_store(packed.ir_value(), o_rsrc, off, mask=ok)
-        # LSE: natural base, +inf for fully masked rows; a null L gets an empty range.
-        lse = (m_fin + fx.Float32(fx.math.log2(l_fin))) * fx.Float32(LN2)
-        lse = (l_fin > fx.Float32(0.0)).select(lse, fx.Float32(float('inf')))
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
-        lse_row0, lse_pitch = fmha.lse_row_addressing(varlen_bits,
-                                                      fx.Index(q_batch),
-                                                      head,
-                                                      num_head_q,
-                                                      lse_tokens,
-                                                      fx.Index(q_row_off))
-        lse_addr = fx.Int64(fx.ptrtoint(LSE))
-        lse_base = lse_addr + fx.Int64(lse_row0) * fx.Int64(4)
-        lse_bytes = (lse_addr == fx.Int64(0)).select(fx.Int64(0), fx.Int64(sq * lse_pitch) * fx.Int64(4))
-        lse_rsrc = buffer_ops.create_buffer_resource_from_addr(lse_base, num_records_bytes=lse_bytes)
-        buffer_ops.buffer_store(lse, lse_rsrc, q_row * lse_pitch, mask=q_ok & (lh == fx.Index(0)))
+        tensor_io.store_acc(pv,
+                            results[2:2 + pv.out_tiles],
+                            o_rsrc,
+                            q_row,
+                            o_row_stride,
+                            lh,
+                            row_vo,
+                            q_ok,
+                            elem,
+                            tr.pad_floor,
+                            scale=inv_l)
+        lse = softmax.lse_of(m_fin, l_fin)
+        lse_rsrc, lse_pitch = softmax.lse_rsrc(LSE,
+                                               sq,
+                                               varlen_bits,
+                                               fx.Index(q_batch),
+                                               head,
+                                               num_head_q,
+                                               max_seqlen_q,
+                                               seqinfo_q0,
+                                               seqinfo_q1,
+                                               num_seqlens,
+                                               fx.Index(q_row_off))
+        softmax.lse_store(lse_rsrc,
+                          lse_pitch,
+                          lse,
+                          q_row,
+                          q_ok,
+                          lh)
 
     @flyc.jit
     def launch_fmha_fwd_gfx942_flex(
