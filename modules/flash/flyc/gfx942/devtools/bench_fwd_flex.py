@@ -3,7 +3,8 @@
 
 """TFLOPS of a forward body on flex_gemm against the original, timed interleaved
 (the power cap makes back-to-back runs of one kernel unfair to the other):
-narrow fwd_flex.py vs fwd.py, wide fwd_wide_flex.py vs fwd_wide.py.
+narrow fwd_flex.py vs fwd.py, wide fwd_wide_flex.py vs fwd_wide.py, xwide
+fwd_xwide_flex.py vs fwd_xwide.py.
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<FlyDSL tree> python bench_fwd_flex.py \\
         --body wide --head_dim 256 --seqlen 8192 --causal --reps 10
@@ -26,7 +27,9 @@ import torch  # noqa: E402
 BODIES = {'narrow': (('gfx942.fwd', 'build_fmha_fwd_gfx942'),
                      ('gfx942.fwd_flex', 'build_fmha_fwd_gfx942_flex')),
           'wide': (('gfx942.fwd_wide', 'build_fmha_fwd_gfx942_wide'),
-                   ('gfx942.fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex'))}
+                   ('gfx942.fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex')),
+          'xwide': (('gfx942.fwd_xwide', 'build_fmha_fwd_gfx942_xwide'),
+                    ('gfx942.fwd_xwide_flex', 'build_fmha_fwd_gfx942_xwide_flex'))}
 
 
 def main():

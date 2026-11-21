@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: MIT
 
 """The forward bodies on flex_gemm against the originals: fwd_flex.py vs fwd.py
-(narrow) and fwd_wide_flex.py vs fwd_wide.py (wide). O and LSE must be
+(narrow), fwd_wide_flex.py vs fwd_wide.py (wide) and fwd_xwide_flex.py vs
+fwd_xwide.py (xwide). O and LSE must be
 bit-identical for every feature build, including windows, varlen, GQA, NaN
 slack in padded heads and rows that see no key.
 
@@ -20,11 +21,14 @@ from .jit_common import np, pytestmark, torch, with_nan_slack  # noqa: F401
 
 import fmha_utils as abi  # noqa: E402
 
-# body -> head dims: narrow at 64/128; wide at 160 (early K/V^T) and 256 (streamed).
-HEAD_DIMS = {'narrow': (64, 128), 'wide': (160, 256)}
+# body -> head dims: narrow at 64/128; wide at 160 (early K/V^T) and 256 (streamed);
+# xwide at 384 and 512.
+HEAD_DIMS = {'narrow': (64, 128), 'wide': (160, 256), 'xwide': (384, 512)}
 BUILDERS = {'narrow': (('fwd', 'build_fmha_fwd_gfx942'), ('fwd_flex', 'build_fmha_fwd_gfx942_flex')),
             'wide': (('fwd_wide', 'build_fmha_fwd_gfx942_wide'),
-                     ('fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex'))}
+                     ('fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex')),
+            'xwide': (('fwd_xwide', 'build_fmha_fwd_gfx942_xwide'),
+                      ('fwd_xwide_flex', 'build_fmha_fwd_gfx942_xwide_flex'))}
 CASES = [(body, d) for body, dims in HEAD_DIMS.items() for d in dims]
 
 
