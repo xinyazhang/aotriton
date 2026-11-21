@@ -1,11 +1,12 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""TFLOPS of fwd_flex.py against fwd.py's narrow body, timed interleaved (the
-power cap makes back-to-back runs of one kernel unfair to the other).
+"""TFLOPS of a forward body on flex_gemm against the original, timed interleaved
+(the power cap makes back-to-back runs of one kernel unfair to the other):
+narrow fwd_flex.py vs fwd.py, wide fwd_wide_flex.py vs fwd_wide.py.
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<FlyDSL tree> python bench_fwd_flex.py \\
-        --seqlen 8192 --causal --reps 10
+        --body wide --head_dim 256 --seqlen 8192 --causal --reps 10
 """
 
 import argparse
@@ -17,13 +18,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.environ['AOTRITON_FLYDSL_KERNEL_ROOT'])
 
+import importlib  # noqa: E402
+
 import torch  # noqa: E402
-from gfx942.fwd import build_fmha_fwd_gfx942  # noqa: E402
-from gfx942.fwd_flex import build_fmha_fwd_gfx942_flex  # noqa: E402
+
+# body -> (original module, builder), (flex module, builder)
+BODIES = {'narrow': (('gfx942.fwd', 'build_fmha_fwd_gfx942'),
+                     ('gfx942.fwd_flex', 'build_fmha_fwd_gfx942_flex')),
+          'wide': (('gfx942.fwd_wide', 'build_fmha_fwd_gfx942_wide'),
+                   ('gfx942.fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex'))}
 
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument('--body', default='narrow', choices=list(BODIES))
     p.add_argument('--batch', type=int, default=4)
     p.add_argument('--heads', type=int, default=32)
     p.add_argument('--seqlen', type=int, default=8192)
@@ -39,8 +47,11 @@ def main():
     o = torch.empty_like(q)
     lse = torch.empty(a.batch * a.heads, a.seqlen, dtype=torch.float32, device='cuda')
     ct = 2 if a.causal else 0
-    launches = {'fwd.py': build_fmha_fwd_gfx942(a.head_dim, causal_type=ct, dtype_str=a.dtype),
-                'fwd_flex.py': build_fmha_fwd_gfx942_flex(a.head_dim, causal_type=ct, dtype_str=a.dtype)}
+    launches = {}
+    for mod, fn in BODIES[a.body]:
+        build = getattr(importlib.import_module(mod), fn)
+        launches[mod.split('.')[-1] + '.py'] = build(a.head_dim, causal_type=ct, dtype_str=a.dtype)
+    names = list(launches)
 
     def run(launch):
         launch(q.transpose(1, 2),
@@ -57,7 +68,7 @@ def main():
         run(launch)
         torch.cuda.synchronize()
         outs[name] = o.clone()
-    assert torch.equal(outs['fwd.py'], outs['fwd_flex.py']), 'outputs differ'
+    assert torch.equal(outs[names[0]], outs[names[1]]), 'outputs differ'
     pairs = a.seqlen * a.seqlen
     if a.causal:
         pairs = a.seqlen * (a.seqlen + 1) // 2
@@ -65,7 +76,6 @@ def main():
     tf = {name: [] for name in launches}
     e0 = torch.cuda.Event(enable_timing=True)
     e1 = torch.cuda.Event(enable_timing=True)
-    names = list(launches)
     for rep in range(a.reps):
         for name in (names if rep % 2 == 0 else names[::-1]):
             for _ in range(3):
@@ -77,7 +87,7 @@ def main():
             torch.cuda.synchronize()
             tf[name].append(flops / (e0.elapsed_time(e1) / a.iters) / 1e9)
     for name in names:
-        print(f'B{a.batch} H{a.heads} S{a.seqlen} D{a.head_dim} causal={a.causal} {a.dtype} {name:12s} '
+        print(f'B{a.batch} H{a.heads} S{a.seqlen} D{a.head_dim} causal={a.causal} {a.dtype} {name:18s} '
               f'median {statistics.median(tf[name]):.1f} TFLOPS  (min {min(tf[name]):.1f}, max {max(tf[name]):.1f})')
 
 

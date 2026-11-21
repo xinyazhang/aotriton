@@ -2,15 +2,17 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""fwd_flex.py (the narrow forward on flex_gemm) against fwd.py's narrow body:
-O and LSE must be bit-identical for every feature build, including windows,
-varlen, GQA, NaN slack in padded heads and rows that see no key.
+"""The forward bodies on flex_gemm against the originals: fwd_flex.py vs fwd.py
+(narrow) and fwd_wide_flex.py vs fwd_wide.py (wide). O and LSE must be
+bit-identical for every feature build, including windows, varlen, GQA, NaN
+slack in padded heads and rows that see no key.
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<flydsl-checkout> \\
         python -m pytest modules/flash/flyc/gfx942/test_fwd_flex.py
 """
 
 import functools
+import importlib
 
 import pytest
 
@@ -18,15 +20,22 @@ from .jit_common import np, pytestmark, torch, with_nan_slack  # noqa: F401
 
 import fmha_utils as abi  # noqa: E402
 
-HEAD_DIMS = (64, 128)
+# body -> head dims: narrow at 64/128; wide at 160 (early K/V^T) and 256 (streamed).
+HEAD_DIMS = {'narrow': (64, 128), 'wide': (160, 256)}
+BUILDERS = {'narrow': (('fwd', 'build_fmha_fwd_gfx942'), ('fwd_flex', 'build_fmha_fwd_gfx942_flex')),
+            'wide': (('fwd_wide', 'build_fmha_fwd_gfx942_wide'),
+                     ('fwd_wide_flex', 'build_fmha_fwd_gfx942_wide_flex'))}
+CASES = [(body, d) for body, dims in HEAD_DIMS.items() for d in dims]
+
+
+def _builder(body, variant):
+    mod, fn = BUILDERS[body][0 if variant == 'old' else 1]
+    return getattr(importlib.import_module(f'.{mod}', __package__), fn)
 
 
 @functools.cache
-def _build(variant, head_dim, causal_type, bias, dropout, padded_head, dtype_str, rescale_threshold):
-    if variant == 'old':
-        from .fwd import build_fmha_fwd_gfx942 as build
-    else:
-        from .fwd_flex import build_fmha_fwd_gfx942_flex as build
+def _build(variant, body, head_dim, causal_type, bias, dropout, padded_head, dtype_str, rescale_threshold):
+    build = _builder(body, variant)
     return build(head_dim,
                  causal_type=causal_type,
                  bias=bias,
@@ -65,8 +74,8 @@ WINDOWS = ((0, None), (1, None), (2, None), (3, (100, 37)), (3, (0, 0)))
 @pytest.mark.parametrize("dropout", (False, True))
 @pytest.mark.parametrize("bias", (False, True))
 @pytest.mark.parametrize("window", WINDOWS)
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
-def test_dense(head_dim, window, bias, dropout, padded, dtype, rescale_threshold):
+@pytest.mark.parametrize("body,head_dim", CASES)
+def test_dense(body, head_dim, window, bias, dropout, padded, dtype, rescale_threshold):
     causal_type, win = window
     if bias and causal_type:
         pytest.skip("bias and causal are mutually exclusive")
@@ -91,7 +100,7 @@ def test_dense(head_dim, window, bias, dropout, padded, dtype, rescale_threshold
         kwargs.update(dropout_p=0.2, philox_seed=1234, philox_offset2=5)
     if win is not None:
         kwargs['window'] = win
-    key = (head_dim, causal_type, bias, dropout, padded, dtype, rescale_threshold)
+    key = (body, head_dim, causal_type, bias, dropout, padded, dtype, rescale_threshold)
     _assert_same(_run_both(key, (q, k, v), b, sq, out, lse, kwargs))
 
 
@@ -101,8 +110,8 @@ SEQS = ((1, 300), (64, 320), (130, 130), (300, 37), (37, 200))
 
 @pytest.mark.parametrize("bias", (False, True))
 @pytest.mark.parametrize("causal_type", (0, 2))
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
-def test_varlen(head_dim, causal_type, bias):
+@pytest.mark.parametrize("body,head_dim", CASES)
+def test_varlen(body, head_dim, causal_type, bias):
     if bias and causal_type:
         pytest.skip("bias and causal are mutually exclusive")
     h = 2
@@ -121,5 +130,5 @@ def test_varlen(head_dim, causal_type, bias):
     kwargs = dict(seqlen_k=max(lk), num_seqlens=len(SEQS), lse=lse, varlen=varlen)
     if bias:
         kwargs['bias'] = torch.randn(1, h, tq, tk, device='cuda', dtype=torch.bfloat16)
-    key = (head_dim, causal_type, bias, False, False, 'bf16', 0.0)
+    key = (body, head_dim, causal_type, bias, False, False, 'bf16', 0.0)
     _assert_same(_run_both(key, (q, k, v), 1, max(lq), out, lse, kwargs))
