@@ -206,11 +206,15 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         stride_b_head: fx.Int64,
         stride_b_seq_q: fx.Int64,
     ):
-        _ = tag
+        _ = tag                     # puts every traits field in the JIT cache key
+        # ctx: the frozen traits plus the run-time state. `carried` names what
+        # crosses the tile loop's back edge (softmax state, O, V(j+1) in VGPRs).
         ctx = flex_gemm.Ctx(tr, carried=('m', 'corr', 'l', 's', 'o', 'v_regs'))
         ctx.qk, ctx.pv = qk, pv
 
         # ---- prelude: addressing, resources, per-lane plans (same order as fwd.py)
+        # Lane geometry and the (q tile, head) this block serves; GQA maps the
+        # query head to its kv head. Varlen decodes each sequence's length and offset.
         tid = fx.Index(gpu.thread_idx.x)
         wave = tid // WAVE
         lane = tid % WAVE
@@ -229,6 +233,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         sq = fx.Index(sq_i32)
         sk = fx.Index(sk_i32)
 
+        # LDS: K(j) double-buffered at 0, V^T(j) double-buffered after it.
         lds = fx.SharedAllocator().allocate(Smem).peek()
         lds_p = lds.buf.ptr
         lds_addr = fx.Index(fx.ptrtoint(lds_p))
@@ -248,8 +253,13 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         v_stride_b = fx.Int32(stride_v_seq) * fx.Int32(2)
         o_row_stride = fx.Index(fx.Int32(stride_o_seq))
 
+        # Each wave owns 32 query rows; a lane holds one row (lm) and one half of
+        # the 32x32x8 accumulator's columns (lh).
         q_start = q_tile * tr.block_m
         q_row = q_start + wave * WAVE_M + lm
+
+        # Q^T stays in VGPRs for the whole loop. The plans are per-lane addresses,
+        # computed once so the loop body only adds tile offsets.
 
         ctx.q_packs = flex_gemm.resident_packs(qk, q_rsrc, q_row, q_row_stride, lh, hdim_qk)
         k_dma_plan = gemm_dma_plan(qk, wave, lane, k_stride_b, lds_addr)
@@ -258,6 +268,8 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         vt_read_plan = gemm_read_plan(pv, lm, lh)
         ctx.k_masks = flex_gemm.a_col_masks(qk, hdim_qk, lh)
 
+        # Softmax constants: scores go to base 2 (exp2); swap_addr reaches the lane
+        # holding the other half of this row.
         ctx.c_scale = fx.Float32(sm_scale) * fx.Float32(softmax.LOG2E)
         ctx.c_neg_inf = fx.Float32(float('-inf'))
         c_neg_max = fx.Float32(-3.4028234663852886e38)
@@ -277,6 +289,8 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         j_clean = smin(j_clean + j_clean % 2, n_loop)
         j_clean_end = smax(smin(smax(clean_end, fx.Index(1)) - fx.Index(1), n_loop), j_clean)
 
+        # Bias: this row's slab of B and the lane's byte position in it; loads are
+        # dword-aligned, so the shift picks the bf16/f16 pairs out.
         if const_expr(bias):
             ctx.b_rsrc, b_mis = bias_slab(B,
                                           q_batch,
@@ -307,6 +321,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
             return kv_base + j * block_n
 
         # ---- memory clusters: which tile each load serves is visible here
+        # They own every wait and barrier; the GEMM phases never wait.
         def mem0(kv_next, b, masked):
             """C0(j): V^T(j) -> LDS, V(j+1) -> VGPRs, K(j+1) LDS -> VGPRs, bias(j+1)."""
             gemm_stage(pv, v_load_plan, ctx.lds, scopes, ctx.v_regs, b)
@@ -324,6 +339,8 @@ def build_fmha_fwd_gfx942_flex(head_dim,
             rocdl.s_waitcnt(vmcnt=pv.a.n_load + qk.a.n_dma)
             cluster_barrier(f'C2.{b}')
 
+        # Iteration -1 fills the pipeline the loop expects: K(1), K(2) in flight,
+        # V(0) in VGPRs, S(0) through head(0).
         def warmup():
             """Iteration -1: K(0..2) DMAs, V(0), QK(0), head(0); opens the stagger."""
             gemm_dma(qk, k_dma_plan, k_rsrc, scopes, kv_base, k_stride_b, 0)
@@ -351,6 +368,8 @@ def build_fmha_fwd_gfx942_flex(head_dim,
             ctx.o = [fx.full(16, 0.0, fx.Float32) for _ in range(pv.out_tiles)]
 
         # ---- the tile loop: QK(j+1) and PV(j) with softmax(j) and (j+1) under them
+        # `b` = j % 2 is a Python int (alias scopes need constants); `masked` says
+        # whether tile j+1 needs the causal/window/padding mask.
         def iteration(j, b, masked):
             kv_next = kv(j + 1)
             mem0(kv_next, b, masked)
@@ -365,6 +384,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
             softmax.head(ctx, s_next, kv_next, masked, ctx.b_next)              # max(j+1)
             compute_end(f'C3.{b}')
 
+        # The loop leaves the last tile's PV undone; drain picks its buffer at run time.
         def finish(state, b, kv_last):
             """The last tile's PV; returns [m, l] + O. Starts from `state`: a branch
             must not see what the other branch did to ctx."""
@@ -393,12 +413,15 @@ def build_fmha_fwd_gfx942_flex(head_dim,
                 out = finish(state, 1, kv_last)
             return out
 
+        # Masked tiles run first and last, the clean middle unrolled x2 (flex_gemm.run_tiles).
         warmup()
         ctx.tiles(iteration, j_clean, j_clean_end, n_loop)
         results = drain(n_loop)
         barrier_if(fx.Int32(1) - group_b)         # close the stagger
 
         # ---- epilogue: O / l, LSE
+        # The row sum l is split over the two lane halves; a fully masked row
+        # (l = 0) stores O = 0 and LSE = +inf. Dropout's 1/(1-p) folds into 1/l.
         rocdl.s_waitcnt(0)
         m_fin = results[0]
         l_fin = results[1]
@@ -419,6 +442,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
                             elem,
                             tr.pad_floor,
                             scale=inv_l)
+        # LSE before its resource, as in fwd.py: keeps the ISA identical.
         lse = softmax.lse_of(m_fin, l_fin)
         lse_rsrc, lse_pitch = softmax.lse_rsrc(LSE,
                                                sq,
