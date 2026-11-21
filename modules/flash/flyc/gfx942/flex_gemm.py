@@ -17,11 +17,13 @@ differs between the GEMMs is only the traits, chiefly A's source:
 never wait, barrier or set priorities: the schedule places them in its
 clusters and owns the waits, using the load counts the traits publish.
 
-Kernels import the phases by name (`from .flex_gemm import x`) so FlyDSL's JIT
-cache hashes their source. The presets run at builder scope and are called as
-`flex_gemm.trait_ab(...)`; the traits they build reach the cache through `cache_tag`.
+Kernels import the `gemm_*` phases by name (`from .flex_gemm import gemm_mma`):
+the name reads as running a GEMM. Everything else is called through the module
+(`flex_gemm.trait_ab(...)`, `flex_gemm.Ctx(...)`). FlyDSL's JIT cache does not
+see module-prefixed calls, so `cache_tag` folds in a digest of the modules' source.
 """
 
+import hashlib
 from dataclasses import astuple, dataclass, fields
 
 import flydsl.compiler as flyc
@@ -39,9 +41,15 @@ def elem_type(dtype):
     return fx.BFloat16 if dtype == 'bf16' else fx.Float16
 
 
-def cache_tag(traits):
-    """A string naming every field: the JIT cache hashes it, not the traits object."""
-    return '_'.join(f'{f.name}={v}' for f, v in zip(fields(traits), astuple(traits)))
+def cache_tag(traits, *modules):
+    """Every traits field, plus a digest of `modules`' source: the JIT cache hashes
+    this string, but neither the traits object nor module-prefixed calls."""
+    tag = '_'.join(f'{f.name}={v}' for f, v in zip(fields(traits), astuple(traits)))
+    digest = hashlib.sha256()
+    for m in modules:
+        with open(m.__file__, 'rb') as f:
+            digest.update(f.read())
+    return f'{tag}_src={digest.hexdigest()[:16]}'
 
 
 # ---------------------------------------------------------------- A sources

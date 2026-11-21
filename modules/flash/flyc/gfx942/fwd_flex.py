@@ -21,10 +21,6 @@ from . import flex_gemm
 from . import softmax
 from . import tuning_fwd as tuning
 from .flex_gemm import (
-    Ctx,
-    a_col_masks,
-    cache_tag,
-    elem_type,
     gemm_dma,
     gemm_dma_plan,
     gemm_load,
@@ -33,7 +29,6 @@ from .flex_gemm import (
     gemm_read,
     gemm_read_plan,
     gemm_stage,
-    resident_packs,
 )
 from .utils import (
     LN2,
@@ -148,9 +143,9 @@ def build_fmha_fwd_gfx942_flex(head_dim,
     qk, pv = tr.gemms()
     lds_bytes = 2 * qk.a.tile_bytes + 2 * pv.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'flex_' + cache_tag(tr)
+    tag = 'flex_' + flex_gemm.cache_tag(tr, flex_gemm, softmax)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
-    elem = elem_type(dtype_str)
+    elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
 
     @fx.struct
@@ -214,7 +209,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         stride_b_seq_q: fx.Int64,
     ):
         _ = tag
-        ctx = Ctx(tr, carried=('m', 'corr', 'l', 's', 'o', 'v_regs'))
+        ctx = flex_gemm.Ctx(tr, carried=('m', 'corr', 'l', 's', 'o', 'v_regs'))
         ctx.qk, ctx.pv = qk, pv
 
         # ---- prelude: addressing, resources, per-lane plans (same order as fwd.py)
@@ -258,12 +253,12 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         q_start = q_tile * tr.block_m
         q_row = q_start + wave * WAVE_M + lm
 
-        ctx.q_packs = resident_packs(qk, q_rsrc, q_row, q_row_stride, lh, hdim_qk)
+        ctx.q_packs = flex_gemm.resident_packs(qk, q_rsrc, q_row, q_row_stride, lh, hdim_qk)
         k_dma_plan = gemm_dma_plan(qk, wave, lane, k_stride_b, lds_addr)
         v_load_plan = gemm_load_plan(pv, tid, v_stride_b)
         k_read_plan = gemm_read_plan(qk, lm, lh)
         vt_read_plan = gemm_read_plan(pv, lm, lh)
-        ctx.k_masks = a_col_masks(qk, hdim_qk, lh)
+        ctx.k_masks = flex_gemm.a_col_masks(qk, hdim_qk, lh)
 
         ctx.c_scale = fx.Float32(sm_scale) * fx.Float32(softmax.LOG2E)
         ctx.c_neg_inf = fx.Float32(float('-inf'))

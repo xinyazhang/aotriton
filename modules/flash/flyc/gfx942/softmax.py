@@ -15,7 +15,7 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as raw
 
-from .flex_gemm import elem_type
+from . import flex_gemm
 from .utils import LOG2E, bias_load4, exp2, mask_band, pack_operand
 
 
@@ -38,7 +38,12 @@ def bias_load(ctx, kv_start, exact):
     out = []
     for g in ctx.qk.group_coords:
         off = (ctx.b_byte if exact else ctx.b_lane) + fx.Int32(g * 2)
-        out.append(bias_load4(ctx.b_rsrc, off, soff, ctx.b_shift, exact, elem_type(ctx.traits.dtype)))
+        out.append(bias_load4(ctx.b_rsrc,
+                              off,
+                              soff,
+                              ctx.b_shift,
+                              exact,
+                              flex_gemm.elem_type(ctx.traits.dtype)))
     return out
 
 
@@ -112,5 +117,5 @@ def tail(ctx, kv_start):
     if ctx.traits.dropout:
         flags = keep(ctx, kv_start)
         p = [flags[r].select(p[r], fx.Float32(0.0)) for r in range(ns)]
-    elem = elem_type(ctx.traits.dtype)
+    elem = flex_gemm.elem_type(ctx.traits.dtype)
     return [pack_operand(p[4 * i:4 * i + 4], elem) for i in range(ns // 4)]
