@@ -279,7 +279,9 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         # Tiles: masked iterations bracket the clean ones; iteration j masks tile j+1.
         win_l, win_r = band_window(tr.causal, window_left, window_right, sq_i32, sk_i32, varlen_bits)
         q_first, q_last, kv_base, n_tiles = kv_tiles(q_start, tr.block_m, block_n, sq_i32, sk_i32, win_l, win_r)
-        ctx.band_lo, ctx.band_span = row_band(q_row, win_l, win_r, sk_i32)
+        band = row_band(q_row, win_l, win_r, sk_i32)
+        ctx.band = lambda: band
+        ctx.lane_key = lambda: ctx.kv_lane
         lead, clean_end = clean_tiles(q_first, q_last, kv_base, block_n, sk_i32, win_l, win_r)
         if const_expr(bias):
             # Only the last tile can hold the dword that straddles the bias slab's end.
@@ -425,7 +427,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
         rocdl.s_waitcnt(0)
         m_fin = results[0]
         l_fin = results[1]
-        l_fin = l_fin + softmax.peer(ctx, l_fin)
+        l_fin = softmax.row_sum(ctx, l_fin)
         inv_l = fx.Float32(1.0) / l_fin
         inv_l = (l_fin > fx.Float32(0.0)).select(inv_l, fx.Float32(0.0))
         if const_expr(dropout):
@@ -460,7 +462,7 @@ def build_fmha_fwd_gfx942_flex(head_dim,
                           lse,
                           q_row,
                           q_ok,
-                          lh)
+                          lambda: lh == fx.Index(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942_flex(
