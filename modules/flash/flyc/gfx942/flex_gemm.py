@@ -12,13 +12,14 @@ differs between the GEMMs is only the traits, chiefly A's source:
 - `PermA`: A transposed by v_perm on its way from VGPRs into LDS; one 8 B read
   per MFMA. Forward PV.
 
-`gemm_ab` and `gemm_tb` are presets of these traits. A GEMM is frozen traits
+`trait_ab` and `trait_tb` are presets of these traits. A GEMM is frozen traits
 (Python values only) plus stateless phase functions. Phases take explicit tile offsets and a trace-time buffer index, and
 never wait, barrier or set priorities: the schedule places them in its
 clusters and owns the waits, using the load counts the traits publish.
 
-Kernels import these by name (`from .flex_gemm import x`) so FlyDSL's JIT
-cache hashes their source.
+Kernels import the phases by name (`from .flex_gemm import x`) so FlyDSL's JIT
+cache hashes their source. The presets run at builder scope and are called as
+`flex_gemm.trait_ab(...)`; the traits they build reach the cache through `cache_tag`.
 """
 
 from dataclasses import astuple, dataclass, fields
@@ -153,12 +154,12 @@ class GemmTraits:
         return [32 * (g // 4) + 8 * (g % 4) for g in range(self.ns // 4)]
 
 
-def gemm_ab(dtype, rows, cols, pad_floor, threads, lds_base, scope):
+def trait_ab(dtype, rows, cols, pad_floor, threads, lds_base, scope):
     """acc^T = A.B^T over `cols`: A row-major, DMA'd; B resident."""
     return GemmTraits(dtype, RowA(rows, cols, pad_floor, threads, lds_base, scope))
 
 
-def gemm_tb(dtype, rows, cols, threads, lds_base, scope):
+def trait_tb(dtype, rows, cols, threads, lds_base, scope):
     """acc^T += A^T.B over `rows`: A^T by v_perm; B the previous GEMM's output."""
     return GemmTraits(dtype, PermA(rows, cols, threads, lds_base, scope))
 

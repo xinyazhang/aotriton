@@ -17,6 +17,7 @@ from flydsl.expr.typing import Vector as Vec
 from kernels.common import buffer_ops
 
 import fmha_utils as fmha
+from . import flex_gemm
 from . import softmax
 from . import tuning_fwd as tuning
 from .flex_gemm import (
@@ -24,7 +25,6 @@ from .flex_gemm import (
     a_col_masks,
     cache_tag,
     elem_type,
-    gemm_ab,
     gemm_dma,
     gemm_dma_plan,
     gemm_load,
@@ -33,7 +33,6 @@ from .flex_gemm import (
     gemm_read,
     gemm_read_plan,
     gemm_stage,
-    gemm_tb,
     resident_packs,
 )
 from .utils import (
@@ -100,8 +99,19 @@ class FwdTraits:
 
     def gemms(self):
         """(QK, PV): S^T = K.Q^T and O^T += V^T.P^T, double-buffered in LDS."""
-        qk = gemm_ab(self.dtype, self.block_n, self.head_dim, self.pad_floor, self.block_size, 0, 'k')
-        pv = gemm_tb(self.dtype, self.block_n, self.head_dim, self.block_size, 2 * qk.a.tile_bytes, 'vt')
+        qk = flex_gemm.trait_ab(self.dtype,
+                                self.block_n,
+                                self.head_dim,
+                                self.pad_floor,
+                                self.block_size,
+                                0,
+                                'k')
+        pv = flex_gemm.trait_tb(self.dtype,
+                                self.block_n,
+                                self.head_dim,
+                                self.block_size,
+                                2 * qk.a.tile_bytes,
+                                'vt')
         return qk, pv
 
 
