@@ -9,8 +9,10 @@ or P/dS from the previous GEMM), the accumulator passed in or fresh. What
 differs between the GEMMs is only the traits, chiefly A's source:
 
 - `RowA`: A row-major in LDS, DMA'd; one 16 B read feeds two MFMAs. Forward QK.
-  `dma` picks the copy: 'lines' (the block copies the tile as flat 4 B lines) or
-  'rows' (each wave copies whole rows, 256 B per issue).
+  `dma` picks the copy: 'lines' (the block copies the tile as flat 4 B lines),
+  'rows' (each wave copies whole rows, 256 B per issue) or 'stage' (loaded into
+  VGPRs by `gemm_load` in 4-row x 8-column units, written by `gemm_stage`, chunk
+  XORed with (row // div) % mod by `swizzle`): the wide dQ, whose K also feeds K^T.
 - `PermA`: A transposed by v_perm on its way from VGPRs into LDS; one 8 B read
   per MFMA. Forward PV. `unit_cols` picks the load unit: 4 rows x 2 columns
   (dword loads) or 4 rows x 8 columns (dwordx4 loads, row groups fastest).
@@ -60,6 +62,7 @@ from .utils import (
     OOB_VOFF,
     WAVE,
     col_mask,
+    col_mask_words,
     lds_ptr_at,
     m0_at,
     mfma_16x16x16,
@@ -105,6 +108,7 @@ class RowA:
     dma: str = 'lines'   # 'lines' or 'rows'
     buffers: int = 2
     key_order: str = 'linear'    # or 'runs' ('lines' DMA only)
+    swizzle: tuple = (1, 1)      # 'stage': chunk ^= (row // div) % mod
 
     @property
     def row_bytes(self):
@@ -148,9 +152,14 @@ class RowA:
 
     @property
     def tile_bytes(self):
-        if self.dma in ('rows', 'xor'):
+        if self.dma in ('rows', 'xor', 'stage'):
             return self.rows * self.stride
         return self.n_dma * self.dma_round_bytes
+
+    @property
+    def units(self):
+        """'stage' load units: 4 rows x 8 columns, one per thread."""
+        return (self.rows // 4) * (self.cols // 8)
 
     def scope_of(self, buf):
         return self.scope if self.buffers == 1 else f'{self.scope}{buf}'
@@ -272,8 +281,16 @@ class GemmTraits:
         return 2 if isinstance(self.a, RowA) or self.a.layout == 'chunks' else 1
 
     @property
+    def lane_groups(self):
+        """Lanes sharing an MFMA row: 64 / m."""
+        return WAVE // self.m
+
+    @property
     def reads(self):
         """A reads per output tile; for chunked PermA, per two output tiles."""
+        if isinstance(self.a, PermA) and self.a.layout == 'rows':
+            # One 8 B read a k-step of 4 * lane_groups rows.
+            return self.a.rows // (4 * self.lane_groups)
         if self.mfma == '16x16x16':
             # One 16 B read = 8 columns of the lane's 4-key group: two MFMAs.
             return self.a.cols // 32
@@ -325,8 +342,9 @@ def trait_ab(dtype,
              dma='lines',
              mfma='32x32x8',
              buffers=2,
-             key_order='linear'):
-    """acc^T = A.B^T over `cols`: A row-major, DMA'd; B resident."""
+             key_order='linear',
+             swizzle=(1, 1)):
+    """acc^T = A.B^T over `cols`: A row-major, DMA'd or staged; B resident."""
     return GemmTraits(dtype,
                       RowA(rows,
                            cols,
@@ -336,7 +354,8 @@ def trait_ab(dtype,
                            scope,
                            dma=dma,
                            buffers=buffers,
-                           key_order=key_order),
+                           key_order=key_order,
+                           swizzle=swizzle),
                       mfma=mfma)
 
 
@@ -384,7 +403,7 @@ def resident_packs(t, rsrc, row, row_stride, lh, hdim, masks=None):
     `masks` (from `a_col_masks`) are used when given, else built per read."""
     elem = elem_type(t.dtype)
     packs = []
-    if t.mfma == '16x16x16':
+    if t.mfma == '16x16x16' and t.a.dma == 'xor':
         # k-step 2s+e reads columns 32s + 8*lh + 4e + [0, 4); lh is the lane's 4-key group.
         for s in range_constexpr(t.reads):
             c0 = fx.Index(32 * s) + lh * 8
@@ -394,11 +413,12 @@ def resident_packs(t, rsrc, row, row_stride, lh, hdim, masks=None):
             packs.append(Vec(v8).shuffle(Vec(v8), [0, 1, 2, 3]).ir_value())
             packs.append(Vec(v8).shuffle(Vec(v8), [4, 5, 6, 7]).ir_value())
         return packs
+    step = 8 * t.lane_groups            # columns a read covers over the lane groups
     for s in range_constexpr(t.reads):
-        off = row * row_stride + fx.Index(16 * s) + lh * 8
+        off = row * row_stride + fx.Index(step * s) + lh * 8
         v8 = buffer_ops.buffer_load(rsrc, off, vec_width=8, dtype=elem)
-        if 16 * s + 16 > t.a.pad_floor:
-            mask = masks[s] if masks else col_mask(fx.Int32(16 * s) + fx.Int32(lh * 8), hdim)
+        if step * s + step > t.a.pad_floor:
+            mask = masks[s] if masks else col_mask(fx.Int32(step * s) + fx.Int32(lh * 8), hdim)
             v8 = Vec(Vec(v8).bitcast(fx.Int32) & mask).bitcast(elem).ir_value()
         packs.append(Vec(v8).shuffle(Vec(v8), [0, 1, 2, 3]).ir_value())
         packs.append(Vec(v8).shuffle(Vec(v8), [4, 5, 6, 7]).ir_value())
@@ -544,9 +564,29 @@ def gemm_fix(t, plan, lds, scopes, buf):
 
 # ---------------------------------------------------------------- PermA phases
 
-def gemm_load_plan(t, tid, row_stride_b):
-    """Per-thread (global voffsets, LDS write offsets). Threads past the last unit redo one."""
+def gemm_load_plan(t, tid, row_stride_b, also=()):
+    """Per-thread (global voffsets, LDS write offsets). Threads past the last unit redo one.
+    'stage' `RowA`: (voffset, tile-relative write offset, the unit's 8-column index).
+    `also` ('stage'): (traits, row stride or None) of GEMMs on the same load unit, a
+    `RowA` sharing the layout or a K^T `PermA` (unit_cols 8) written from the same
+    registers; returns one plan per GEMM."""
     a = t.a
+    if isinstance(a, RowA):
+        units = a.rows // 4
+        u = tid % a.units
+        g = u % units
+        c8 = u // units
+        gemms = ((t, row_stride_b),) + tuple(also)
+        voffs = [None if s is None else fx.Int32(g * 4) * s + fx.Int32(c8 * 16) for _, s in gemms]
+        div, mod = a.swizzle
+        rm_wr = fx.Index(g * 4 * a.stride) + (c8 ^ (((g * 4) // div) % mod)) * 16
+        plans = []
+        for (o, _), voff in zip(gemms, voffs):
+            if isinstance(o.a, RowA):
+                plans.append((voff, rm_wr, c8))
+            else:
+                plans.append((voff, fx.Index(o.a.lds_base) + (c8 * 8 * o.a.stride + g * 4) * 2))
+        return tuple(plans) if also else plans[0]
     if a.layout == 'chunks':
         # Unit = 4 keys x 2 columns -> one 16 B chunk. Affine: one base serves every unit.
         base = []
@@ -583,6 +623,14 @@ def gemm_load_plan(t, tid, row_stride_b):
 def gemm_load(t, plan, rsrc_raw, row_start, row_stride_b):
     """Global -> VGPRs, rows from `row_start`."""
     a = t.a
+    if isinstance(a, RowA) or a.unit_cols == 8:
+        # 4 rows x 8 columns: four dwordx4.
+        out = []
+        for r in range_constexpr(4):
+            soff = (fx.Int32(row_start) + fx.Int32(r)) * row_stride_b
+            w4 = Vec(rocdl.raw_ptr_buffer_load(Vec.make_type(4, fx.Int32), rsrc_raw, plan[0], soff, 0))
+            out.extend(w4[i] for i in range(4))
+        return out
     if a.layout == 'chunks':
         g_step = a.threads // (a.cols // 2)     # key groups between a thread's units
         out = []
@@ -607,9 +655,27 @@ def gemm_load(t, plan, rsrc_raw, row_start, row_stride_b):
     return [fx.Int32(rocdl.raw_ptr_buffer_load(fx.Int32.ir_type, rsrc_raw, off, soff, 0)) for off in plan[0]]
 
 
+def unit_masks(t, plan, hdim):
+    """'stage' unit: dword masks keeping its 8 columns below `hdim`."""
+    return col_mask_words(fx.Int32(plan[2] * 8), hdim)
+
+
+def unit_clean(regs, masks):
+    """A loaded unit with its slack columns zeroed (0 * NaN is NaN)."""
+    return [fx.Int32(regs[i]) & masks[i % 4] for i in range(16)]
+
+
 def gemm_stage(t, plan, lds, scopes, regs, buf):
-    """VGPRs -> A^T in LDS buffer `buf`: each unit's 4x2 blocks transposed by v_perm."""
+    """VGPRs -> LDS buffer `buf`: 'stage' `RowA` rows as loaded; `PermA` A^T, each
+    unit's 4x2 blocks transposed by v_perm."""
     a = t.a
+    if isinstance(a, RowA):
+        for r in range_constexpr(4):
+            lds.store(plan[1] + a.lds_base + r * a.stride,
+                      Vec.from_elements(regs[4 * r:4 * r + 4], fx.Int32),
+                      16,
+                      a.scope_of(buf))
+        return
     if a.layout == 'chunks':
         g_step = a.threads // (a.cols // 2)
         sel_lo = fx.Int32(0x05040100)
@@ -671,6 +737,11 @@ def gemm_read_plan(t, lm, lh, lane=None):
     if isinstance(a, DerivedA):
         # LDS row 8s + 4lh + j, column d0 + g*lm + dt: one base per group width g.
         return {g: lh * (4 * a.stride) + lm * (2 * g) for g in {g for _, g, _ in a.groups}}
+    if isinstance(a, RowA) and a.dma == 'stage':
+        # Row lm, chunk lh ^ key; read s adds s * lane_groups chunks. Tile-relative.
+        div, mod = a.swizzle
+        sw = (lm // div) % mod
+        return lm * a.stride + (lh ^ sw) * 16
     if isinstance(a, RowA) and a.dma == 'xor':
         # Read t: row lm, chunk 4t + lh, at chunk (4t + lh) ^ (lm % 8); bases alternate by t % 2.
         return [_opaque(fx.Index(a.lds_base) + lm * a.row_bytes + ((fx.Index(4 * e) + lh) ^ (lm % 8)) * 16)
@@ -689,6 +760,9 @@ def gemm_read(t, plan, lds, buf, masks=None):
     a = t.a
     elem = elem_type(t.dtype)
     scope = a.scope_of(buf)
+    if isinstance(a, RowA) and a.dma == 'stage':
+        v8 = Vec.make_type(8, elem)
+        return [[lds.load(plan + a.lds_base + s * t.lane_groups * 16, v8, 16, scope) for s in range(t.reads)]]
     if isinstance(a, RowA) and masks:
         v8 = Vec.make_type(8, elem)
         out = []
@@ -707,27 +781,36 @@ def gemm_read(t, plan, lds, buf, masks=None):
                 for o in range(t.out_tiles)]
     v4 = Vec.make_type(4, elem)
     base = plan if a.buffers == 1 else plan + buf * a.tile_bytes
-    return [[lds.load(base + (32 * o * a.stride + 8 * s) * 2, v4, 8, scope) for s in range(t.reads)]
+    k = 4 * t.lane_groups
+    return [[lds.load(base + (t.m * o * a.stride + k * s) * 2, v4, 8, scope) for s in range(t.reads)]
             for o in range(t.out_tiles)]
 
 
-def gemm_mma(t, a_reads, b_packs, accs=None, a_masks=None):
-    """acc[o] += A[o] . B over all k-steps, output tile outer. `accs` None starts
-    each tile from zero; `a_masks` (from `a_col_masks`) zero A's slack columns."""
+def gemm_mma(t, a_reads, b_packs, accs=None, a_masks=None, order='a_outer'):
+    """acc[o] += A[o] . B over all k-steps. `accs` None starts each tile from zero;
+    `a_masks` (from `a_col_masks`) zero A's slack columns. `order`: 'a_outer'
+    (output tile outer) or 'b_outer' (k-step outer: each B pack meets every tile)."""
     elem = elem_type(t.dtype)
+    mfma = mfma_32x32x8 if t.mfma == '32x32x8' else mfma_16x16x16
     if a_masks:
         a_reads = [[Vec(Vec(r).bitcast(fx.Int32) & a_masks[s]).bitcast(elem).ir_value() if s in a_masks else r
                     for s, r in enumerate(row)] for row in a_reads]
+    if order == 'b_outer':
+        out = list(accs)
+        for s in range_constexpr(t.reads):
+            for o in range_constexpr(t.out_tiles):
+                out[o] = mfma(a_reads[o][s], b_packs[s], out[o], elem)
+        return out
     out = [] if accs is None else list(accs)
     for o in range_constexpr(t.out_tiles):
-        acc = fx.full(16, 0.0, fx.Float32) if accs is None else out[o]
+        acc = fx.full(t.acc, 0.0, fx.Float32) if accs is None else out[o]
         for s in range_constexpr(t.reads):
             if t.split == 2:
                 a8 = Vec(a_reads[o][s])
-                acc = mfma_32x32x8(a8.shuffle(a8, [0, 1, 2, 3]).ir_value(), b_packs[2 * s], acc, elem)
-                acc = mfma_32x32x8(a8.shuffle(a8, [4, 5, 6, 7]).ir_value(), b_packs[2 * s + 1], acc, elem)
+                acc = mfma(a8.shuffle(a8, [0, 1, 2, 3]).ir_value(), b_packs[2 * s], acc, elem)
+                acc = mfma(a8.shuffle(a8, [4, 5, 6, 7]).ir_value(), b_packs[2 * s + 1], acc, elem)
             else:
-                acc = mfma_32x32x8(a_reads[o][s], b_packs[s], acc, elem)
+                acc = mfma(a_reads[o][s], b_packs[s], acc, elem)
         if accs is None:
             out.append(acc)
         else:
@@ -866,7 +949,11 @@ class Ctx:
         """Run `iteration(j, buf, masked)` over [0, n_loop): masked tiles on both
         sides of [j_clean, j_clean_end), the clean ones unrolled by `buffers` so
         `buf` (j % buffers) is a constant; `j_clean` is a multiple of `buffers`.
-        The masked tail starts at `tail_start`, or where the unrolled loop ends."""
+        The masked tail starts at `tail_start`, or where the unrolled loop ends.
+        One buffer: three plain loops, `buf` 0."""
+        if buffers == 1:
+            self.restore(run_tiles_single(self, iteration, j_clean, j_clean_end, n_loop))
+            return
         self.restore(run_tiles(self, iteration, j_clean, j_clean_end, n_loop, buffers, tail_start))
 
     def tile_pairs(self, iteration, j_clean, j_clean_end, n_iter):
@@ -927,6 +1014,21 @@ def run_tiles(ctx, iteration, j_clean, j_clean_end, n_loop, buffers, tail_start)
     results2 = results1
     for j, carried in range(tail, n_loop, 1, init=results1):
         results2 = yield _masked_step(ctx, iteration, j, carried, 0, buffers)
+    return _as_list(results2)
+
+
+@flyc.jit
+def run_tiles_single(ctx, iteration, j_clean, j_clean_end, n_loop):
+    init = ctx.carry()
+    results0 = init
+    for j, carried in range(fx.Index(0), j_clean, 1, init=init):
+        results0 = yield _step(ctx, iteration, j, carried, 0, True)
+    results1 = results0
+    for j, carried in range(j_clean, j_clean_end, 1, init=results0):
+        results1 = yield _step(ctx, iteration, j, carried, 0, False)
+    results2 = results1
+    for j, carried in range(j_clean_end, n_loop, 1, init=results1):
+        results2 = yield _step(ctx, iteration, j, carried, 0, True)
     return _as_list(results2)
 
 

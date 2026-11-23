@@ -24,6 +24,7 @@ the bodies differ there.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import math as fmath
 from flydsl.expr import rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as raw
@@ -274,10 +275,39 @@ def pair_op(xs, c, op):
     return out
 
 
+def _p_fma(ctx, s_raw, kv_start, masked, bias_vals):
+    """P_EXP_FMA: per value; with bias, pairs of (S*c + bias*log2e) - lse2."""
+    ns = ctx.qk.ns
+    acc = ctx.qk.acc
+    if ctx.traits.bias:
+        # Upcast first: log2(e) in the input dtype would differ from the forward's.
+        c2 = fx.full(2, fx.Float32(ctx.c_scale), fx.Float32)
+        e2 = fx.full(2, fx.Float32(LOG2E), fx.Float32)
+        l2 = fx.full(2, fx.Float32(ctx.lse2), fx.Float32)
+        s_vals = []
+        for i in range(ns // 2):
+            sv = Vec.from_elements([Vec(s_raw[(2 * i + e) // acc])[(2 * i + e) % acc] for e in range(2)], fx.Float32)
+            bv = Vec.from_elements([fx.Float32(Vec(bias_vals[i // 2])[2 * (i % 2) + e].to(fx.Float32))
+                                    for e in range(2)], fx.Float32)
+            v2 = (sv * c2 + bv * e2) - l2
+            s_vals.extend([v2[0], v2[1]])
+    else:
+        # One fma: the exponent of S*scale - lse2, rounded once.
+        s_vals = [fx.Float32(fmath.fma(Vec(s_raw[r // acc])[r % acc], ctx.c_scale, ctx.neg_lse2)) for r in range(ns)]
+    if masked:
+        # After the scale (numerical lessons, #7); -inf - lse2 is -inf.
+        band_lo, band_span = ctx.band()
+        rel0 = fx.Int32(kv_start) + ctx.lane_key() - band_lo
+        s_vals = mask_band(s_vals, rel0, ctx.qk.coords, band_span, ctx.c_neg_inf)
+    return [exp2(s_vals[r]) for r in range(ns)]
+
+
 def p_from_lse(ctx, s_raw, kv_start, masked, bias_vals, exponent=P_EXP_TWO_ROUNDINGS):
-    """P = exp2(sm_scale*log2e*S + log2e*bias - lse2), one f32 vector per S^T tile."""
-    if exponent != P_EXP_TWO_ROUNDINGS:
-        raise NotImplementedError(exponent)
+    """P = exp2(sm_scale*log2e*S + log2e*bias - lse2): one f32 vector per S^T tile
+    (P_EXP_TWO_ROUNDINGS, v_pk pairs), or one value per S^T value (P_EXP_FMA, which
+    also needs ctx.neg_lse2)."""
+    if exponent == P_EXP_FMA:
+        return _p_fma(ctx, s_raw, kv_start, masked, bias_vals)
     ns = ctx.qk.ns
     acc = ctx.qk.acc
     # Scale once in fp32, as the forward: P must be the forward's P bit for bit.
@@ -312,14 +342,20 @@ def keep_scale(ctx, kv_start):
     return out
 
 
-def ds_packs(ctx, p_vals, dp_raw, keep):
-    """dS = P * (dP - Delta), packed as the next GEMM's B operand. Dropout's mask and
-    1/(1-p) hit dP; P stays undropped (numerical lessons, #9)."""
+def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
+    """dS = P * (dP - Delta), packed as the next GEMM's B operand: in v_pk pairs
+    after P_EXP_TWO_ROUNDINGS, per value after P_EXP_FMA (`p_vals` as p_from_lse
+    returned them). Dropout's mask and 1/(1-p) hit dP; P stays undropped
+    (numerical lessons, #9)."""
     ns = ctx.qk.ns
     acc = ctx.qk.acc
     dp = [fx.Float32(Vec(dp_raw[r // acc])[r % acc]) for r in range(ns)]
     if ctx.traits.dropout:
         dp = [dp[r] * keep[r] for r in range(ns)]
+    if exponent == P_EXP_FMA:
+        ds = [p_vals[r] * (dp[r] - ctx.delta) for r in range(ns)]
+        elem = flex_gemm.elem_type(ctx.traits.dtype)
+        return [pack_operand(ds[4 * i:4 * i + 4], elem) for i in range(ns // 4)]
     dpd = pair_op(dp, ctx.delta, lambda x, c: x - c)
     ds = []
     for i in range(ns // 2):

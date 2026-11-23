@@ -26,7 +26,8 @@ def store_acc(t,
               row_ok,
               elem,
               pad_floor,
-              scale=None):
+              scale=None,
+              offset_first=True):
     """Store accumulator tiles `accs` of GEMM `t` (acc^T: columns = the GEMM's output rows).
 
     32x32x8: value group g of tile o holds columns t.group_coords[g] + 4*lh +
@@ -34,12 +35,13 @@ def store_acc(t,
     hold columns 32p + 8*lh + 2i + e, so a lane stores 8 consecutive columns per
     pair; `lh` may be a function, called after the scale vector is built.
     `scale` (f32) multiplies each tile first; columns at or past `col_limit`
-    are masked only where a padded build can reach them.
+    are masked only where a padded build can reach them. `offset_first` builds a
+    store's address before its mask (the order only moves instructions).
     """
     if isinstance(t.a, flex_gemm.DerivedA):
         _store_derived(t, accs, rsrc, row, row_stride, lh, col_limit, row_ok, elem, pad_floor, scale)
         return
-    if t.mfma == '16x16x16':
+    if t.mfma == '16x16x16' and t.a.layout == 'chunks':
         scale_v = fx.full(4, fx.Float32(scale), fx.Float32)
         lane_g = lh() if callable(lh) else lh
         for p in range_constexpr(t.reads):
@@ -55,19 +57,24 @@ def store_acc(t,
                 ok = ok & (fx.Int32(d) < col_limit)
             buffer_ops.buffer_store(packed.ir_value(), rsrc, row * row_stride + d, mask=ok)
         return
+    # Value group i of tile o: columns m*o + 4*lane_groups*i + 4*lh + [0, 4).
+    span = 4 * t.lane_groups
     for o in range_constexpr(t.out_tiles):
         acc = Vec(accs[o])
         if const_expr(scale is not None):
-            acc = acc * fx.full(16, fx.Float32(scale), fx.Float32)
-        for i in range_constexpr(4):
+            acc = acc * fx.full(t.acc, fx.Float32(scale), fx.Float32)
+        for i in range_constexpr(t.acc // 4):
             vals = [acc[4 * i + j] for j in range(4)]
             packed = Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem)
-            col0 = t.group_coords[4 * o + i]
+            col0 = t.m * o + span * i
             d = fx.Index(col0) + lh * 4
-            off = row * row_stride + d
+            if const_expr(offset_first):
+                off = row * row_stride + d
             ok = row_ok
-            if const_expr(col0 + 8 > pad_floor):
+            if const_expr(col0 + span > pad_floor):
                 ok = ok & (fx.Int32(d) < col_limit)
+            if const_expr(not offset_first):
+                off = row * row_stride + d
             buffer_ops.buffer_store(packed.ir_value(), rsrc, off, mask=ok)
 
 
