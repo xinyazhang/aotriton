@@ -3,7 +3,7 @@
 
 """TFLOPS of a dQ body on flex_gemm against the original, timed interleaved (the
 power cap makes back-to-back runs of one kernel unfair to the other): narrow
-dq_flex.py vs dq.py. TFLOPS count dQ's own work, S, dP and dQ: 3 * 2 * B * H * pairs * D.
+dq_flex.py vs dq.py, wide dq_wide_flex.py vs dq_wide.py. TFLOPS count dQ's own work, S, dP and dQ: 3 * 2 * B * H * pairs * D.
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<FlyDSL tree> python bench_bwd_dq_flex.py \\
         --body narrow --head_dim 128 --seqlen 8192 --causal --reps 10
@@ -25,7 +25,9 @@ import torch  # noqa: E402
 
 # body -> (original module, builder), (flex module, builder)
 BODIES = {'narrow': (('gfx942.dq', 'build_fmha_bwd_dq_gfx942'),
-                     ('gfx942.dq_flex', 'build_fmha_bwd_dq_gfx942_flex'))}
+                     ('gfx942.dq_flex', 'build_fmha_bwd_dq_gfx942_flex')),
+          'wide': (('gfx942.dq_wide', 'build_fmha_bwd_dq_gfx942_wide'),
+                   ('gfx942.dq_wide_flex', 'build_fmha_bwd_dq_gfx942_wide_flex'))}
 
 
 def main():

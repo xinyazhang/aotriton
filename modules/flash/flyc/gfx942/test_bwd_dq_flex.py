@@ -2,7 +2,8 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""The dQ bodies on flex_gemm against the originals: dq_flex.py vs dq.py (narrow).
+"""The dQ bodies on flex_gemm against the originals: dq_flex.py vs dq.py (narrow)
+and dq_wide_flex.py vs dq_wide.py (wide).
 dQ and dB must be bit-identical for every feature build, including windows,
 varlen, GQA, NaN slack in padded heads and rows that see no key.
 
@@ -21,8 +22,11 @@ from .jit_common import np, pytestmark, torch, with_nan_slack  # noqa: F401
 import fmha_utils as abi  # noqa: E402
 
 # body -> head dims; the narrow body's dQ groups differ at each (1, 2, 2+1, 4 columns).
-HEAD_DIMS = {'narrow': (32, 64, 96, 128)}
-BUILDERS = {'narrow': (('dq', 'build_fmha_bwd_dq_gfx942'), ('dq_flex', 'build_fmha_bwd_dq_gfx942_flex'))}
+# The wide body: 32x32x8 at 160/256, 16x16x16 at 384/512.
+HEAD_DIMS = {'narrow': (32, 64, 96, 128), 'wide': (160, 256, 384, 512)}
+BUILDERS = {'narrow': (('dq', 'build_fmha_bwd_dq_gfx942'), ('dq_flex', 'build_fmha_bwd_dq_gfx942_flex')),
+            'wide': (('dq_wide', 'build_fmha_bwd_dq_gfx942_wide'),
+                     ('dq_wide_flex', 'build_fmha_bwd_dq_gfx942_wide_flex'))}
 CASES = [(body, d) for body, dims in HEAD_DIMS.items() for d in dims]
 
 
