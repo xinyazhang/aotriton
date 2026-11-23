@@ -56,7 +56,6 @@ from .utils import (
     philox_stream,
     row_band,
     rsrc_for,
-    sched_spread,
     smax,
     smin,
 )
@@ -213,9 +212,11 @@ def build_fmha_bwd_dq_gfx942_wide_flex(head_dim,
     g_lanes = WAVE // wm                # lane groups: lane = group * WAVE_M + row
     ns = qk.ns                          # S^T values per lane
 
-    # Per-tile op counts for sched_spread: A(j) runs S^T and dP^T, B(j) dQ^T.
+    # A(j) spreads its LDS reads and Philox VALU over the S^T and dP^T MFMAs.
     a_mfma = qk.n_mma + vdo.n_mma
-    a_reads = qk.n_reads + vdo.n_reads
+    a_ops = flex_gemm.ClusterOps(rd=qk.n_reads + vdo.n_reads,
+                                 valu=tr.philox_a if dropout else 0,
+                                 lead=tr.lead_a)
 
     @fx.struct
     class Smem:
@@ -567,6 +568,16 @@ def build_fmha_bwd_dq_gfx942_wide_flex(head_dim,
                         else:
                             db_store_scalar(packs, base, kv_start)
 
+            # ---- cluster ends: LDS reads land before the next cluster overwrites them
+            # (s_barrier does not wait for them).
+            def a_end():
+                rocdl.s_waitcnt(lgkmcnt=0)
+                cluster_barrier('A')
+
+            def b_end():
+                rocdl.s_waitcnt(lgkmcnt=0)
+                cluster_barrier('B')
+
             # ---- the tile loop: S, dP, Philox in A(j); dS, dB, dQ in B(j)
             # One buffer each: K(j+1) and V(j+2) wait in VGPRs until their buffer is free.
             def iteration(j, b, masked):
@@ -583,9 +594,8 @@ def build_fmha_bwd_dq_gfx942_wide_flex(head_dim,
                 s = gemm_mma(qk, gemm_read(qk, rd_plan, ctx.lds, 0), ctx.q_packs)               # S(j)
                 dp = gemm_mma(vdo, gemm_read(vdo, rd_plan, ctx.lds, 0), ctx.do_packs)           # dP(j)
                 keep = softmax.keep_scale(ctx, kv_cur) if const_expr(dropout) else None         # under the MFMAs
-                sched_spread(a_mfma, a_reads, 0, 0, tr.philox_a if dropout else 0, lead=tr.lead_a)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                cluster_barrier('A')
+                flex_gemm.spread(a_mfma, a_ops)
+                a_end()
                 # B(j): V(j+1) row-major, then V(j+2) into its registers; dS(j);
                 # dQ^T += K^T(j) dS^T(j); K(j+1) row-major last.
                 gemm_stage(vdo, v_plan, ctx.lds, scopes, v_clean(ctx.v_regs), 0)                 # V(j+1)
@@ -601,8 +611,7 @@ def build_fmha_bwd_dq_gfx942_wide_flex(head_dim,
                 rocdl.sched_barrier(0)
                 ctx.k_regs = k_clean(ctx.k_regs)
                 gemm_stage(qk, k_plan, ctx.lds, scopes, ctx.k_regs, 0)                           # K(j+1)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                cluster_barrier('B')
+                b_end()
                 ctx.b_raws = b_next
 
             # Prologue: K, V (tile 0) row-major; K^T(0) is written by A(0); V(1) in flight.

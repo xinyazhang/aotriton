@@ -68,6 +68,7 @@ from .utils import (
     mfma_16x16x16,
     mfma_32x32x8,
     pipelined,
+    sched_spread,
     set_alias_scopes,
 )
 
@@ -897,6 +898,28 @@ def gemm_stream(t, plan, lds, buf, b, accs=None, ahead=2):
 
 
 # ---------------------------------------------------------------- Ctx
+
+@dataclass(frozen=True)
+class ClusterOps:
+    """Non-MFMA ops one cluster issues, for `spread`: LDS reads (`lead` of them
+    before the first MFMA), LDS writes, VMEM loads and VALU."""
+    rd: int = 0
+    wr: int = 0
+    vmem: int = 0
+    valu: int = 0
+    lead: int = 0
+
+
+def spread(n_mfma, ops, valu_per_mfma=None):
+    """Spread a cluster's `ops` over its `n_mfma` MFMAs (utils.sched_spread)."""
+    sched_spread(n_mfma,
+                 ops.rd,
+                 ops.wr,
+                 ops.vmem,
+                 ops.valu,
+                 valu_per_mfma=valu_per_mfma,
+                 lead=ops.lead)
+
 
 class Ctx:
     """One kernel's trace-time state: frozen traits, plus the run-time values its

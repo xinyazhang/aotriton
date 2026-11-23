@@ -48,7 +48,6 @@ from .utils import (
     pin_values,
     row_band,
     rsrc_for,
-    sched_spread,
     smax,
     smin,
 )
@@ -56,16 +55,6 @@ from .utils import (
 _LDS_DOMAIN = '#llvm.alias_scope_domain<id = "fmha_fwd_gfx942_wide.lds">'
 LDS_SCOPES = ('k0', 'k1', 'vt')
 WAVE_M = 32         # query rows per wave: the N of the 32x32x8 MFMA
-
-
-@dataclass(frozen=True)
-class ClusterOps:
-    """Non-MFMA ops one cluster issues, for `sched_spread`: LDS reads (`lead` of
-    them before the first MFMA), LDS writes and VMEM loads."""
-    rd: int
-    wr: int
-    vmem: int
-    lead: int
 
 
 @dataclass(frozen=True)
@@ -204,23 +193,17 @@ def build_fmha_fwd_gfx942_wide_flex(head_dim,
 
     # What x_loads / y_loads issue per cluster: an early K or V^T moves its work
     # from the cluster of its MFMAs to the other one.
-    x_ops = ClusterOps(rd=(n_vt if vt_early else 0) + (0 if k_early else n_k),
+    x_ops = flex_gemm.ClusterOps(rd=(n_vt if vt_early else 0) + (0 if k_early else n_k),
                        wr=0 if vt_early else n_vst,
                        vmem=(n_kdma if k_early else 0) + (0 if vt_early else n_v),
                        lead=0 if k_early else tr.vt_lead)
-    y_ops = ClusterOps(rd=(n_k if k_early else 0) + (0 if vt_early else n_vt),
+    y_ops = flex_gemm.ClusterOps(rd=(n_k if k_early else 0) + (0 if vt_early else n_vt),
                        wr=n_vst if vt_early else 0,
                        vmem=(n_v if vt_early else 0) + (0 if k_early else n_kdma),
                        lead=0 if vt_early else tr.vt_lead)
 
     def spread(n_mfma, ops):
-        """Spread a cluster's loads and stores over its `n_mfma` MFMAs."""
-        sched_spread(n_mfma,
-                     ops.rd,
-                     ops.wr,
-                     ops.vmem,
-                     valu_per_mfma=tr.valu_per_mfma,
-                     lead=ops.lead)
+        flex_gemm.spread(n_mfma, ops, valu_per_mfma=tr.valu_per_mfma)
 
     @flyc.kernel(known_block_size=[tr.block_size, 1, 1])
     def fmha_fwd_gfx942_kernel(
