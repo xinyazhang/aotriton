@@ -4,7 +4,8 @@
 
 """The dK/dV bodies on flex_gemm against the originals: dkdv<body>_flex.py vs
 dkdv<body>.py. dK and dV must be bit-identical for every feature build, including
-windows, varlen, GQA, NaN slack in padded heads and keys no query sees.
+windows, varlen, GQA, NaN slack in padded heads and keys no query sees; and both
+must write every element they own (dK = dV = 0 on keys no query sees).
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<flydsl-checkout> \\
         python -m pytest modules/flash/flyc/gfx942/test_bwd_dkdv_flex.py
@@ -16,7 +17,7 @@ import math
 
 import pytest
 
-from .jit_common import np, pytestmark, torch, with_nan_slack  # noqa: F401
+from .jit_common import assert_written, np, pytestmark, torch, with_nan_slack  # noqa: F401
 
 import fmha_utils as abi  # noqa: E402
 
@@ -51,6 +52,7 @@ def _run_both(key, args, dk, dv, kwargs):
         dv.fill_(float('nan'))
         _build(variant, *key)(*args, **kwargs)
         torch.cuda.synchronize()
+        assert_written(f'{variant} body', dK=dk, dV=dv)
         got.append((dk.clone(), dv.clone()))
     return got
 
@@ -71,22 +73,27 @@ def _rows(n_rows, sq, sk):
 
 # Window cases: causal_type 1/2 (top-left/bottom-right causal), 3 with an explicit window.
 WINDOWS = ((0, None), (1, None), (2, None), (3, (100, 37)), (3, (0, 0)))
-SHAPE = (333, 517)
+# Sq < Sk: top-left causal and small windows leave keys no query sees; Sq > Sk:
+# bottom-right causal leaves rows that see no key.
+SHAPES = ((333, 517), (517, 333))
 
 
+@pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("dtype", ("bf16", "f16"))
 @pytest.mark.parametrize("padded", (False, True))
 @pytest.mark.parametrize("dropout", (False, True))
 @pytest.mark.parametrize("bias", (False, True))
 @pytest.mark.parametrize("window", WINDOWS)
 @pytest.mark.parametrize("body,head_dim", CASES)
-def test_dense(body, head_dim, window, bias, dropout, padded, dtype):
+def test_dense(body, head_dim, window, bias, dropout, padded, dtype, shape):
     causal_type, win = window
     if bias and causal_type:
         pytest.skip("bias and causal are mutually exclusive")
+    if shape != SHAPES[0] and (not causal_type or dtype != 'bf16'):
+        pytest.skip("Sq > Sk only matters to masked rows")
     dt = torch.bfloat16 if dtype == 'bf16' else torch.float16
     b, h, hk = 2, 4, 2
-    sq, sk = SHAPE
+    sq, sk = shape
     d = head_dim - 5 if padded else head_dim     # NaN in the slack up to ceil8(d)
     torch.manual_seed(head_dim + causal_type)
     if padded:

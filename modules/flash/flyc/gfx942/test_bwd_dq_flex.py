@@ -5,7 +5,8 @@
 """The dQ bodies on flex_gemm against the originals: dq_flex.py vs dq.py (narrow)
 and dq_wide_flex.py vs dq_wide.py (wide).
 dQ and dB must be bit-identical for every feature build, including windows,
-varlen, GQA, NaN slack in padded heads and rows that see no key.
+varlen, GQA, NaN slack in padded heads and rows that see no key; and both must
+write every element they own (dQ = 0 on rows that see no key).
 
     AOTRITON_FLYDSL_KERNEL_ROOT=<flydsl-checkout> \\
         python -m pytest modules/flash/flyc/gfx942/test_bwd_dq_flex.py
@@ -17,7 +18,7 @@ import math
 
 import pytest
 
-from .jit_common import np, pytestmark, torch, with_nan_slack  # noqa: F401
+from .jit_common import assert_written, np, pytestmark, torch, with_nan_slack  # noqa: F401
 
 import fmha_utils as abi  # noqa: E402
 
@@ -45,8 +46,9 @@ def _build(variant, body, head_dim, causal_type, bias, dropout, padded_head, dty
                                    dtype_str=dtype_str)
 
 
-def _run_both(key, args, dq, dbias, kwargs):
-    """Run old and new on the same inputs; return their (dQ, dB)."""
+def _run_both(key, args, dq, dbias, kwargs, db_owned=None):
+    """Run old and new on the same inputs; return their (dQ, dB). `db_owned` lists
+    the (row slice, column slice) blocks of dB a varlen launch owns."""
     got = []
     for variant in ('old', 'new'):
         dq.fill_(float('nan'))
@@ -54,6 +56,10 @@ def _run_both(key, args, dq, dbias, kwargs):
             dbias.fill_(float('nan'))
         _build(variant, *key)(*args, **kwargs)
         torch.cuda.synchronize()
+        assert_written(f'{variant} body', dQ=dq)
+        if dbias is not None:
+            for rows, cols in db_owned or [(slice(None), slice(None))]:
+                assert_written(f'{variant} body', dB=dbias[..., rows, cols])
         got.append((dq.clone(), None if dbias is None else dbias.clone()))
     return got
 
@@ -76,7 +82,8 @@ def _rows(n_rows, sq, sk):
 # Window cases: causal_type 1/2 (top-left/bottom-right causal), 3 with an explicit window.
 WINDOWS = ((0, None), (1, None), (2, None), (3, (100, 37)), (3, (0, 0)))
 # Odd Sk: bias and dB rows start mid-dword; even Sk: clean dB tiles store dwords.
-SHAPES = ((333, 517), (300, 520))
+# Sq > Sk: under causal masks some rows see no key.
+SHAPES = ((333, 517), (300, 520), (517, 333))
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -90,8 +97,10 @@ def test_dense(body, head_dim, window, bias, dropout, padded, dtype, shape):
     causal_type, win = window
     if bias and causal_type:
         pytest.skip("bias and causal are mutually exclusive")
-    if shape != SHAPES[0] and not bias:
+    if shape == SHAPES[1] and not bias:
         pytest.skip("the even pitch only matters to dB")
+    if shape == SHAPES[2] and (not causal_type or dtype != 'bf16'):
+        pytest.skip("Sq > Sk only matters to masked rows")
     dt = torch.bfloat16 if dtype == 'bf16' else torch.float16
     b, h, hk = 2, 4, 2
     sq, sk = shape
@@ -154,4 +163,5 @@ def test_varlen(body, head_dim, causal_type, bias):
         dbias = torch.empty(1, h, tq, tk, device='cuda', dtype=torch.bfloat16)
         kwargs['dbias'] = dbias
     key = (body, head_dim, causal_type, bias, False, False, 'bf16')
-    _assert_same(_run_both(key, (q, k, v, do, dq, lse, delta, 1, max(lq)), dq, dbias, kwargs))
+    owned = [(slice(int(cu_q[i]), int(cu_q[i + 1])), slice(int(cu_k[i]), int(cu_k[i + 1]))) for i in range(len(SEQS))]
+    _assert_same(_run_both(key, (q, k, v, do, dq, lse, delta, 1, max(lq)), dq, dbias, kwargs, owned))

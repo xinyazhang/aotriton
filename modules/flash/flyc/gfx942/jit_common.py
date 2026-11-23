@@ -59,6 +59,14 @@ def philox_4x32_10(seed, offsets):
     return np.stack([c.astype(np.uint32).view(np.int32) for c in (c0, c1, c2, c3)], -1)
 
 
+def assert_written(tag, **outs):
+    """Every element a kernel owns is written: outputs start NaN-filled, so a NaN
+    left here (outside the slack columns, which the views exclude) is a skipped write."""
+    for name, t in outs.items():
+        n = int(torch.isnan(t).sum())
+        assert n == 0, f"{tag}: {name} keeps {n} NaN (unwritten elements)"
+
+
 def with_nan_slack(*shape, dt=torch.bfloat16):
     """A (..., hdim) view of a (..., ceil8(hdim)) tensor whose slack is NaN: the 8xD contract."""
     *lead, d = shape
