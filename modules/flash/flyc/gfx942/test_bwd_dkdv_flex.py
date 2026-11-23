@@ -123,6 +123,32 @@ def test_dense(body, head_dim, window, bias, dropout, padded, dtype, shape):
     _assert_same(_run_both(key, (q, k, v, do, dk, dv, lse, delta, b, sq), dk, dv, kwargs))
 
 
+# principal_diagonal_choice (VarlenBits bit 18): with d = seqlen_k - seqlen_q per
+# sequence and p the bit, a numeric bound becomes L = wl - p*d, R = wr + p*d;
+# sentinels are not shifted. The windows put L below 0, R past seqlen_k, a band off
+# the diagonal and bands that miss every key of some rows (tests/
+# test_bwd_dq_principal_diagonal.py); the shapes are decode, chunked prefill,
+# square and Sq > Sk, dense and mixed in one varlen batch.
+PD_WINDOWS = ((abi.WINDOW_BOTRIGHT, 0), (8, 0), (0, 8), (4, 4), (-1, 3))
+PD_SHAPES = ((1, 200), (48, 200), (150, 150), (200, 70), 'varlen')
+PD_SEQS = ((1, 130), (37, 160), (96, 96), (150, 40), (20, 3))
+PD_BITS = (abi.VARLEN_PRINCIPAL_DIAGONAL_TOP_LEFT, abi.VARLEN_PRINCIPAL_DIAGONAL_BOTTOM_RIGHT)
+
+
+def _pd_varlen(shape, p_bit):
+    """(batch, lq, lk, varlen dict, cu_q, cu_k) of a principal-diagonal case."""
+    if shape == 'varlen':
+        lq = [a for a, _ in PD_SEQS]
+        lk = [b for _, b in PD_SEQS]
+        cu_q = torch.tensor([0] + list(np.cumsum(lq)), device='cuda', dtype=torch.int32)
+        cu_k = torch.tensor([0] + list(np.cumsum(lk)), device='cuda', dtype=torch.int32)
+        varlen = abi.varlen_compact(cu_q, cu_k, max(lq), max(lk), lse_tokens=sum(lq), lse_layout=abi.VARLEN_LSE_LAYOUT_HT)
+        varlen['bits'] = abi.principal_diagonal_bits(varlen['bits'], p_bit)
+        return 1, lq, lk, varlen, cu_q, cu_k
+    sq, sk = shape
+    return 2, [sq], [sk], abi.varlen_dense(principal_diagonal=p_bit), None, None
+
+
 # (seqlen_q, seqlen_k) per sequence: decode, shorter and longer K, ragged tiles.
 SEQS = ((1, 300), (64, 320), (130, 130), (300, 37), (37, 200))
 
@@ -216,3 +242,28 @@ def test_dropout_scale_at(body, head_dim, causal):
     else:
         wide_ref._check(f'dV {tag}', dv, dv_r)
         wide_ref._check(f'dK {tag}', dk, dk_r)
+
+
+@pytest.mark.parametrize("shape", PD_SHAPES)
+@pytest.mark.parametrize("window", PD_WINDOWS)
+@pytest.mark.parametrize("p_bit", PD_BITS)
+@pytest.mark.parametrize("body,head_dim", CASES)
+def test_principal_diagonal(body, head_dim, p_bit, window, shape):
+    """Numeric windows under both principal diagonals: bit-identical dK and dV, and
+    every owned element written (dK = dV = 0 where no query sees a key)."""
+    batch, lq, lk, varlen, _, _ = _pd_varlen(shape, p_bit)
+    h, hk = 4, 2
+    torch.manual_seed(head_dim + sum(lq))
+    tq, tk = (sum(lq), sum(lk)) if shape == 'varlen' else (lq[0], lk[0])
+    q = torch.randn(batch, h, tq, head_dim, device='cuda', dtype=torch.bfloat16)
+    k = torch.randn(batch, hk, tk, head_dim, device='cuda', dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    do = torch.randn_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    lse, delta = _rows(batch * h, tq, max(lk))
+    kwargs = dict(seqlen_k=max(lk), varlen=varlen, window=window)
+    if shape == 'varlen':
+        kwargs['num_seqlens'] = len(lq)
+    key = (body, head_dim, 3, False, False, False, 'bf16')
+    _assert_same(_run_both(key, (q, k, v, do, dk, dv, lse, delta, batch, max(lq)), dk, dv, kwargs))
