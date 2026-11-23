@@ -377,6 +377,8 @@ def build_fmha_bwd_dq_gfx942_wide_flex(head_dim,
             ctx.dropout_scale = dropout_scale
 
         # ---- bias and dB resources
+        # dB stays in this body: its 64-lane ds_bpermute deal follows this body's S^T
+        # layout; the narrow body's (ds_swizzle) differs, so sharing would not pay.
         if const_expr(bias):
             b_rsrc, b_mis = bias_slab(B,
                                       q_batch,

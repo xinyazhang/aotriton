@@ -345,6 +345,8 @@ def build_fmha_bwd_dq_gfx942_flex(head_dim,
         j_clean_end = smax(j_clean + (smax(clean_end, j_clean) - j_clean) // NBUF * NBUF, j_clean)
 
         # ---- bias and dB: 16 bytes a lane, by whole 64 B segments of 16 rows
+        # dB stays in this body: its lane exchange (ds_swizzle lane ^ 16 / ^ 8) follows
+        # this body's S^T layout; the wide body's differs, so sharing would not pay.
         if const_expr(bias):
             # (B, H, Sq, Sk), Sk contiguous; rows offset by Q's varlen offset, columns by K's.
             b_elems = (fx.Int64(q_batch) * stride_b_batch + fx.Int64(head) * stride_b_head

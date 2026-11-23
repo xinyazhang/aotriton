@@ -379,10 +379,9 @@ def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
 # ---------------------------------------------------------------- dK/dV P and dS
 # A dK/dV S tile (16x16x16, Q rows streamed, K resident) holds one kv column and
 # four consecutive q rows per lane, so LSE and Delta are per value and P, dS
-# come out as the dV/dK GEMMs' B operand. The bodies differ in two places
-# (flyc-gfx942-flex-gemm-design.md, section 4.2); both are named options.
-MASK_SCORE = 'score'        # the band mask sets S to -inf before exp
-MASK_PROB = 'prob'          # P is zeroed after exp
+# come out as the dV/dK GEMMs' B operand. The band mask sets S to -inf before
+# exp, as the Triton reference does (bwd_inner_dk_dv.py) for every body. Where
+# dropout's 1/(1-p) meets P for dV is a named option.
 P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
 P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
 
@@ -396,12 +395,11 @@ def p_ds_kv(ctx,
             mask_of,
             keep_of,
             masked,
-            mask_point=MASK_SCORE,
             p_drop=P_DROP_AT_STORE):
     """(P packs, dS packs), one each per kv block. `bias_of(b)` gives block b's
     bias, `mask_of(s_vals, b)` its masked scores, `keep_of(b)` its dropout keep
     flags; each is called where the block needs it."""
-    assert mask_point == MASK_SCORE and p_drop == P_DROP_AT_STORE, (mask_point, p_drop)
+    assert p_drop == P_DROP_AT_STORE, p_drop
     elem = flex_gemm.elem_type(ctx.traits.dtype)
     c_scale_v = fx.full(4, fx.Float32(ctx.c_scale), fx.Float32)
     lse_v = Vec.from_elements(lse_l2, fx.Float32)
