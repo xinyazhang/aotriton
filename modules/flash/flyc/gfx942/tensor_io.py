@@ -13,6 +13,8 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from kernels.common import buffer_ops
 
+from . import flex_gemm
+
 
 def store_acc(t,
               accs,
@@ -34,6 +36,9 @@ def store_acc(t,
     `scale` (f32) multiplies each tile first; columns at or past `col_limit`
     are masked only where a padded build can reach them.
     """
+    if isinstance(t.a, flex_gemm.DerivedA):
+        _store_derived(t, accs, rsrc, row, row_stride, lh, col_limit, row_ok, elem, pad_floor, scale)
+        return
     if t.mfma == '16x16x16':
         scale_v = fx.full(4, fx.Float32(scale), fx.Float32)
         lane_g = lh() if callable(lh) else lh
@@ -64,3 +69,21 @@ def store_acc(t,
             if const_expr(col0 + 8 > pad_floor):
                 ok = ok & (fx.Int32(d) < col_limit)
             buffer_ops.buffer_store(packed.ir_value(), rsrc, off, mask=ok)
+
+
+def _store_derived(t, accs, rsrc, row, row_stride, lh, col_limit, row_ok, elem, pad_floor, scale):
+    """A `DerivedA` GEMM's accumulators, transposed back by the store: element i of
+    group (d0, g), MFMA dt, is column d0 + g*(8*(i//4) + 4*lh + i%4) + dt."""
+    scale_v = fx.full(16, fx.Float32(scale), fx.Float32)
+    accs = [Vec(a) * scale_v for a in accs]
+    for d0, g, a0 in t.a.groups:
+        for i4 in range_constexpr(4):
+            vals = [accs[a0 + dt][4 * i4 + r] for r in range(4) for dt in range(g)]
+            for h in range_constexpr(max(1, g // 2)):
+                part = vals[8 * h:8 * h + 8] if g >= 2 else vals
+                d = fx.Index(d0 + g * 8 * i4 + 8 * h) + lh * (4 * g)
+                packed = Vec.from_elements([fx.Float32(x).to(elem) for x in part], elem)
+                ok = row_ok
+                if const_expr(d0 + g * 8 * i4 + 8 * h + 4 * g + len(part) > pad_floor):
+                    ok = ok & (fx.Int32(d) < col_limit)
+                buffer_ops.buffer_store(packed.ir_value(), rsrc, row * row_stride + d, mask=ok)

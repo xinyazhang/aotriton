@@ -16,8 +16,10 @@ row's key band) and `ctx.lane_key()` (the lane's first key in a tile), and may
 supply `ctx.peer_addr(mask)` and `ctx.ph_lane()` to rebuild lane values at their
 use instead of keeping them live.
 
-The LSE helpers at the end serve the backward too: its LSE and Delta rows share
-the forward's LSE layout.
+The LSE helpers serve the backward too: its LSE and Delta rows share the
+forward's LSE layout. The backward hooks at the end recompute P from LSE and form
+dS = P (dP - Delta); how P's exponent rounds is a named option (P_EXP_*), since
+the bodies differ there.
 """
 
 import flydsl.compiler as flyc
@@ -183,6 +185,41 @@ def lse_of(m, l):
     return (l > fx.Float32(0.0)).select(lse, fx.Float32(float('inf')))
 
 
+def lse_rows(varlen_bits,
+             batch,
+             head,
+             num_head_q,
+             max_seqlen_q,
+             seqinfo_q0,
+             seqinfo_q1,
+             num_seqlens,
+             row_off):
+    """(first row, pitch) of one (batch, head)'s LSE or Delta rows."""
+    tokens = fmha.lse_token_pitch(varlen_bits,
+                                  0,
+                                  max_seqlen_q,
+                                  seqinfo_q0,
+                                  seqinfo_q1,
+                                  num_seqlens)
+    return fmha.lse_row_addressing(varlen_bits,
+                                   batch,
+                                   head,
+                                   num_head_q,
+                                   tokens,
+                                   row_off)
+
+
+def lse_rsrc_at(ptr, row0, pitch, rows, nullable=True):
+    """The rows' buffer resource; a null `ptr` gets an empty range when `nullable`."""
+    addr = fx.Int64(fx.ptrtoint(ptr))
+    base = addr + fx.Int64(row0) * fx.Int64(4)
+    if nullable:
+        n_bytes = (addr == fx.Int64(0)).select(fx.Int64(0), fx.Int64(rows * pitch) * fx.Int64(4))
+    else:
+        n_bytes = fx.Int64(rows * pitch) * fx.Int64(4)
+    return buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=n_bytes)
+
+
 def lse_rsrc(ptr,
              rows,
              varlen_bits,
@@ -195,25 +232,100 @@ def lse_rsrc(ptr,
              num_seqlens,
              row_off):
     """(rsrc, pitch) of one (batch, head)'s LSE or Delta rows; a null `ptr` gets an empty range."""
-    tokens = fmha.lse_token_pitch(varlen_bits,
-                                  0,
-                                  max_seqlen_q,
-                                  seqinfo_q0,
-                                  seqinfo_q1,
-                                  num_seqlens)
-    row0, pitch = fmha.lse_row_addressing(varlen_bits,
-                                          batch,
-                                          head,
-                                          num_head_q,
-                                          tokens,
-                                          row_off)
-    addr = fx.Int64(fx.ptrtoint(ptr))
-    base = addr + fx.Int64(row0) * fx.Int64(4)
-    n_bytes = (addr == fx.Int64(0)).select(fx.Int64(0), fx.Int64(rows * pitch) * fx.Int64(4))
-    return buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=n_bytes), pitch
+    row0, pitch = lse_rows(varlen_bits,
+                           batch,
+                           head,
+                           num_head_q,
+                           max_seqlen_q,
+                           seqinfo_q0,
+                           seqinfo_q1,
+                           num_seqlens,
+                           row_off)
+    return lse_rsrc_at(ptr, row0, pitch, rows), pitch
+
+
+def lse_load(rsrc, pitch, row):
+    """One row's LSE or Delta."""
+    return fx.Float32(buffer_ops.buffer_load(rsrc, row * pitch, vec_width=1, dtype=fx.Float32))
 
 
 def lse_store(rsrc, pitch, lse, row, row_ok, lane_first):
     """One lane of each row stores: `lane_first()` says which (built after the offset)."""
     off = row * pitch
     buffer_ops.buffer_store(lse, rsrc, off, mask=row_ok & lane_first())
+
+
+# ---------------------------------------------------------------- backward
+# On the S^T accumulator of `ctx.qk` (its lane map: ctx.qk.coords), with
+# ctx.c_scale, ctx.lse2 (log2-base LSE) and ctx.delta of the lane's row.
+
+P_EXP_TWO_ROUNDINGS = 'two_roundings'   # S * c, then - lse2: the forward's P bit for bit
+P_EXP_FMA = 'fma'                       # one fma(S, c, -lse2)
+
+
+def pair_op(xs, c, op):
+    """op(xs, c) on adjacent pairs: v_pk_* math against a 2-wide splat of `c`.
+    A 16-wide splat is hoisted out of the loop as 16 registers."""
+    c2 = fx.full(2, fx.Float32(c), fx.Float32)
+    out = []
+    for i in range(len(xs) // 2):
+        v2 = op(Vec.from_elements([xs[2 * i], xs[2 * i + 1]], fx.Float32), c2)
+        out.extend([v2[0], v2[1]])
+    return out
+
+
+def p_from_lse(ctx, s_raw, kv_start, masked, bias_vals, exponent=P_EXP_TWO_ROUNDINGS):
+    """P = exp2(sm_scale*log2e*S + log2e*bias - lse2), one f32 vector per S^T tile."""
+    if exponent != P_EXP_TWO_ROUNDINGS:
+        raise NotImplementedError(exponent)
+    ns = ctx.qk.ns
+    acc = ctx.qk.acc
+    # Scale once in fp32, as the forward: P must be the forward's P bit for bit.
+    s_vals = pair_op([Vec(s_raw[r // acc])[r % acc] for r in range(ns)], ctx.c_scale, lambda x, c: x * c)
+    if ctx.traits.bias:
+        l2 = fx.full(2, fx.Float32(LOG2E), fx.Float32)
+        out = []
+        for i in range(ns // 2):
+            b2 = Vec.from_elements([fx.Float32(Vec(bias_vals[i // 2])[2 * (i % 2) + e].to(fx.Float32))
+                                    for e in range(2)], fx.Float32)
+            v2 = Vec.from_elements([s_vals[2 * i], s_vals[2 * i + 1]], fx.Float32) + b2 * l2
+            out.extend([v2[0], v2[1]])
+        s_vals = out
+    if masked:
+        band_lo, band_span = ctx.band()
+        rel0 = fx.Int32(kv_start) + ctx.lane_key() - band_lo
+        s_vals = mask_band(s_vals, rel0, ctx.qk.coords, band_span, ctx.c_neg_inf)
+    x = pair_op(s_vals, ctx.lse2, lambda x, c: x - c)
+    return [Vec.from_elements([exp2(x[acc * n + r]) for r in range(acc)], fx.Float32).ir_value()
+            for n in range(ns // acc)]
+
+
+def keep_scale(ctx, kv_start):
+    """dP's dropout factor, 1/(1-p) or 0, in S^T order: each 4-key group is one
+    Philox call. Floats, not i1: 16 masks would take 32 SGPRs and spill."""
+    out = []
+    tile = ctx.ph_row + fx.Int64(fx.Int32(kv_start) // fx.Int32(4))
+    for g in range(ctx.qk.ns // 4):
+        vals = ctx.rng.u32(ctx.ph_seed, tile + fx.Int64(ctx.qk.coords[4 * g] // 4))
+        out.extend((fx.Int32(v) > fx.Int32(ctx.idropout_p)).select(fx.Float32(ctx.dropout_scale), fx.Float32(0.0))
+                   for v in vals)
+    return out
+
+
+def ds_packs(ctx, p_vals, dp_raw, keep):
+    """dS = P * (dP - Delta), packed as the next GEMM's B operand. Dropout's mask and
+    1/(1-p) hit dP; P stays undropped (numerical lessons, #9)."""
+    ns = ctx.qk.ns
+    acc = ctx.qk.acc
+    dp = [fx.Float32(Vec(dp_raw[r // acc])[r % acc]) for r in range(ns)]
+    if ctx.traits.dropout:
+        dp = [dp[r] * keep[r] for r in range(ns)]
+    dpd = pair_op(dp, ctx.delta, lambda x, c: x - c)
+    ds = []
+    for i in range(ns // 2):
+        pv = Vec.from_elements([Vec(p_vals[i // (acc // 2)])[2 * (i % (acc // 2)) + e] for e in range(2)],
+                               fx.Float32)
+        v2 = pv * Vec.from_elements([dpd[2 * i], dpd[2 * i + 1]], fx.Float32)
+        ds.extend([v2[0], v2[1]])
+    elem = flex_gemm.elem_type(ctx.traits.dtype)
+    return [pack_operand(ds[4 * i:4 * i + 4], elem) for i in range(ns // 4)]
