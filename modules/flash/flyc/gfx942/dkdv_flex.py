@@ -74,6 +74,7 @@ class DkdvTraits:
     grid_axis_order: int
     bias: bool
     dropout: bool
+    dropout_scale_at: str       # softmax.P_DROP_AT_STORE or P_DROP_PER_ELEM
 
     # make_dkdv_launch's names
     @property
@@ -168,8 +169,10 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                                     waves_per_eu=None,
                                     grid_axis_order=None,
                                     interleave_valu=None,
-                                    padded_head=False):
-    """`dkdv.build_fmha_bwd_dkdv_gfx942`'s interface and kernel, on flex_gemm."""
+                                    padded_head=False,
+                                    dropout_scale_at=None):
+    """`dkdv.build_fmha_bwd_dkdv_gfx942`'s interface and kernel, on flex_gemm.
+    `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV (softmax.P_DROP_*)."""
     assert head_dim in tuning.LADDER and head_dim <= 128, head_dim
     host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
     if num_waves is None:
@@ -192,7 +195,8 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                     interleave_valu=interleave_valu,
                     grid_axis_order=grid_axis_order,
                     bias=bias,
-                    dropout=dropout)
+                    dropout=dropout,
+                    dropout_scale_at=dropout_scale_at or softmax.P_DROP_AT_STORE)
     qs, dops, dvt, dkt = tr.gemms()
     lds_bytes = 4 * tr.slot_bytes
     assert lds_bytes <= 65536, lds_bytes
@@ -590,13 +594,15 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                       n_trips=n_pairs)
             res_h = yield ctx.dk + ctx.dv
 
-        # ---- epilogue: dK = sm_scale * dK^T, dV (times 1/(1-p) under dropout), transposed by the store
+        # ---- epilogue: dK = sm_scale * dK^T, dV (times 1/(1-p) if dropout scales it here), transposed by the store
         dk_rsrc = rsrc_for(DK, k_batch, head_k, k_row_off, stride_dk_batch, stride_dk_head, stride_dk_seq, sk, row_qk)
         dv_rsrc = rsrc_for(DV, k_batch, head_k, k_row_off, stride_dv_batch, stride_dv_head, stride_dv_seq, sk, row_vo)
         dk_row_stride = fx.Index(fx.Int32(stride_dk_seq))
         dv_row_stride = fx.Index(fx.Int32(stride_dv_seq))
         scale_v = fx.full(4, fx.Float32(sm_scale), fx.Float32)
-        dv_scale = (lambda: fx.full(4, fx.Float32(dropout_scale), fx.Float32)) if const_expr(dropout) else None
+        dv_scale = None
+        if const_expr(dropout and tr.dropout_scale_at == softmax.P_DROP_AT_STORE):
+            dv_scale = lambda: fx.full(4, fx.Float32(dropout_scale), fx.Float32)  # noqa: E731
         res_h = list(res_h)
         tensor_io.store_acc_t(dkt,
                               [(res_h[:dkt.n_acc], dk_rsrc, dk_row_stride, row_qk, scale_v),

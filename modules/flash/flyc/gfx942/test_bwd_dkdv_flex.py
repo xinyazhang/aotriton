@@ -17,9 +17,12 @@ import math
 
 import pytest
 
-from .jit_common import assert_written, np, pytestmark, torch, with_nan_slack  # noqa: F401
+from .jit_common import assert_written, bottom_right, np, philox_4x32_10, pytestmark, torch, with_nan_slack  # noqa: F401
+from . import test_bwd_dkdv as narrow_ref
+from . import test_bwd_dkdv_wide as wide_ref
 
 import fmha_utils as abi  # noqa: E402
+import philox  # noqa: E402
 
 # body -> head dims it serves (hd96: waves_per_eu 2 without bias, 1 with).
 HEAD_DIMS = {'narrow': (32, 64, 96, 128)}
@@ -150,3 +153,66 @@ def test_varlen(body, head_dim, causal_type, bias):
         kwargs['bias'] = torch.randn(1, h, tq, tk, device='cuda', dtype=torch.bfloat16)
     key = (body, head_dim, causal_type, bias, False, False, 'bf16')
     _assert_same(_run_both(key, (q, k, v, do, dk, dv, lse, delta, 1, max(lq)), dk, dv, kwargs))
+
+
+# Where dropout's 1/(1-p) meets P for dV (traits `dropout_scale_at`): each body's
+# default keeps its original's bits above; the other is held to fp64 here.
+OTHER_SCALE_AT = {'narrow': 'elem', 'wide': 'store', 'xwide': 'store', 'xxwide': 'store'}
+
+
+@pytest.mark.parametrize("causal", (False, True))
+@pytest.mark.parametrize("body,head_dim", CASES)
+def test_dropout_scale_at(body, head_dim, causal):
+    """The non-default `dropout_scale_at` against fp64, at the tolerance of the body's
+    own reference test (test_bwd_dkdv.py: narrow; test_bwd_dkdv_wide.py: the rest)."""
+    sq, sk = 300, 517
+    b, h, p = 2, 3, 0.3
+    seed, off1, off2 = 0x123456789ABCDEF0, 1000, 77
+    dt = torch.bfloat16
+    torch.manual_seed(head_dim + causal)
+    q, k, v, do = (torch.randn(b, h, n, head_dim, device='cuda', dtype=dt) for n in (sq, sk, sk, sq))
+    stride = -(-sk // 4)
+    zh = np.arange(b * h, dtype=np.uint64)[:, None, None]
+    m = np.arange(sq, dtype=np.uint64)[None, :, None]
+    g = np.arange(stride, dtype=np.uint64)[None, None, :]
+    offs = np.uint64(off1 + off2) + zh * np.uint64(sq * stride) + m * np.uint64(stride) + g
+    rand = philox_4x32_10(seed, offs).reshape(b * h, sq, stride * 4)[:, :, :sk]
+    keep = torch.from_numpy(rand > philox.dropout_threshold(p)).cuda().view(b, h, sq, sk)
+    live = bottom_right(sq, sk) if causal else None
+    scale = head_dim ** -0.5
+    if body == 'narrow':
+        dk_r, dv_r, dk_f, dv_f, lse, delta = narrow_ref._reference(q, k, v, do, scale, dt, live=live,
+                                                                   keep=keep.double(), p=p)
+    else:
+        dk_r, dv_r, lse, delta = wide_ref._reference(q, k, v, do, scale, keep_mask=live, keep=keep, p=p)
+    fn = _builder(body, 'new')(head_dim,
+                               causal_type=2 if causal else 0,
+                               dropout=True,
+                               dropout_scale_at=OTHER_SCALE_AT[body])
+    dk = torch.full_like(k, float('nan'))
+    dv = torch.full_like(v, float('nan'))
+    fn(q,
+       k,
+       v,
+       do,
+       dk,
+       dv,
+       lse.reshape(b * h, sq).contiguous(),
+       delta.reshape(b * h, sq).contiguous(),
+       b,
+       sq,
+       seqlen_k=sk,
+       scale=scale,
+       dropout_p=p,
+       philox_seed=seed,
+       philox_offset1=torch.tensor([off1], dtype=torch.int64, device='cuda'),
+       philox_offset2=off2)
+    torch.cuda.synchronize()
+    assert_written('new body', dK=dk, dV=dv)
+    tag = f'{body} d{head_dim} dropout_scale_at={OTHER_SCALE_AT[body]} causal={causal}'
+    if body == 'narrow':
+        narrow_ref._check(f'dV {tag}', dv, dv_r, dv_f)
+        narrow_ref._check(f'dK {tag}', dk, dk_r, dk_f)
+    else:
+        wide_ref._check(f'dV {tag}', dv, dv_r)
+        wide_ref._check(f'dK {tag}', dk, dk_r)

@@ -381,9 +381,18 @@ def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
 # four consecutive q rows per lane, so LSE and Delta are per value and P, dS
 # come out as the dV/dK GEMMs' B operand. The band mask sets S to -inf before
 # exp, as the Triton reference does (bwd_inner_dk_dv.py) for every body. Where
-# dropout's 1/(1-p) meets P for dV is a named option.
+# dropout's 1/(1-p) meets P for dV is the traits field `dropout_scale_at`; with
+# P_DROP_AT_STORE the body scales dV by it at the store.
 P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
 P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
+
+
+def _p_drop(ctx, keep, p):
+    """P for dV under dropout: kept or 0, scaled by 1/(1-p) here if `dropout_scale_at` says so."""
+    if ctx.traits.dropout_scale_at == P_DROP_PER_ELEM:
+        return keep.select(p * fx.Float32(ctx.dropout_scale), fx.Float32(0.0))
+    assert ctx.traits.dropout_scale_at == P_DROP_AT_STORE, ctx.traits.dropout_scale_at
+    return keep.select(p, fx.Float32(0.0))
 
 
 def p_ds_kv(ctx,
@@ -394,12 +403,11 @@ def p_ds_kv(ctx,
             bias_of,
             mask_of,
             keep_of,
-            masked,
-            p_drop=P_DROP_AT_STORE):
-    """(P packs, dS packs), one each per kv block. `bias_of(b)` gives block b's
-    bias, `mask_of(s_vals, b)` its masked scores, `keep_of(b)` its dropout keep
-    flags; each is called where the block needs it."""
-    assert p_drop == P_DROP_AT_STORE, p_drop
+            masked):
+    """(P packs, dS packs), one each per kv block, a block's values as vectors (the
+    narrow body's order). `bias_of(b)` gives block b's bias, `mask_of(s_vals, b)`
+    its masked scores, `keep_of(b)` its dropout keep flags; each is called where
+    the block needs it."""
     elem = flex_gemm.elem_type(ctx.traits.dtype)
     c_scale_v = fx.full(4, fx.Float32(ctx.c_scale), fx.Float32)
     lse_v = Vec.from_elements(lse_l2, fx.Float32)
@@ -421,7 +429,7 @@ def p_ds_kv(ctx,
         if ctx.traits.dropout:
             keep = keep_of(b)
             dsc = fx.Float32(ctx.dropout_scale)
-            p_kept = [keep[r].select(p[r], fx.Float32(0.0)) for r in range(4)]
+            p_kept = [_p_drop(ctx, keep[r], p[r]) for r in range(4)]
             dp_vals = [keep[r].select(dp[r] * dsc, fx.Float32(0.0)) for r in range(4)]
             dpd = Vec.from_elements(dp_vals, fx.Float32) - delta_v
         else:
@@ -431,3 +439,4 @@ def p_ds_kv(ctx,
         p_packs.append(pack_operand(p_kept, elem))
         ds_packs.append(pack_operand([ds[r] for r in range(4)], elem))
     return p_packs, ds_packs
+
