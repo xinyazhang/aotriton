@@ -94,3 +94,27 @@ def _store_derived(t, accs, rsrc, row, row_stride, lh, col_limit, row_ok, elem, 
                 if const_expr(d0 + g * 8 * i4 + 8 * h + 4 * g + len(part) > pad_floor):
                     ok = ok & (fx.Int32(d) < col_limit)
                 buffer_ops.buffer_store(packed.ir_value(), rsrc, row * row_stride + d, mask=ok)
+
+
+def store_acc_t(t, outs, row0, lc, lg, row_lim, elem, pad_floor):
+    """Store TransA accumulators: a lane holds B row row0 + 16b + lc, columns
+    16o + 4lg + [0, 4). `outs` lists (accs, rsrc, row_stride, col_limit, scale)
+    per tensor (dK and dV), stored interleaved; `scale` is None, a vector, or a
+    function building one where it is used."""
+    for b in range_constexpr(t.b_tiles):
+        row = row0 + fx.Index(16 * b) + lc
+        row_ok = row < row_lim
+        for o in range_constexpr(t.out_tiles):
+            d = fx.Index(16 * o) + lg * 4
+            vals = []
+            for accs, _, _, _, scale in outs:
+                v = Vec(accs[o * t.b_tiles + b])
+                if scale is not None:
+                    v = v * (scale() if callable(scale) else scale)
+                vals.append(v)
+            oks = [row_ok for _ in outs]
+            if const_expr(16 * o + 16 > pad_floor):
+                oks = [ok & (fx.Int32(d) < lim) for ok, (_, _, _, lim, _) in zip(oks, outs)]
+            packed = [Vec.from_elements([fx.Float32(v[r]).to(elem) for r in range(4)], elem) for v in vals]
+            for e, ok, (_, rsrc, row_stride, _, _) in zip(packed, oks, outs):
+                buffer_ops.buffer_store(e.ir_value(), rsrc, row * row_stride + d, mask=ok)

@@ -25,7 +25,7 @@ the bodies differ there.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import math as fmath
-from flydsl.expr import rocdl
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as raw
 
@@ -221,6 +221,15 @@ def lse_rsrc_at(ptr, row0, pitch, rows, nullable=True):
     return buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=n_bytes)
 
 
+def lse_delta_rsrcs(lse_ptr, delta_ptr, row0, pitch, rows):
+    """The backward's LSE and Delta resources: one row layout, so one range."""
+    n_bytes = fx.Int64(rows * pitch) * fx.Int64(4)
+    row0_b = fx.Int64(row0) * fx.Int64(4)
+    return [buffer_ops.create_buffer_resource_from_addr(fx.Int64(fx.ptrtoint(ptr)) + row0_b,
+                                                        num_records_bytes=n_bytes)
+            for ptr in (lse_ptr, delta_ptr)]
+
+
 def lse_rsrc(ptr,
              rows,
              varlen_bits,
@@ -365,3 +374,62 @@ def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
         ds.extend([v2[0], v2[1]])
     elem = flex_gemm.elem_type(ctx.traits.dtype)
     return [pack_operand(ds[4 * i:4 * i + 4], elem) for i in range(ns // 4)]
+
+
+# ---------------------------------------------------------------- dK/dV P and dS
+# A dK/dV S tile (16x16x16, Q rows streamed, K resident) holds one kv column and
+# four consecutive q rows per lane, so LSE and Delta are per value and P, dS
+# come out as the dV/dK GEMMs' B operand. The bodies differ in two places
+# (flyc-gfx942-flex-gemm-design.md, section 4.2); both are named options.
+MASK_SCORE = 'score'        # the band mask sets S to -inf before exp
+MASK_PROB = 'prob'          # P is zeroed after exp
+P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
+P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
+
+
+def p_ds_kv(ctx,
+            s_accs,
+            dp_accs,
+            lse_l2,
+            delta,
+            bias_of,
+            mask_of,
+            keep_of,
+            masked,
+            mask_point=MASK_SCORE,
+            p_drop=P_DROP_AT_STORE):
+    """(P packs, dS packs), one each per kv block. `bias_of(b)` gives block b's
+    bias, `mask_of(s_vals, b)` its masked scores, `keep_of(b)` its dropout keep
+    flags; each is called where the block needs it."""
+    assert mask_point == MASK_SCORE and p_drop == P_DROP_AT_STORE, (mask_point, p_drop)
+    elem = flex_gemm.elem_type(ctx.traits.dtype)
+    c_scale_v = fx.full(4, fx.Float32(ctx.c_scale), fx.Float32)
+    lse_v = Vec.from_elements(lse_l2, fx.Float32)
+    delta_v = Vec.from_elements(delta, fx.Float32)
+    p_packs = []
+    ds_packs = []
+    for b in range_constexpr(len(s_accs)):
+        # Scale once in fp32, as the forward does; the mask lands on the scaled score.
+        s = Vec(s_accs[b]) * c_scale_v
+        s_vals = [s[r] for r in range(4)]
+        if ctx.traits.bias:
+            bv = bias_of(b)
+            s_vals = [s_vals[r] + bv[r] * fx.Float32(LOG2E) for r in range(4)]
+        if masked and ctx.traits.causal:
+            s_vals = mask_of(s_vals, b)
+        e = Vec.from_elements(s_vals, fx.Float32) - lse_v
+        p = [exp2(e[r]) for r in range(4)]
+        dp = Vec(dp_accs[b])
+        if ctx.traits.dropout:
+            keep = keep_of(b)
+            dsc = fx.Float32(ctx.dropout_scale)
+            p_kept = [keep[r].select(p[r], fx.Float32(0.0)) for r in range(4)]
+            dp_vals = [keep[r].select(dp[r] * dsc, fx.Float32(0.0)) for r in range(4)]
+            dpd = Vec.from_elements(dp_vals, fx.Float32) - delta_v
+        else:
+            p_kept = p
+            dpd = dp - delta_v
+        ds = Vec.from_elements(p, fx.Float32) * dpd
+        p_packs.append(pack_operand(p_kept, elem))
+        ds_packs.append(pack_operand([ds[r] for r in range(4)], elem))
+    return p_packs, ds_packs
