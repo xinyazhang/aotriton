@@ -59,6 +59,16 @@ WAVE_M = 32         # query rows per wave: the N of the 32x32x8 MFMA
 
 
 @dataclass(frozen=True)
+class ClusterOps:
+    """Non-MFMA ops one cluster issues, for `sched_spread`: LDS reads (`lead` of
+    them before the first MFMA), LDS writes and VMEM loads."""
+    rd: int
+    wr: int
+    vmem: int
+    lead: int
+
+
+@dataclass(frozen=True)
 class FwdWideTraits:
     """Everything one build fixes. Frozen Python values; the GEMMs derive from it."""
     head_dim: int
@@ -192,9 +202,25 @@ def build_fmha_fwd_gfx942_wide_flex(head_dim,
     def scopes(name):
         return alias_scopes(_LDS_DOMAIN, LDS_SCOPES, name)
 
-    def sched(n_mfma, n_rd, n_wr, n_vmem, lead=0):
-        """Spread LDS reads (`lead` of them first), LDS writes and VMEM over the MFMAs."""
-        sched_spread(n_mfma, n_rd, n_wr, n_vmem, valu_per_mfma=tr.valu_per_mfma, lead=lead)
+    # What x_loads / y_loads issue per cluster: an early K or V^T moves its work
+    # from the cluster of its MFMAs to the other one.
+    x_ops = ClusterOps(rd=(n_vt if vt_early else 0) + (0 if k_early else n_k),
+                       wr=0 if vt_early else n_vst,
+                       vmem=(n_kdma if k_early else 0) + (0 if vt_early else n_v),
+                       lead=0 if k_early else tr.vt_lead)
+    y_ops = ClusterOps(rd=(n_k if k_early else 0) + (0 if vt_early else n_vt),
+                       wr=n_vst if vt_early else 0,
+                       vmem=(n_v if vt_early else 0) + (0 if k_early else n_kdma),
+                       lead=0 if vt_early else tr.vt_lead)
+
+    def spread(n_mfma, ops):
+        """Spread a cluster's loads and stores over its `n_mfma` MFMAs."""
+        sched_spread(n_mfma,
+                     ops.rd,
+                     ops.wr,
+                     ops.vmem,
+                     valu_per_mfma=tr.valu_per_mfma,
+                     lead=ops.lead)
 
     @flyc.kernel(known_block_size=[tr.block_size, 1, 1])
     def fmha_fwd_gfx942_kernel(
@@ -391,6 +417,21 @@ def build_fmha_fwd_gfx942_wide_flex(head_dim,
                     gemm_dma(qk, k_dma_plan, k_rsrc, scopes, kv_next + 2 * block_n, k_stride_b, 1 - b)
                 return vts if vt_early else gemm_read(pv, vt_read_plan, ctx.lds, 0)
 
+            # ---- cluster ends: wait for what the next cluster consumes or overwrites
+            def x_end(b):
+                if const_expr(k_early):
+                    rocdl.s_waitcnt(vmcnt=n_v + n_kdma)     # K(j+2)'s DMA, read in Y(j)
+                if const_expr(vt_early):
+                    # Y(j) overwrites V^T; s_barrier does not wait for these reads.
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                cluster_barrier(f'X{b}')
+
+            def y_end(b):
+                if const_expr(not k_early):
+                    rocdl.s_waitcnt(vmcnt=n_v + n_kdma)     # K(j+2)'s DMA, read in X(j+1)
+                rocdl.s_waitcnt(lgkmcnt=0)
+                cluster_barrier(f'Y{b}')
+
             # Iteration -1: K(0), K(1) land; X(-1) = QK(0); Y(-1) = softmax head(0).
             def warmup():
                 gemm_dma(qk, k_dma_plan, k_rsrc, scopes, kv_base, k_stride_b, 0)
@@ -437,34 +478,19 @@ def build_fmha_fwd_gfx942_wide_flex(head_dim,
                 vts, k_reads = x_loads(kv_next, b, masked)
                 s_next = gemm_mma(qk, k_reads, ctx.q_packs, a_masks=ctx.k_masks)      # QK(j+1)
                 p = pin_values(softmax.tail(ctx, kv_cur))                             # P(j)
-                sched(qk.n_mma,
-                      (n_vt if vt_early else 0) + (0 if k_early else n_k),
-                      0 if vt_early else n_vst,
-                      (n_kdma if k_early else 0) + (0 if vt_early else n_v),
-                      0 if k_early else tr.vt_lead)
-                if const_expr(k_early):
-                    rocdl.s_waitcnt(vmcnt=n_v + n_kdma)
-                if const_expr(vt_early):
-                    # Y(j) overwrites V^T; s_barrier does not wait for these reads.
-                    rocdl.s_waitcnt(lgkmcnt=0)
-                cluster_barrier(f'X{b}')
+                spread(qk.n_mma, x_ops)
+                x_end(b)
                 # Y(j): rescale O, then PV(j); head(j+1)'s VALU fills the MFMA gaps.
                 ctx.o = softmax.rescale(ctx.o, ctx.corr)
                 vts = y_loads(kv_next, b, vts)
                 ctx.o = gemm_mma(pv, vts, p, ctx.o)                                   # PV(j)
-
-                def sched_y():
-                    sched(pv.n_mma,
-                          (n_k if k_early else 0) + (0 if vt_early else n_vt),
-                          n_vst if vt_early else 0,
-                          (n_v if vt_early else 0) + (0 if k_early else n_kdma),
-                          0 if vt_early else tr.vt_lead)
-
-                softmax.head(ctx, s_next, kv_next, masked, ctx.b_next, sched=sched_y)  # max(j+1)
-                if const_expr(not k_early):
-                    rocdl.s_waitcnt(vmcnt=n_v + n_kdma)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                cluster_barrier(f'Y{b}')
+                softmax.head(ctx,
+                             s_next,
+                             kv_next,
+                             masked,
+                             ctx.b_next,
+                             sched=lambda: spread(pv.n_mma, y_ops))                   # max(j+1)
+                y_end(b)
 
             # The loop leaves the last tile's PV undone; V^T has one buffer, so no dispatch.
             def finish(kv_last):
