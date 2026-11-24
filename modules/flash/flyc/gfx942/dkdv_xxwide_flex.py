@@ -181,8 +181,8 @@ def build_fmha_bwd_dkdv_gfx942_xxwide_flex(head_dim,
                           grid_axis_order=grid_axis_order,
                           bias=bias,
                           dropout=dropout,
-                          dropout_scale_at=dropout_scale_at or softmax.P_DROP_PER_ELEM,
-                          mask_at=mask_at or softmax.MASK_SCORE)
+                          dropout_scale_at=dropout_scale_at or tuning.default_dropout_scale_at('xxwide'),
+                          mask_at=mask_at or tuning.default_mask_at('xxwide'))
     xg, yg = tr.gemms()
     NSUB = tr.kv_subs
     NI = tr.items

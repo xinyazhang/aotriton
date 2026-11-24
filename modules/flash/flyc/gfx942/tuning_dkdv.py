@@ -10,7 +10,7 @@ defaults from here, so the two cannot drift.
 
 from fmha_knobs import GRID_AXIS_HEAD_FASTEST, GRID_AXIS_TILE_FASTEST, knobs_of  # noqa: F401  (the kernels read the grid axes here)
 from fmha_meta import FmhaInputMetadata
-from .knobs import BwdDkDvKnobs
+from .knobs import MASK_PROB, MASK_SCORE, P_DROP_AT_STORE, P_DROP_PER_ELEM, BwdDkDvKnobs
 from .tuning_fwd import LADDER, check_tile, plan, resolve_fields, rung  # noqa: F401  (re-exported for the kernels and benches)
 
 # Rows of one 16x16x16 MFMA block: the q tile per loop step and the kv unit.
@@ -84,6 +84,24 @@ def body_kv_subs(body_name, head_dim):
     return default_kv_subs(head_dim) if body(head_dim) == body_name else 2
 
 
+# Per body; dropout_scale_at by A/B at B4 H32 bf16, dropout 0.2.
+_MASK_AT = {'narrow': MASK_SCORE, 'wide': MASK_PROB, 'xwide': MASK_PROB, 'xxwide': MASK_SCORE}
+_DROPOUT_SCALE_AT = {'narrow': P_DROP_AT_STORE,
+                     'wide': P_DROP_AT_STORE,
+                     'xwide': P_DROP_AT_STORE,
+                     'xxwide': P_DROP_PER_ELEM}
+
+
+def default_mask_at(body_name):
+    """Where `body_name`'s band mask lands: the score before exp2 or P after it."""
+    return _MASK_AT[body_name]
+
+
+def default_dropout_scale_at(body_name):
+    """Where `body_name` applies dropout's 1/(1-p) to P for dV: per element or at the dV store."""
+    return _DROPOUT_SCALE_AT[body_name]
+
+
 def block_kv(num_waves, kv_blocks):
     """KV rows per workgroup: what the grid's tile axis divides max_seqlen_k by."""
     return num_waves * kv_blocks * BLOCK_ROWS
@@ -95,20 +113,28 @@ def policy(head_dim, causal, bias=False):
     reads. `GRID_AXIS_ORDER` is passed to the builder as `grid_axis_order`."""
     if head_dim not in LADDER:
         raise ValueError(f'head_dim {head_dim} is not on the gfx942 dK/dV ladder {LADDER}')
-    if body(head_dim) == 'wide':
+    name = body(head_dim)
+    return dict(_body_policy(name, head_dim, causal, bias),
+                mask_at=default_mask_at(name),
+                dropout_scale_at=default_dropout_scale_at(name))
+
+
+def _body_policy(name, head_dim, causal, bias):
+    """`policy`'s body-specific knobs."""
+    if name == 'wide':
         subs = default_kv_subs(head_dim)
         return dict(kv_subs=subs,
                     waves_per_eu=1,
                     block_kv=block_kv(4, subs),
                     GRID_AXIS_ORDER=default_grid_axis_order(causal))
-    if body(head_dim) == 'xwide':
+    if name == 'xwide':
         # Two teams of two waves, each team owning 16 * kv_subs keys.
         subs = default_kv_subs(head_dim)
         return dict(kv_subs=subs,
                     waves_per_eu=1,
                     block_kv=block_kv(2, subs),
                     GRID_AXIS_ORDER=default_grid_axis_order(causal))
-    if body(head_dim) == 'xxwide':
+    if name == 'xxwide':
         # One team of four waves owning 16 * kv_subs keys.
         subs = default_kv_subs(head_dim)
         return dict(kv_subs=subs,

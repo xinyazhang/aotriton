@@ -33,6 +33,7 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from .knobs import MASK_PROB, MASK_SCORE, P_DROP_AT_STORE, P_DROP_PER_ELEM  # noqa: F401  (bodies read them here)
 from .utils import LN2, LOG2E, bias_load4, exp2, mask_band, pack_operand
 
 
@@ -387,10 +388,7 @@ def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
 # - `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV; with
 #   P_DROP_AT_STORE the body scales dV by it at the store.
 # A body's `mask_of(v, i, fill)` puts `fill` where item (or block) i is outside the band.
-MASK_SCORE = 'score'        # score -> -inf before exp2
-MASK_PROB = 'prob'          # P -> 0 after exp2
-P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
-P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
+# The constants live in knobs.py; tuning_dkdv.py picks them per body.
 
 
 def _p_drop(ctx, keep, p):

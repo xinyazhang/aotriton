@@ -196,8 +196,8 @@ def build_fmha_bwd_dkdv_gfx942_wide_flex(head_dim,
                         grid_axis_order=grid_axis_order,
                         bias=bias,
                         dropout=dropout,
-                        dropout_scale_at=dropout_scale_at or softmax.P_DROP_PER_ELEM,
-                        mask_at=mask_at or softmax.MASK_PROB,
+                        dropout_scale_at=dropout_scale_at or tuning.default_dropout_scale_at('wide'),
+                        mask_at=mask_at or tuning.default_mask_at('wide'),
                         # LLVM's register allocator aborted ("Overlapping insert") on
                         # padded + bias + dropout builds otherwise (bf16 hd224).
                         tb_pos=0 if padded_head and bias and dropout else 99)

@@ -22,6 +22,13 @@ from fmha_knobs import (
 
 __all__ = ["BwdDkDvKnobs", "BwdDqKnobs", "FmhaKnobs"]
 
+# dK/dV `mask_at`: where the band mask lands.
+MASK_SCORE = 'score'        # score -> -inf before exp2
+MASK_PROB = 'prob'          # P -> 0 after exp2
+# dK/dV `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV.
+P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
+P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
+
 
 class _PolicyGridAxisOrder:
     """gfx942's grid order is per functional, so `GRID_AXIS_ORDER` is a policy
@@ -82,6 +89,10 @@ class BwdDkDvKnobs(_PolicyGridAxisOrder, FlycKVKnobs):
     # Wide bodies: 16-key columns per wave or team.
     kv_subs: int | None = None
     waves_per_eu: int | None = None
+    # All bodies: MASK_SCORE or MASK_PROB.
+    mask_at: str | None = None
+    # All bodies: P_DROP_AT_STORE or P_DROP_PER_ELEM.
+    dropout_scale_at: str | None = None
 
     FLYC_SOURCE = "gfx942/dkdv.py"
     FLYC_KERNEL_NAME = "fmha_bwd_dkdv_gfx942_kernel"
