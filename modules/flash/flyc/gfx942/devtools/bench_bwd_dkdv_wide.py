@@ -89,6 +89,8 @@ def main():
     p.add_argument('--kv_subs', type=int, default=None)
     p.add_argument('--body', choices=('wide', 'xwide', 'xxwide'), default=None, help='default: the tuning module\'s')
     p.add_argument('--grid_axis_order', type=int, default=None)
+    p.add_argument('--mask_at', choices=('score', 'prob'), default=None, help='default: the policy')
+    p.add_argument('--dropout_scale_at', choices=('store', 'elem'), default=None, help='default: the policy')
     p.add_argument('--iters', type=int, default=20)
     p.add_argument('--no_check', action='store_true')
     a = p.parse_args()
@@ -97,7 +99,8 @@ def main():
     rung = next((r for r in LADDER if r >= a.head_dim), None)
     if rung is None:
         sys.exit(f'head_dim {a.head_dim} is past the gfx942 dK/dV ladder {LADDER}')
-    kw = {k: v for k, v in (('kv_subs', a.kv_subs), ('grid_axis_order', a.grid_axis_order)) if v is not None}
+    names = ('kv_subs', 'grid_axis_order', 'mask_at', 'dropout_scale_at')
+    kw = {n: getattr(a, n) for n in names if getattr(a, n) is not None}
     launch = build(rung,
                    body=a.body,
                    causal_type=2 if a.causal else 0,

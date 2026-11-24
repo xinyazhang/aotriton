@@ -78,6 +78,8 @@ def main():
     p.add_argument('--waves_per_eu', type=int, default=None)
     p.add_argument('--grid_axis_order', type=int, default=None)
     p.add_argument('--interleave_valu', type=int, default=None)
+    p.add_argument('--mask_at', choices=('score', 'prob'), default=None, help='default: the policy')
+    p.add_argument('--dropout_scale_at', choices=('store', 'elem'), default=None, help='default: the policy')
     p.add_argument('--iters', type=int, default=20)
     p.add_argument('--check', action='store_true', help='compare with fp64 (small shapes only)')
     p.add_argument('--bias', action='store_true', help='(B, H, Sq, Sk) bias, timing only')
@@ -91,8 +93,8 @@ def main():
         sys.exit(f'head_dim {a.head_dim} is past the ladder {tuning.LADDER}')
     from gfx942.dkdv import build_fmha_bwd_dkdv_gfx942
 
-    knobs = {n: getattr(a, n) for n in ('num_waves', 'kv_blocks', 'waves_per_eu', 'grid_axis_order', 'interleave_valu')
-             if getattr(a, n) is not None}
+    names = ('num_waves', 'kv_blocks', 'waves_per_eu', 'grid_axis_order', 'interleave_valu', 'mask_at', 'dropout_scale_at')
+    knobs = {n: getattr(a, n) for n in names if getattr(a, n) is not None}
     launch = build_fmha_bwd_dkdv_gfx942(rung,
                                         causal_type=2 if a.causal else 0,
                                         bias=a.bias,

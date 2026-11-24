@@ -68,7 +68,9 @@ modules/flash/flyc/
 ├── gfx942/, gfx950/, gfx1201/     # one package per arch: knobs.py, tuning_*.py
 │                                 #   (entry_resolve/entry_plan/entry_build),
 │                                 #   fwd.py, dq.py, dkdv.py, ...; test_*.py only
-│                                 #   for what is arch-specific
+│                                 #   for what is arch-specific. gfx942's bodies
+│                                 #   share flex_gemm.py (GEMM phases, ctx),
+│                                 #   softmax.py and tensor_io.py
 modules/flash/aot/flyc_*.py       # ATI descriptions; no arch branches
 ```
 
@@ -562,7 +564,9 @@ ninja install
 ```
 
 Deleting only the `.hsaco` files is not enough: the `.aks2` archives and the
-zip are not rebuilt from them. Edits to `modules/*/aot/*.py` also need
+zip are not rebuilt from them. On gfx942 an edit to a shared module
+(`flex_gemm.py`, `softmax.py`, `tensor_io.py`, `utils.py`) reaches all three
+kernels: clean `flyc_attn_fwd`, `flyc_bwd_dq` and `flyc_bwd_dkdv`. Edits to `modules/*/aot/*.py` also need
 `cmake .` in the build directory before `ninja`. To check what got packaged,
 extract the zip entry and unpack it with `python -m python.unaks2`, then `cmp`
 it against the `.hsaco`.

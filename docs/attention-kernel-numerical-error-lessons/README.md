@@ -613,8 +613,9 @@ P in the forward and in dV. dS keeps the truncation: it is signed, and dQ and
 dK showed no material bias from it.
 
 **gfx942** has no f32 to bf16 convert either (`v_cvt_pk_bf16_f32` is gfx950
-and later), and its flyc forward rounds P the same way
-(`pack_p` in `modules/flash/flyc/gfx942/fwd.py`). NVIDIA rounds P to
+and later), and its flyc kernels round P the same way
+(`pack_operand` in `modules/flash/flyc/gfx942/utils.py`, which the softmax
+hooks in `gfx942/softmax.py` call). NVIDIA rounds P to
 nearest even in hardware (`cvt.rn.bf16x2.f32`) in FlashAttention 2, 3 and 4,
 so the ties-away rounding is the only difference from them, at exact ties.
 
