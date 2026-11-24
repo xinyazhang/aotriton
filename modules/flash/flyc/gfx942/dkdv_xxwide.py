@@ -1,38 +1,52 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""dK/dV backward for gfx942 at head dims 384 and 512, FlyDSL: role-split teams
-that also shard the contraction (gfx1201's contraction_shards = 2).
+"""The xxwide dK/dV body (head dims 384, 512) on `flex_gemm`, `softmax` and `tensor_io`.
 
-One team of four waves owns 16 * KV_SUBS keys. Wave (shard c, role r) holds K
-(r = 0) or V (r = 1), and dK^T or dV^T, only for the d columns [c, c + 1) * D/2,
-so a wave keeps 0.1875 * D * KV_SUBS registers of state (the xwide body: 0.375).
-S and dP are sums of the two shards' partials, reduced through LDS:
+    S  = Q.K^T                  P = exp2(sm_scale*log2e*S + log2e*bias - lse2)
+    dP = dO.V^T                 dS = P * (dP - Delta)
+    dV^T += dO^T.P              dK^T += Q^T.dS;  dK = sm_scale * dK
 
-    K-wave c: S_c  = Q[:, c] . K[:, c]^T       dK^T[c] += Q^T[c] . dS
-    V-wave c: dP_c = dO[:, c] . V[:, c]^T      dV^T[c] += dO^T[c] . P
-
-A wave reads only its own tensor's half (Q for K-waves, dO for V-waves), so it
-loads it itself, whole rows a 16B load, into an LDS area no other wave reads: X's
-row-major operands and Y's transposed ones (four dword reads, four v_perm) come
-back from it without a barrier. Per 16-row q tile j, two barrier-separated phases:
-    A(j): S, dP of tile j summed from the exchange; P(j), dS(j) of KV_SUBS
-          (column, row group) items a wave (at 3, a column a wave) to the exchange;
-          partial S or dP of tile j+1 from the own area; tile j+2 loads
-    B(j): partials of j+1 to the exchange; dK^T or dV^T += tile j from the derived
-          operands read in B(j-1); tile j+1's derived reads; tile j+2 to the own area
+One team of four waves owns 16 * kv_subs
+keys; wave (shard c, role r) holds K (r 0) or V (r 1), and dK^T or dV^T, for the
+d columns [c, c + 1) * D/2 only, so S and dP are sums of the two shards' partials,
+reduced through LDS:
+    K-wave c: S_c  = Q[:, c].K[:, c]^T   (`trait_ab`)   dK^T[c] += Q^T[c].dS   (`trait_tb`)
+    V-wave c: dP_c = dO[:, c].V[:, c]^T                 dV^T[c] += dO^T[c].P
+A wave loads its own tensor's half itself, whole rows a 16 B load, into an LDS
+area no other wave reads (that private staging stays in this body); X reads it
+row-major, Y derives its transpose (`derived_from`, the dword loads issued a
+phase before their v_perm). Per 16-row q tile j, two barrier-separated phases:
+    A(j): S, dP of tile j summed from the exchange; P(j), dS(j) of the wave's
+          items to the exchange; partial S or dP of tile j+1; tile j+2 loads
+    B(j): partials of j+1 to the exchange; dK^T or dV^T += tile j from the
+          derived loads of B(j-1); tile j+1's derived loads; tile j+2 to the own area
+The policy's band mask sets the score to -inf before exp2 (`mask_at` 'score':
++1.4% causal over 'prob', the same bits). Same kernel ABI and launcher
+interface as the narrow body in `dkdv.py`.
 """
+
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, ktrace, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from kernels.common import buffer_ops
 
 import fmha_utils as fmha
+from . import flex_gemm
+from . import softmax
+from . import tensor_io
 from . import tuning_dkdv as tuning
+from .flex_gemm import (
+    gemm_derived_load,
+    gemm_derived_ops,
+    gemm_mma_joint_at,
+    gemm_read_at,
+    gemm_read_plan,
+)
 from .utils import (
     LOG2E,
     WAVE,
@@ -43,8 +57,6 @@ from .utils import (
     cluster_barrier,
     col_mask,
     deal_keep_bits,
-    exp2,
-    mfma_16x16x16,
     pack_operand,
     philox_plane,
     philox_stream,
@@ -58,129 +70,153 @@ from .utils import (
 _LDS_DOMAIN = '#llvm.alias_scope_domain<id = "fmha_bwd_dkdv_gfx942_xxwide.lds">'
 LDS_SCOPES = ('own', 'xs', 'xp')
 NUM_WAVES = 4
-BLOCK_M = 16            # q rows per tile: the N of the 16x16x16 MFMA
+BM = 16                 # q rows per tile: the N of the 16x16x16 MFMA
 SHARDS = 2              # contraction shards: d halves
-XS_SUB = 2 * SHARDS * WAVE * 16     # partial S and dP of one key column, 16B per lane each
-XP_SUB = 2 * WAVE * 8   # P and dS packs of one key column, 8B per lane each
-# Dev sweeps only: Traits field -> value, applied to every build (and its cache tag).
-DEV_OVERRIDES = {}
+XS_SUB = 2 * SHARDS * WAVE * 16     # partial S and dP of one key column, 16 B per lane each
+XP_SUB = 2 * WAVE * 8   # P and dS packs of one key column, 8 B per lane each
 
 
-class Traits:
-    """Compile-time shape of one kernel."""
+@dataclass(frozen=True)
+class DkdvXxwideTraits:
+    """Everything one build fixes. Frozen Python values; the GEMMs derive from it."""
+    head_dim: int
+    padded: bool
+    causal: bool
+    dtype: str
+    kv_subs: int                # 16-key MFMA columns of the team
+    waves_per_eu: int
+    grid_axis_order: int
+    bias: bool
+    dropout: bool
+    dropout_scale_at: str       # softmax.P_DROP_PER_ELEM or P_DROP_AT_STORE
+    mask_at: str                # softmax.MASK_PROB or MASK_SCORE
+    z_at: int = 99              # the X step of A(j) that Z(j) follows (99: last)
+    w_at: int = 0               # the X step of A(j) the tile loads start after
 
-    def __init__(self, head_dim, causal, dtype_str, kv_subs, padded_head=False):
-        assert head_dim % 64 == 0 and 128 <= head_dim <= 512, head_dim
-        assert kv_subs in (2, 3, 4), kv_subs
-        self.D = head_dim
-        self.PADDED = padded_head
-        self.CAUSAL = causal
-        self.DTYPE = dtype_str
-        self.NSUB = kv_subs                     # 16-key MFMA columns of the team
-        self.BLOCK_KV = 16 * kv_subs
-        self.BLOCK_SIZE = NUM_WAVES * WAVE
-        self.NT = head_dim // 32                # 32-column d blocks: one 16B operand read, two k-steps
-        # Softmax items (column, row r) per wave and tile: KV_SUBS of them, or at 3 a column
-        # each, the fourth wave on a spare column.
-        self.NI = 4 if kv_subs == 3 else kv_subs
-        self.NZ = 4 if kv_subs == 3 else kv_subs   # exchange columns
-        self.NB = self.NT // SHARDS             # own blocks
-        self.Z_AT = 99                          # the X step of A(j) that Z(j) follows (99: last)
-        self.W_AT = 0                           # the X step of A(j) the tile loads start after
-        # Pin the resident K or V to VGPRs ('v') or AGPRs ('a'); '' leaves LLVM free. 512 at
-        # KV_SUBS 3: 'v' spills, 'a' and '' do not ('' 424 vs 418 TFLOPS).
-        self.KV_PIN = ''
-        # Walk q tiles last to first: a causal head's blocks then all start on its last
-        # tiles and share them in L2, instead of each starting at its own diagonal.
-        self.Q_DOWN = causal
-        self.TRACE = False                      # dev: ktrace marks per phase
-        self.EXP = ''                           # dev experiments (wrong results): 'nosm', 'nobar', 'nox', 'noy', 'noder'
-        for k, v in DEV_OVERRIDES.items():
-            assert hasattr(self, k), k
-            setattr(self, k, v)
-        # Each wave's own area: its tensor's 16 rows, its half of the columns.
-        self.OWN_STRIDE = self._stride(self.NB * 32)
-        self.OWN_BYTES = BLOCK_M * self.OWN_STRIDE
-        self.CPR = head_dim // 16               # 16B chunks of a row's own half
-        self.N_LD = BLOCK_M * self.CPR // WAVE  # 16B loads a lane per tile
-        self.LDS_OWN = 0
-        self.LDS_XS = NUM_WAVES * self.OWN_BYTES
-        self.LDS_XP = self.LDS_XS + self.NZ * XS_SUB
-        self.LDS_BYTES = self.LDS_XP + self.NZ * XP_SUB
-        assert self.LDS_BYTES <= 65536, self.LDS_BYTES
-        self.CACHE_TAG = (f'BXX{head_dim}_c{int(causal)}_{dtype_str}_s{kv_subs}_p{int(padded_head)}'
-                          f'_z{self.Z_AT}.{self.W_AT}_k{self.KV_PIN}_d{int(self.Q_DOWN)}_e{self.EXP}_t{int(self.TRACE)}')
+    # make_dkdv_launch's names
+    @property
+    def D(self):  # noqa: N802
+        return self.head_dim
 
-    @staticmethod
-    def _stride(cols):
-        """Rows an odd number of 16B chunks apart: conflict-free b128 reads, and the
-        derived reads' four row groups (4 rows apart) land on distinct bank halves."""
-        chunks = cols // 8
-        return (chunks + 1 - chunks % 2) * 16
+    @property
+    def PADDED(self):  # noqa: N802
+        return self.padded
 
+    @property
+    def block_size(self):
+        return NUM_WAVES * WAVE
 
-def lds_bytes(head_dim, kv_subs):
-    """LDS of a build, for the tuning module's legality check."""
-    return Traits(head_dim, False, 'bf16', kv_subs).LDS_BYTES
+    @property
+    def block_kv(self):
+        return 16 * self.kv_subs
+
+    @property
+    def pad_floor(self):
+        return 0 if self.padded else self.head_dim
+
+    @property
+    def items(self):
+        """Softmax items (column, row r) per wave and tile: kv_subs of them, or at 3 a
+        column each, the fourth wave on a spare column. Also the exchange's columns."""
+        return 4 if self.kv_subs == 3 else self.kv_subs
+
+    @property
+    def q_down(self):
+        """Walk q tiles last to first: a causal head's blocks then all start on its last
+        tiles and share them in L2, instead of each starting at its own diagonal."""
+        return self.causal
+
+    def gemms(self):
+        """(X, Y): X = partial S or dP on the wave's own area (its tensor's 16 rows,
+        its half of the columns; area `wave`), Y = dK^T or dV^T derived from it."""
+        xg = flex_gemm.trait_ab(self.dtype,
+                                BM,
+                                self.head_dim // SHARDS,
+                                self.pad_floor,
+                                self.block_size,
+                                0,
+                                'own',
+                                dma='rows',
+                                mfma='16x16x16',
+                                buffers=1,
+                                b_tiles=self.kv_subs)
+        yg = flex_gemm.trait_tb(self.dtype,
+                                BM,
+                                self.head_dim // SHARDS,
+                                self.block_size,
+                                0,
+                                'own',
+                                mfma='16x16x16',
+                                derived_from=xg.a,
+                                b_tiles=self.kv_subs)
+        return xg, yg
 
 
 def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
-                                     causal=False,
-                                     causal_type=None,
-                                     dtype_str='bf16',
-                                     bias=False,
-                                     dropout=False,
-                                     kv_subs=None,
-                                     waves_per_eu=1,
-                                     grid_axis_order=None,
-                                     padded_head=False):
-    """The gfx1201 dK/dV kernel's ABI and `_launch` interface, for the widest heads."""
+                                           causal=False,
+                                           causal_type=None,
+                                           dtype_str='bf16',
+                                           bias=False,
+                                           dropout=False,
+                                           kv_subs=None,
+                                           waves_per_eu=1,
+                                           grid_axis_order=None,
+                                           padded_head=False,
+                                           dropout_scale_at=None,
+                                           mask_at=None):
+    """build_fmha_bwd_dkdv_gfx942's interface and kernel ABI, for head dims 384 and 512."""
+    assert head_dim % 64 == 0 and 128 <= head_dim <= 512, head_dim
     host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
     if kv_subs is None:
         kv_subs = tuning.body_kv_subs('xxwide', head_dim)
-    tr = Traits(head_dim, causal_type != 0, dtype_str, kv_subs, padded_head)
+    assert kv_subs in (2, 3, 4), kv_subs
     if grid_axis_order is None:
-        grid_axis_order = tuning.default_grid_axis_order(tr.CAUSAL)
+        grid_axis_order = tuning.default_grid_axis_order(causal_type != 0)
+    tr = DkdvXxwideTraits(head_dim=head_dim,
+                          padded=padded_head,
+                          causal=causal_type != 0,
+                          dtype=dtype_str,
+                          kv_subs=kv_subs,
+                          waves_per_eu=waves_per_eu,
+                          grid_axis_order=grid_axis_order,
+                          bias=bias,
+                          dropout=dropout,
+                          dropout_scale_at=dropout_scale_at or tuning.default_dropout_scale_at('xxwide'),
+                          mask_at=mask_at or tuning.default_mask_at('xxwide'))
+    xg, yg = tr.gemms()
+    NSUB = tr.kv_subs
+    NI = tr.items
+    NB = xg.reads                   # own 32-column blocks: one 16 B read, two k-steps
+    n_acc = yg.n_acc
+    own_bytes = xg.a.tile_bytes
+    own_stride = xg.a.stride
+    cpr = head_dim // 16            # 16 B chunks of a row's own half
+    n_ld = BM * cpr // WAVE         # 16 B loads a lane per tile
+    lds_xs = NUM_WAVES * own_bytes
+    lds_xp = lds_xs + NI * XS_SUB
+    lds_bytes = lds_xp + NI * XP_SUB
+    assert lds_bytes <= 65536, lds_bytes
+    tag = 'dkdv_xxwide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
-    cache_tag = f'{tr.CACHE_TAG}_wpe{waves_per_eu}_g{grid_axis_order}_b{int(bias)}_d{int(dropout)}'
-    elem = fx.BFloat16 if dtype_str == 'bf16' else fx.Float16
-    block_kv = tr.BLOCK_KV
-
-    def v4e():
-        return Vec.make_type(4, elem)
-
-    def v8e():
-        return Vec.make_type(8, elem)
-
-    @fx.struct
-    class Smem:
-        buf: fx.Array[fx.Int8, tr.LDS_BYTES, 16]
-
-    def mfma(a, b, c):
-        return mfma_16x16x16(a, b, c, elem)
-
-    def pack4(vals):
-        return pack_operand(vals, elem)
+    elem = flex_gemm.elem_type(dtype_str)
 
     def pack_items(vals):
-        """NI f32 -> the bits of NI elements: i32 or <2 x i32>; bf16 rounds as pack4."""
+        """NI f32 -> the bits of NI elements: i32 or <2 x i32>; bf16 rounds as pack_operand."""
         if const_expr(len(vals) == 4):
-            return Vec(pack4(vals)).bitcast(fx.Int32)
-        if const_expr(tr.DTYPE == 'bf16'):
+            return Vec(pack_operand(vals, elem)).bitcast(fx.Int32)
+        if const_expr(dtype_str == 'bf16'):
             rnd = [fx.Float32(x).bitcast(fx.Int32) + fx.Int32(0x8000) for x in vals]
             return fx.Int32(rocdl.perm_b32(rnd[1], rnd[0], fx.Int32(0x07060302)))
         return Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem).bitcast(fx.Int32)[0]
 
-    def scope_attrs(name):
+    @fx.struct
+    class Smem:
+        buf: fx.Array[fx.Int8, lds_bytes, 16]
+
+    def scopes(name):
         return alias_scopes(_LDS_DOMAIN, LDS_SCOPES, name)
 
-    def trace(name):
-        """Under FLYDSL_KTRACE_ENABLE=1 (or a ktrace capture), a timestamp."""
-        rocdl.sched_barrier(0)
-        ktrace.mark(name)
-        rocdl.sched_barrier(0)
-
-    @flyc.kernel(known_block_size=[tr.BLOCK_SIZE, 1, 1])
+    @flyc.kernel(known_block_size=[tr.block_size, 1, 1])
     # The kernel ABI is bwd_dkdv_kernel's (gfx1201), so aot/flyc_bwd_dkdv.py can serve both.
     def fmha_bwd_dkdv_gfx942_kernel(
         Q: fx.Pointer,
@@ -234,7 +270,8 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
         stride_b_head: fx.Int64,
         stride_b_seq_q: fx.Int64,
     ):
-        _ = cache_tag
+        _ = tag
+        # ---- prelude: lane roles, this block's kv tile and kv head, sequence bounds
         tid = fx.Index(gpu.thread_idx.x)
         wave = tid // WAVE
         lane = tid % WAVE
@@ -255,13 +292,11 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
         shard = wave_s >> fx.Int32(1)           # own columns: [shard, shard + 1) * D / 2
         is_v = role == fx.Int32(1)
         # Softmax items (column z_sub, rows 4gq + z_r0 + [0, NI)): wave w takes items w * NI + [0, NI).
-        z_sub = (wave_s * fx.Int32(tr.NI)) >> fx.Int32(2)
-        z_r0 = (wave_s * fx.Int32(tr.NI)) & fx.Int32(3)
+        z_sub = (wave_s * fx.Int32(NI)) >> fx.Int32(2)
+        z_r0 = (wave_s * fx.Int32(NI)) & fx.Int32(3)
 
         lds = fx.SharedAllocator().allocate(Smem).peek()
         lds_p = lds.buf.ptr
-        lds_base = fx.Index(fx.ptrtoint(lds_p))
-
         lds_io = Lds(lds_p, elem, _LDS_DOMAIN, LDS_SCOPES)
 
         # The 8xD contract: a row owns ceil8(hdim) columns (numerical lessons, #11).
@@ -272,8 +307,9 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
         def masked8(v8, c0, hdim):
             return apply_mask(v8, col_mask(c0, hdim), elem)
 
-        # ---- The resident B operand: K (K-wave) or V (V-wave) of the own half, key kvt + 16 sub + lc ----
-        k0 = fx.Int32(kv_tile) * fx.Int32(tr.BLOCK_KV)
+        # ---- the resident B operand: K (K-wave) or V (V-wave) of the own half, key
+        # kvt + 16 sub + lc; as B packs [block][read]
+        k0 = fx.Int32(kv_tile) * fx.Int32(tr.block_kv)
         kvt = k0
         k_base = base_addr(K, k_batch, head_k, k_row_off, stride_k_batch, stride_k_head, stride_k_seq)
         v_base = base_addr(V, k_batch, head_k, k_row_off, stride_v_batch, stride_v_head, stride_v_seq)
@@ -283,25 +319,22 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                                                                                           r_ss,
                                                                                           is_v.select(row_vo, row_qk)))
         res = []
-        for t in range_constexpr(tr.NB):
+        for t in range_constexpr(NB):
             row = []
-            for sub in range_constexpr(tr.NSUB):
+            for sub in range_constexpr(NSUB):
                 r = fx.Index(kvt + fx.Int32(16 * sub)) + lc
-                c0 = fx.Index(32 * t) + fx.Index(shard) * (tr.D // 2) + gq * 8
+                c0 = fx.Index(32 * t) + fx.Index(shard) * (head_dim // 2) + gq * 8
                 v8 = buffer_ops.buffer_load(r_rsrc, r * fx.Index(fx.Int32(r_ss)) + c0, vec_width=8, dtype=elem)
-                if const_expr(tr.PADDED):
+                if const_expr(tr.padded):
                     # Slack columns may hold NaN, and 0 * NaN is NaN.
                     v8 = masked8(v8, fx.Int32(c0), hdim_own)
                 row.append(v8)
             res.append(row)
-        if const_expr(tr.KV_PIN):
-            flat = pin_values([x for row in res for x in row], tr.KV_PIN)
-            res = [[flat[t * tr.NSUB + sub] for sub in range(tr.NSUB)] for t in range(tr.NB)]
-        res = [[Vec(x) for x in row] for row in res]
+        res = [[Vec(res[t][sub]) for t in range(NB)] for sub in range(NSUB)]
 
-        # ---- The visited q range of this key block ----
-        k_hi = smin(k0 + fx.Int32(tr.BLOCK_KV), sk_i32) - fx.Int32(1)
-        if const_expr(tr.CAUSAL):
+        # ---- the visited q range of this key block
+        k_hi = smin(k0 + fx.Int32(tr.block_kv), sk_i32) - fx.Int32(1)
+        if const_expr(tr.causal):
             win_l, win_r = fmha.resolve_window(window_left, window_right, sq_i32, sk_i32, varlen_bits)
             q_lo = smax(k0 - win_r, fx.Int32(0))
             q_hi = smin(k_hi + win_l, sq_i32 - fx.Int32(1))
@@ -309,8 +342,8 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
             q_lo = fx.Int32(0)
             q_hi = sq_i32 - fx.Int32(1)
         alive = (k0 < sk_i32) & (q_lo <= q_hi)
-        t0 = alive.select(q_lo, fx.Int32(0)) // fx.Int32(BLOCK_M)
-        n_tiles = alive.select(q_hi // fx.Int32(BLOCK_M) - t0 + fx.Int32(1), fx.Int32(0))
+        t0 = alive.select(q_lo, fx.Int32(0)) // fx.Int32(BM)
+        n_tiles = alive.select(q_hi // fx.Int32(BM) - t0 + fx.Int32(1), fx.Int32(0))
         t_last = t0 + n_tiles - fx.Int32(1)
         n_pairs = n_tiles // fx.Int32(2)
 
@@ -318,45 +351,19 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
         soft_kv = kvt + fx.Int32(16) * z_sub + fx.Int32(lc)
         # Key kv sees q rows [kv - win_r, kv - win_r + band_span]: one unsigned compare per element
         # of rel = q - kv + win_r = q0 + band_s + (4gq - lc + r), band_s wave-uniform.
-        if const_expr(tr.CAUSAL):
+        if const_expr(tr.causal):
             empty = win_l + win_r < fx.Int32(0)
             band_span = empty.select(fx.Int32(0), win_l + win_r)
             band_s = empty.select(fx.Int32(1 << 30), win_r - kvt - fx.Int32(16) * z_sub + z_r0)
 
-        # ---- Per-lane LDS offsets ----
-        # Own area: X's operand of block b is row lc, chunk 4b + gq; the derived reads of
-        # block b are dword 16b + lc (d = D/2 shard + 32b + 2lc, +1) of rows 4gq + [0, 4).
-        own_base = fx.Index(tr.LDS_OWN) + fx.Index(wave) * tr.OWN_BYTES
-        own_x = own_base + lc * tr.OWN_STRIDE + gq * 16
-        own_rd = own_base + gq * (4 * tr.OWN_STRIDE) + lc * 4
-        # Exchange: partial S / dP at [sub][2 shard + role][lane]; P, dS at [sub][P, dS][lane].
-        xs_at = fx.Index(tr.LDS_XS) + lane * 16
-        xp_at = fx.Index(tr.LDS_XP) + lane * 8
+        # ---- LDS plans: X reads the wave's own area row-major, Y derives its transpose;
+        # the exchange: partial S / dP at [sub][2 shard + role][lane]; P, dS at [sub][P, dS][lane].
+        own_base = fx.Index(xg.a.lds_base) + fx.Index(wave) * own_bytes
+        x_plan = gemm_read_plan(xg, lc, gq, tensor=wave)
+        y_plan = gemm_read_plan(yg, lc, gq, tensor=wave)
+        xs_at = fx.Index(lds_xs) + lane * 16
+        xp_at = fx.Index(lds_xp) + lane * 8
 
-        def derived_load(b):
-            """The four dwords of own block b at d = 2m and 2m + 1 (m = lc), rows 4gq + [0, 4).
-            (gfx942's SRAMECC zeroes the other half of a d16 load, so u16 reads pack no cheaper.)"""
-            al, noal = scope_attrs('own')
-            w = []
-            for i in range_constexpr(4):
-                off = own_rd + (i * tr.OWN_STRIDE + 64 * b)
-                w.append(fx.Int32(llvm.LoadOp(T.i32,
-                                              lds_io.view(off, fx.Int32, 4).llvm_ptr,
-                                              alignment=4,
-                                              alias_scopes=al,
-                                              noalias_scopes=noal).result))
-            return w
-
-        def derived_ops(w):
-            """derived_load's dwords -> the A operands of d = 2m and 2m + 1: four v_perm."""
-            out = []
-            for sel in (sel_lo, sel_hi):
-                dw = [fx.Int32(rocdl.perm_b32(w[1], w[0], sel)), fx.Int32(rocdl.perm_b32(w[3], w[2], sel))]
-                out.append(Vec.from_elements(dw, fx.Int32).bitcast(elem).ir_value())
-            return out
-
-        sel_lo = fx.Int32(0x05040100)
-        sel_hi = fx.Int32(0x07060302)
         c_scale = fx.Float32(sm_scale) * fx.Float32(LOG2E)
         zero4 = fx.full(4, 0.0, fx.Float32)
         if const_expr(dropout):
@@ -367,34 +374,31 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
             quad_shift = fx.Int32(lc % 4) + z_r0 * fx.Int32(4)
         lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
-        def store_out(accs):
-            """Accumulator (2b + e, sub) holds dK^T or dV^T [d = D/2 shard + 32b + 8gq + 2r + e][key kvt + 16sub + lc]."""
-            dk_base = base_addr(DK, k_batch, head_k, k_row_off, stride_dk_batch, stride_dk_head, stride_dk_seq)
-            dv_base = base_addr(DV, k_batch, head_k, k_row_off, stride_dv_batch, stride_dv_head, stride_dv_seq)
-            o_ss = is_v.select(fx.Int64(stride_dv_seq), fx.Int64(stride_dk_seq))
-            row_lim = is_v.select(row_vo, row_qk)
-            rsrc = buffer_ops.create_buffer_resource_from_addr(is_v.select(dv_base, dk_base),
-                                                               num_records_bytes=span_bytes(sk_i32, o_ss, row_lim))
-            ss = fx.Index(fx.Int32(o_ss))
-            # dS is against the scaled scores: sm_scale lands once, here.
-            scale = is_v.select(fx.Float32(1.0), fx.Float32(sm_scale))
-            sv = fx.full(4, scale, fx.Float32)
-            for u in range_constexpr(tr.NB):
-                for sub in range_constexpr(tr.NSUB):
-                    ev = Vec(accs[(2 * u) * tr.NSUB + sub]) * sv
-                    od = Vec(accs[(2 * u + 1) * tr.NSUB + sub]) * sv
-                    vals = [x for r in range(4) for x in (ev[r], od[r])]
-                    packed = Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem)
-                    kv = kvt + fx.Int32(16 * sub) + fx.Int32(lc)
-                    d = fx.Int32(32 * u) + shard * fx.Int32(tr.D // 2) + fx.Int32(gq * 8)
-                    for hh in range_constexpr(2):
-                        ok = (kv < sk_i32) & (d + fx.Int32(4 * hh) < row_lim)
-                        half = packed.shuffle(packed, [4 * hh + x for x in range(4)])
-                        buffer_ops.buffer_store(half.ir_value(),
-                                                rsrc,
-                                                fx.Index(kv) * ss + fx.Index(d + fx.Int32(4 * hh)),
-                                                mask=ok)
+        ctx = flex_gemm.Ctx(tr, carried=('acc', 'dvd', 'side', 'bias'))
+        ctx.dropout_scale = dropout_scale
 
+        # ---- the schedule's driver: steps in order, other work after given steps
+        def run(steps, hooks):
+            """steps (callables) with hooks[i] after step i; LDS reads and MFMAs keep their order."""
+            for t in range_constexpr(len(steps)):
+                pinned()
+                steps[t]()
+                for h in hooks.get(t, []):
+                    h()
+                pinned()
+
+        def spread(hooks, n, work, first=0):
+            """work over steps first..n-1, evenly."""
+            for i, f in enumerate(work):
+                hooks.setdefault(min(n - 1, first + i * (n - first) // max(1, len(work))), []).append(f)
+            return hooks
+
+        def phase_end():
+            """LDS writes done, then the barrier; the tile loads stay in flight."""
+            rocdl.s_waitcnt(lgkmcnt=0)
+            cluster_barrier()
+
+        # ---- per q head of this kv head's group: dK/dV accumulate over all of them
         def head_pass(g, accs):
             """Every q tile of query head head_k * group + g, accumulated into accs."""
             head_q = fx.Index(fx.Int32(head_k) * group + g)
@@ -436,43 +440,41 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                 ph_base, ph_stride = philox_plane(rng, ph_off, z_i32, num_head_q, head_q, max_seqlen_q, max_seqlen_k)
 
             def q0_of(j):
-                if const_expr(tr.Q_DOWN):
-                    return (t_last - j) * fx.Int32(BLOCK_M)
-                return (t0 + j) * fx.Int32(BLOCK_M)
+                if const_expr(tr.q_down):
+                    return (t_last - j) * fx.Int32(BM)
+                return (t0 + j) * fx.Int32(BM)
 
-            # Load i of a lane: 16B chunk c = 64i + lane of the wave's half-rows, whole rows a load.
-            r_row = [fx.Int32((fx.Index(WAVE * i) + lane) // tr.CPR) for i in range(tr.N_LD)]
-            r_col = [fx.Int32((fx.Index(WAVE * i) + lane) % tr.CPR) for i in range(tr.N_LD)]
-            r_voff = [r_row[i] * o_rs_b + r_col[i] * fx.Int32(16) + shard * fx.Int32(tr.D) for i in range(tr.N_LD)]
+            # ---- private staging (this body's own): load i of a lane is 16 B chunk 64i + lane
+            # of the wave's half-rows, whole rows a load; written to the own area as loaded.
+            r_row = [fx.Int32((fx.Index(WAVE * i) + lane) // cpr) for i in range(n_ld)]
+            r_col = [fx.Int32((fx.Index(WAVE * i) + lane) % cpr) for i in range(n_ld)]
+            r_voff = [r_row[i] * o_rs_b + r_col[i] * fx.Int32(16) + shard * fx.Int32(head_dim) for i in range(n_ld)]
 
             def x_loads(j, out):
-                """Own tile j into out (N_LD v8), one callable a load."""
+                """Own tile j into out (n_ld v8), one callable a load."""
                 def ld(i):
-                    v = rocdl.raw_ptr_buffer_load(v8e(), o_rsrc, r_voff[i], q0_of(j) * o_rs_b, 0)
-                    if const_expr(tr.PADDED):
+                    v = rocdl.raw_ptr_buffer_load(Vec.make_type(8, elem), o_rsrc, r_voff[i], q0_of(j) * o_rs_b, 0)
+                    if const_expr(tr.padded):
                         # Slack columns may hold NaN, and 0 * NaN is NaN.
-                        v = masked8(v, r_col[i] * fx.Int32(8) + shard * fx.Int32(tr.D // 2), hdim_own)
+                        v = masked8(v, r_col[i] * fx.Int32(8) + shard * fx.Int32(head_dim // 2), hdim_own)
                     out[i] = v
-                out.extend([None] * tr.N_LD)
-                return [lambda i=i: ld(i) for i in range(tr.N_LD)]
+                out.extend([None] * n_ld)
+                return [lambda i=i: ld(i) for i in range(n_ld)]
 
-            def own_writes(xop):
-                """The own tile to its LDS area, one callable a load."""
-                def wr(i):
-                    at = own_base + fx.Index(r_row[i]) * tr.OWN_STRIDE + fx.Index(r_col[i]) * 16
+            def refill(xop):
+                """Tile xop to the own area, after the derived loads of the tile before (the
+                same wave's LDS ops run in order)."""
+                for i in range_constexpr(n_ld):
+                    at = own_base + fx.Index(r_row[i]) * own_stride + fx.Index(r_col[i]) * 16
                     lds_io.store(at, Vec(xop[i]).bitcast(fx.Int32), 16, 'own')
-                return [lambda i=i: wr(i) for i in range(tr.N_LD)]
 
-            def x_operands():
-                """X's A operands of own block b: row lc, chunk 4b + gq."""
-                return [lds_io.load(own_x + 64 * b, v8e(), 16, 'own') for b in range(tr.NB)]
-
+            # ---- memory: LSE/Delta and bias of the wave's softmax items
             def side_load(j):
-                """LSE and Delta of q = q0 + 4gq + z_r0 + i, i < NI, as f32."""
+                """LSE and Delta of q = q0 + 4gq + z_r0 + i, i < NI, as i32."""
                 soff = q0_of(j) * pitch_b
                 out = []
                 for rsrc in (lse_rsrc, delta_rsrc):
-                    for i in range_constexpr(tr.NI):
+                    for i in range_constexpr(NI):
                         out.append(fx.Int32(rocdl.raw_ptr_buffer_load(fx.Int32.ir_type,
                                                                       rsrc,
                                                                       side_voff + fx.Int32(i) * pitch_b,
@@ -486,192 +488,136 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                     return []
                 bsoff = q0_of(j) * b_rs_b
                 out = []
-                for i in range_constexpr(tr.NI):
+                for i in range_constexpr(NI):
                     h = rocdl.raw_ptr_buffer_load(T.i16, b_rsrc, b_voff + fx.Int32(i) * b_rs_b, bsoff, 0)
                     out.append(fx.Int32(fx.Int16(h)))
                 return out
 
+            # ---- score hooks: the band mask, bias, dropout keep bits
             def keep_bits(q0):
                 """Dropout keep of (q0 + 4gq + z_r0 + i, soft_kv) for i < NI, as i1."""
                 kv4 = soft_kv - fx.Int32(lc % 4)
                 row = q0 + fx.Int32(gq * 4 + lc % 4)
-                return deal_keep_bits(rng, ph_seed, ph_base, ph_stride, row, kv4, idropout_p, quad_shift, tr.NI)
+                return deal_keep_bits(rng, ph_seed, ph_base, ph_stride, row, kv4, idropout_p, quad_shift, NI)
 
-            def softmax(s_raw, dp_raw, lse, delta, bvals, q0, masked):
-                """P (dropped, for dV) and dS of the softmax items, f32."""
+            def p_ds(s_raw, dp_raw, lse, delta, bvals, q0, masked):
+                """P (for dV) and dS of the softmax items, f32."""
+                mask_of = None
                 if const_expr(masked):
                     # The lane term afresh per tile: hoisted, it holds a VGPR through the loop.
                     lt = fx.Int32(lane // 16) * fx.Int32(4) - fx.Int32(lane % 16)
                     lt = fx.Int32(pin_values([lt])[0])
                     rel0 = q0 + band_s + lt
+
+                    def mask_of(v, r, fill):
+                        live = fx.Uint32(rel0 + fx.Int32(r)) <= fx.Uint32(band_span)
+                        return live.select(v, fill)
+                keep = None
                 if const_expr(dropout):
                     keep = keep_bits(q0)
-                ps = []
-                dss = []
-                for r in range_constexpr(tr.NI):
-                    x = fx.Float32(s_raw[r]) * fx.Float32(c_scale)
-                    if const_expr(bias):
-                        bv = Vec.from_elements([fx.Int16(bvals[r])], fx.Int16).bitcast(elem)
-                        # Upcast first: log2(e) in the input dtype would differ from the forward's.
-                        x = x + fx.Float32(Vec(bv)[0].to(fx.Float32)) * fx.Float32(LOG2E)
-                    p = exp2(x - fx.Float32(lse[r]) * fx.Float32(LOG2E))
-                    if const_expr(masked):
-                        live = fx.Uint32(rel0 + fx.Int32(r)) <= fx.Uint32(band_span)
-                        p = live.select(p, fx.Float32(0.0))
-                    dpr = fx.Float32(dp_raw[r])
-                    p_drop = p
-                    if const_expr(dropout):
-                        p_drop = keep[r].select(p * fx.Float32(dropout_scale), fx.Float32(0.0))
-                        dpr = keep[r].select(dpr * fx.Float32(dropout_scale), fx.Float32(0.0))
-                    ps.append(p_drop)
-                    dss.append(p * (dpr - fx.Float32(delta[r])))
-                return ps, dss
 
-            def x_steps(xop, own):
-                """Partial S or dP of a tile from its own blocks xop into own, one step a block."""
-                def x_use(b):
-                    if const_expr('nox' in tr.EXP):
-                        return
-                    x8 = Vec(xop[b])
-                    for e in range_constexpr(2):
-                        sl = [4 * e, 4 * e + 1, 4 * e + 2, 4 * e + 3]
-                        xa = x8.shuffle(x8, sl).ir_value()
-                        for sub in range_constexpr(tr.NSUB):
-                            rb = res[b][sub]
-                            own[sub] = mfma(xa, rb.shuffle(rb, sl).ir_value(), own[sub])
-                return [lambda b=b: x_use(b) for b in range(tr.NB)]
+                def bias_of(r):
+                    bv = Vec.from_elements([fx.Int16(bvals[r])], fx.Int16).bitcast(elem)
+                    return fx.Float32(Vec(bv)[0].to(fx.Float32))
+                return softmax.p_ds_elems(ctx,
+                                          s_raw,
+                                          dp_raw,
+                                          lambda r: fx.Float32(lse[r]) * fx.Float32(LOG2E),
+                                          delta,
+                                          bias_of,
+                                          mask_of,
+                                          keep,
+                                          c_scale=c_scale)
 
-            def derived_hooks(out):
-                """Derived reads of every own block into out, one callable a block."""
-                def rd(b):
-                    if const_expr('noder' in tr.EXP):
-                        out[b] = [fx.Int32(lane) + fx.Int32(i) for i in range(4)]
-                        return
-                    out[b] = derived_load(b)
-                out.extend([None] * tr.NB)
-                return [lambda b=b: rd(b) for b in range(tr.NB)]
+            # ---- the exchange: S/dP partials in, sums and P/dS out. Its layout follows the
+            # shards' and roles' lane split, so it stays in this body.
+            def z_sums():
+                """Tile j's four partials of the wave's items, as loads (issued early)."""
+                z_at = xs_at + fx.Index(z_sub) * XS_SUB + fx.Index(z_r0) * 4
+                ni_t = Vec.make_type(NI, fx.Float32)
+                return [lds_io.load(z_at + w * (WAVE * 16), ni_t, 4 * NI, 'xs') for w in range(2 * SHARDS)]
+
+            def xp_put(ps, dss):
+                xo = xp_at + fx.Index(z_sub) * XP_SUB + fx.Index(z_r0) * 2
+                for k, vals in enumerate((ps, dss)):
+                    lds_io.store(xo + k * (WAVE * 8), pack_items(vals), 2 * NI, 'xp')
 
             def write_partials(own):
-                for sub in range_constexpr(tr.NSUB):
+                for sub in range_constexpr(NSUB):
                     lds_io.store(xs_at + fx.Index(wave_s) * (WAVE * 16) + sub * XS_SUB, own[sub], 16, 'xs')
 
-            def run(steps, hooks):
-                """steps (callables) with hooks[i] after step i; LDS reads and MFMAs keep their order."""
-                for t in range_constexpr(len(steps)):
-                    pinned()
-                    steps[t]()
-                    for h in hooks.get(t, []):
-                        h()
-                    pinned()
+            def xp_get():
+                """The B operand of Y: dS (K-wave) or P (V-wave) of every column."""
+                pk_off = (fx.Index(1) - fx.Index(role)) * (WAVE * 8)
+                return [lds_io.load(xp_at + (sub * XP_SUB) + pk_off, Vec.make_type(4, elem), 8, 'xp')
+                        for sub in range(NSUB)]
 
-            def spread(hooks, n, work, first=0):
-                """work over steps first..n-1, evenly."""
-                for i, f in enumerate(work):
-                    hooks.setdefault(min(n - 1, first + i * (n - first) // max(1, len(work))), []).append(f)
-                return hooks
+            # ---- GEMM steps: X = partial S or dP, Y = dK^T or dV^T, one step a block
+            def x_steps(own):
+                """X's A of every own block read now, then one MFMA step a block into own."""
+                xop = [gemm_read_at(xg, x_plan, lds_io, 0, b) for b in range(NB)]
+                return [lambda b=b: gemm_mma_joint_at((xg,), b, [xop[b]], (res,), [own]) for b in range(NB)]
 
-            def phase_end(name=None):
-                """LDS writes done, then the barrier; the tile loads stay in flight."""
-                if const_expr(name is not None):
-                    trace(name)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                if const_expr('nobar' in tr.EXP):
-                    return
-                cluster_barrier()
-                if const_expr(name is not None):
-                    trace(name + 'b')
+            def derived_loads(out):
+                """Y's derived dwords of every own block into out, one callable a block."""
+                def rd(b):
+                    out[b] = gemm_derived_load(yg, y_plan, lds_io, 0, b)
+                out.extend([None] * NB)
+                return [lambda b=b: rd(b) for b in range(NB)]
 
-            n_bias = tr.NI if bias else 0
-
-            def unpack(c):
-                o = n_acc
-                accs = list(c[:o])
-                dvd = [list(c[o + 4 * b:o + 4 * b + 4]) for b in range(tr.NB)]
-                o += 4 * tr.NB
-                side = list(c[o:o + 2 * tr.NI])
-                o += 2 * tr.NI
-                bv = list(c[o:o + n_bias])
-                o += n_bias
-                return accs, dvd, side, bv
-
-            def refill(xop):
-                """Tile xop to the own area, after the derived reads of the tile before (the
-                same wave's LDS ops run in order)."""
-                if const_expr('nowr' not in tr.EXP):
-                    for f in own_writes(xop):
-                        f()
-
-            def iteration(j, carried, masked):
-                """A(j): Z(j), X(j+1); B(j): Y(j), derived reads of tile j+1, tile j+2 to the own area.
-                Carried: the accumulators, tile j's derived dwords, LSE/Delta and bias items."""
-                accs, dvd, side, bvals = unpack(carried)
+            # ---- the tile loop. Carried: the accumulators, tile j's derived dwords, LSE/Delta, bias.
+            def iteration(j, masked):
                 q0 = q0_of(j)
-                lse = [fx.Int32(x).bitcast(fx.Float32) for x in side[:tr.NI]]
-                delta = [fx.Int32(x).bitcast(fx.Float32) for x in side[tr.NI:]]
-
-                # ---- A(j): side(j+1), bias(j+1) and tile j+2 load.
+                lse = [fx.Int32(x).bitcast(fx.Float32) for x in ctx.side[:NI]]
+                delta = [fx.Int32(x).bitcast(fx.Float32) for x in ctx.side[NI:]]
+                # A(j): partial S or dP of tile j+1 on the MFMAs, the tile j+2 loads spread over
+                # them; after them Z(j): S, dP summed from the exchange, P and dS to it.
                 side_next = side_load(j + fx.Int32(1))
                 bias_next = bias_load(j + fx.Int32(1))
                 rocdl.sched_barrier(0)
-                ni_t = Vec.make_type(tr.NI, fx.Float32)
-                z_at = xs_at + fx.Index(z_sub) * XS_SUB + fx.Index(z_r0) * 4
-                xs = [lds_io.load(z_at + w * (WAVE * 16), ni_t, 4 * tr.NI, 'xs') for w in range(2 * SHARDS)]
+                xs = z_sums()
 
                 def z_work():
-                    parts = [[Vec(x)[i] for i in range(tr.NI)] for x in xs]
-                    s_sum = [fx.Float32(parts[0][i]) + fx.Float32(parts[2][i]) for i in range(tr.NI)]
-                    dp_sum = [fx.Float32(parts[1][i]) + fx.Float32(parts[3][i]) for i in range(tr.NI)]
-                    if const_expr('nosm' in tr.EXP):
-                        ps, dss = s_sum, dp_sum
-                    else:
-                        ps, dss = softmax(s_sum, dp_sum, lse, delta, bvals, q0, masked)
-                    xo = xp_at + fx.Index(z_sub) * XP_SUB + fx.Index(z_r0) * 2
-                    for k, vals in enumerate((ps, dss)):
-                        lds_io.store(xo + k * (WAVE * 8), pack_items(vals), 2 * tr.NI, 'xp')
+                    parts = [[Vec(x)[i] for i in range(NI)] for x in xs]
+                    s_sum = [fx.Float32(parts[0][i]) + fx.Float32(parts[2][i]) for i in range(NI)]
+                    dp_sum = [fx.Float32(parts[1][i]) + fx.Float32(parts[3][i]) for i in range(NI)]
+                    xp_put(*p_ds(s_sum, dp_sum, lse, delta, ctx.bias, q0, masked))
 
-                own = [zero4] * tr.NSUB
-                steps = x_steps(x_operands(), own)
+                own = [zero4] * NSUB
+                steps = x_steps(own)
                 xop = []
-                hooks = spread({}, len(steps), x_loads(j + fx.Int32(2), xop), tr.W_AT)
-                hooks.setdefault(min(tr.Z_AT, len(steps) - 1), []).append(z_work)
-                if const_expr(tr.TRACE):
-                    trace('As')
+                hooks = spread({}, len(steps), x_loads(j + fx.Int32(2), xop), tr.w_at)
+                hooks.setdefault(min(tr.z_at, len(steps) - 1), []).append(z_work)
                 run(steps, hooks)
-                phase_end('A' if tr.TRACE else None)
-
-                # ---- B(j): partials of tile j+1 out; Y(j) from registers; derived reads of tile j+1;
-                # then tile j+2 replaces it in the own area and X's operands of it come back.
+                phase_end()
+                # B(j): partials of tile j+1 out; dK^T += Q^T.dS or dV^T += dO^T.P of tile j
+                # from last phase's derived dwords; tile j+1's derived loads, then tile j+2
+                # replaces it in the own area.
                 write_partials(own)
-                pk_off = (fx.Index(1) - fx.Index(role)) * (WAVE * 8)
-                pks = [lds_io.load(xp_at + (sub * XP_SUB) + pk_off, v4e(), 8, 'xp') for sub in range(tr.NSUB)]
-
-                def y_use(b):
-                    if const_expr('noy' in tr.EXP):
-                        return
-                    ops = derived_ops(dvd[b])
-                    for e in range_constexpr(2):
-                        for sub in range_constexpr(tr.NSUB):
-                            k = (2 * b + e) * tr.NSUB + sub
-                            accs[k] = mfma(ops[e], pks[sub], accs[k])
-
-                steps = [lambda b=b: y_use(b) for b in range(tr.NB)]
+                pks = xp_get()
+                acc = list(ctx.acc)
+                steps = [lambda b=b: gemm_mma_joint_at((yg,), b, [gemm_derived_ops(yg, ctx.dvd[b])], (pks,), [acc])
+                         for b in range(NB)]
                 dvd_next = []
-                hooks = spread({}, len(steps), derived_hooks(dvd_next))
+                hooks = spread({}, len(steps), derived_loads(dvd_next))
                 hooks.setdefault(len(steps) - 1, []).append(lambda: refill(xop))
                 run(steps, hooks)
-                phase_end('B' if tr.TRACE else None)
-                return accs + [x for b in dvd_next for x in b] + side_next + bias_next
+                phase_end()
+                ctx.acc, ctx.dvd, ctx.side, ctx.bias = acc, dvd_next, side_next, bias_next
 
-            n_acc = 2 * tr.NB * tr.NSUB
+            def step(j, carried):
+                ctx.restore(carried)
+                iteration(j, tr.causal)
+                return ctx.carry()
 
             @flyc.jit
             def tail(j, carried):
                 out = list(carried)
                 if j < fx.Index(n_tiles):
-                    out = iteration(fx.Int32(j), carried, tr.CAUSAL)
+                    out = step(fx.Int32(j), carried)
                 return out
 
-            # Prologue: tile 0 to the own area: X(0), derived reads; partials of tile 0 out;
+            # Prologue: tile 0 to the own area: X(0), derived loads; partials of tile 0 out;
             # tile 1 to the own area.
             rocdl.s_waitcnt(vmcnt=0)
             cluster_barrier()
@@ -683,32 +629,60 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                 f()
             side0 = side_load(fx.Int32(0))
             b0 = bias_load(fx.Int32(0))
-            own0 = [zero4] * tr.NSUB
+            own0 = [zero4] * NSUB
             refill(xop0)
-            for f in x_steps(x_operands(), own0):
+            for f in x_steps(own0):
                 f()
             dvd0 = []
-            for f in derived_hooks(dvd0):
+            for f in derived_loads(dvd0):
                 f()
             refill(xop1)
             write_partials(own0)
             phase_end()
 
-            init = list(accs) + [x for b in dvd0 for x in b] + side0 + b0
+            # Pairs of tiles, then at most one more.
+            ctx.acc, ctx.dvd, ctx.side, ctx.bias = list(accs), dvd0, side0, b0
+            init = ctx.carry()
             res1 = init
             for jp, carried in range(0, fx.Index(n_pairs), 1, init=init):
-                mid = iteration(fx.Int32(jp) * fx.Int32(2), carried, tr.CAUSAL)
-                res1 = yield iteration(fx.Int32(jp) * fx.Int32(2) + fx.Int32(1), mid, tr.CAUSAL)
+                mid = step(fx.Int32(jp) * fx.Int32(2), carried)
+                res1 = yield step(fx.Int32(jp) * fx.Int32(2) + fx.Int32(1), mid)
             out = tail(fx.Index(n_pairs) * 2, res1)
             return out[:n_acc]
 
-        n_acc = 2 * tr.NB * tr.NSUB
         acc0 = [fx.full(4, 0.0, fx.Float32) for _ in range(n_acc)]
         results = acc0
         for g, carried in range(0, fx.Index(group), 1, init=acc0):
             results = yield head_pass(fx.Int32(g), carried)
         rocdl.s_waitcnt(vmcnt=0)
-        store_out(results)
+
+        # ---- epilogue: dK^T (K-wave, times sm_scale) or dV^T (V-wave; times 1/(1-p) if
+        # dropout scales it here) of the wave's shard, transposed back by the store.
+        dk_base = base_addr(DK, k_batch, head_k, k_row_off, stride_dk_batch, stride_dk_head, stride_dk_seq)
+        dv_base = base_addr(DV, k_batch, head_k, k_row_off, stride_dv_batch, stride_dv_head, stride_dv_seq)
+        o_ss = is_v.select(fx.Int64(stride_dv_seq), fx.Int64(stride_dk_seq))
+        row_lim = is_v.select(row_vo, row_qk)
+        rsrc = buffer_ops.create_buffer_resource_from_addr(is_v.select(dv_base, dk_base),
+                                                           num_records_bytes=span_bytes(sk_i32, o_ss, row_lim))
+        ss = fx.Index(fx.Int32(o_ss))
+        # dS is against the scaled scores: sm_scale lands once, here.
+        dv_scale = fx.Float32(1.0)
+        if const_expr(dropout and tr.dropout_scale_at == softmax.P_DROP_AT_STORE):
+            dv_scale = fx.Float32(dropout_scale)
+        scale = is_v.select(dv_scale, fx.Float32(sm_scale))
+        tensor_io.store_acc_derived16(yg,
+                                      list(results),
+                                      1,
+                                      rsrc,
+                                      ss,
+                                      kvt,
+                                      lc,
+                                      gq,
+                                      sk_i32,
+                                      row_lim,
+                                      fx.full(4, scale, fx.Float32),
+                                      elem,
+                                      col0=lambda: shard * fx.Int32(head_dim // 2))
 
     @flyc.jit
     def launch_fmha_bwd_dkdv_gfx942_xxwide(
@@ -765,9 +739,7 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
         stride_b_seq_q: fx.Int64,
         stream: fx.Stream = fx.Stream(None),
     ):
-        # Scalars, not traits fields: the JIT cache keys on scalar closure values.
-        _ = cache_tag
-        grid_x = (fx.Index(max_seqlen_k) + block_kv - 1) // block_kv
+        grid_x = (fx.Index(max_seqlen_k) + tr.block_kv - 1) // tr.block_kv
         grid_z = (fx.Int32(num_seqlens) != fx.Int32(0)).select(fx.Index(num_seqlens), fx.Index(batch_size))
         fmha_bwd_dkdv_gfx942_kernel(Q,
                                     K,
@@ -819,11 +791,11 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                                     stride_b_batch,
                                     stride_b_head,
                                     stride_b_seq_q,
-                                    value_attrs={'rocdl.waves_per_eu': waves_per_eu,
+                                    value_attrs={'rocdl.waves_per_eu': tr.waves_per_eu,
                                                  'rocdl.flat_work_group_size':
-                                                 f'{tr.BLOCK_SIZE},{tr.BLOCK_SIZE}'}).launch(
+                                                 f'{tr.block_size},{tr.block_size}'}).launch(
             grid=(grid_x, fx.Index(num_head_k), grid_z) if tile_fastest else (fx.Index(num_head_k), grid_x, grid_z),
-            block=(tr.BLOCK_SIZE, 1, 1),
+            block=(tr.block_size, 1, 1),
             stream=stream)
 
     _launch = fmha.make_dkdv_launch(launch_fmha_bwd_dkdv_gfx942_xxwide,

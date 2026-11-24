@@ -19,18 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.environ['AOTRITON_FLYDSL_KERNEL_ROOT'])
 
 import torch  # noqa: E402
-from gfx942.dq import body_dev_overrides, build_fmha_bwd_dq_gfx942_by_head_dim  # noqa: E402
+from gfx942.dq import build_fmha_bwd_dq_gfx942_by_head_dim  # noqa: E402
 from gfx942.fwd import build_fmha_fwd_gfx942_by_head_dim  # noqa: E402
 
 LADDER = (160, 192, 224, 256, 384, 512)
-
-
-def build_dq(rung, dev, **kwargs):
-    overrides = body_dev_overrides(rung, body='wide')
-    for item in dev:
-        name, value = item.split('=')
-        overrides[name] = int(value)
-    return build_fmha_bwd_dq_gfx942_by_head_dim(rung, body='wide', **kwargs)
 
 
 def main():
@@ -50,7 +42,6 @@ def main():
     p.add_argument('--no_check', action='store_true')
     p.add_argument('--wave_m', type=int, default=None, help='query rows per wave: 32 or 16')
     p.add_argument('--bhsd', action='store_true', help='BHSD storage (default BSHD)')
-    p.add_argument('--dev', action='append', default=[], help='Traits override NAME=VALUE (dev sweeps)')
     a = p.parse_args()
     hk = a.heads_k or a.heads
     sk = a.seqlen_k or a.seqlen
@@ -94,7 +85,7 @@ def main():
         kw['grid_axis_order'] = a.grid_axis_order
     if a.wave_m is not None:
         kw['wave_m'] = a.wave_m
-    launch = build_dq(rung, a.dev, **kw)
+    launch = build_fmha_bwd_dq_gfx942_by_head_dim(rung, body='wide', **kw)
 
     def run():
         launch(T(q), T(k), T(v), T(do), T(dq), lse, delta, a.batch, a.seqlen, seqlen_k=sk, bias=bias, dbias=dbias,
