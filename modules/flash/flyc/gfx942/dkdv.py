@@ -380,16 +380,23 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
                                                      stride_do_seq,
                                                      sq,
                                                      row_vo))
-            row0, pitch = fmha.lse_row_addressing(varlen_bits,
-                                                  fx.Index(q_batch),
-                                                  head_q,
-                                                  num_head_q,
-                                                  lse_tokens,
-                                                  fx.Index(q_row_off))
-            lse_rsrc, delta_rsrc = [rocdl.get_buffer_rsrc(r) for r in softmax.lse_delta_rsrcs(LSE, Delta, row0, pitch, sq)]
+            row0, pitch = softmax.lse_rows(ctx, head=head_q, tokens=lse_tokens)
+            rsrcs = softmax.lse_delta_rsrcs(LSE, Delta, row0, pitch, sq)
+            lse_rsrc, delta_rsrc = [rocdl.get_buffer_rsrc(r) for r in rsrcs]
             return q_rsrc, do_rsrc, lse_rsrc, delta_rsrc, fx.Int32(pitch) * fx.Int32(4)
 
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
+        ctx = flex_gemm.Ctx(tr, carried=('dk', 'dv', 'sd', 'rows', 'nibs'))
+        # Q rows, for softmax.lse_rows.
+        ctx.set_q_rows(varlen_bits=varlen_bits,
+                       q_batch=q_batch,
+                       q_row_off=q_row_off,
+                       sq=sq,
+                       max_seqlen_q=max_seqlen_q,
+                       seqinfo_q0=seqinfo_q0,
+                       seqinfo_q1=seqinfo_q1,
+                       num_seqlens=num_seqlens,
+                       num_head_q=num_head_q)
+        lse_tokens = softmax.lse_tokens(ctx)
 
         # This lane's LSE/Delta rows: 4 * lg + [0, 4) of the tile; r rides in soffset.
         def row_loads(rsrc, pitch_b, q_start):
@@ -400,7 +407,6 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
                                                        (fx.Int32(q_start) + fx.Int32(r)) * pitch_b,
                                                        0)) for r in range(4)]
 
-        ctx = flex_gemm.Ctx(tr, carried=('dk', 'dv', 'sd', 'rows', 'nibs'))
         ctx.c_scale = fx.Float32(sm_scale) * fx.Float32(LOG2E)
         ctx.dropout_scale = dropout_scale
 
@@ -547,10 +553,10 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
                                     ctx.sd[KVB:],
                                     lse_l2,
                                     delta,
-                                    lambda kb: bias_load(hs['b_rsrc'], q_j, kb),
-                                    lambda vals, kb, fill: mask_scores(vals, q_j, kb, fill),
-                                    lambda kb: dropout_keep(nibs[kb]),
-                                    masked)
+                                    bias_of=lambda kb: bias_load(hs['b_rsrc'], q_j, kb),
+                                    mask_of=lambda vals, kb, fill: mask_scores(vals, q_j, kb, fill),
+                                    keep_of=lambda kb: dropout_keep(nibs[kb]),
+                                    masked=masked)
             interleave(n_mfma_a, sched_valu, 0x002 | 0x400)
             rocdl.sched_barrier(0)
             # B: dV/dK(j) while tile j+1's transposed half is built in LDS.

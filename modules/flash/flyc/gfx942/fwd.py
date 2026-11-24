@@ -266,6 +266,22 @@ def build_fmha_fwd_gfx942(head_dim,
         v_stride_b = fx.Int32(stride_v_seq) * fx.Int32(2)
         o_row_stride = fx.Index(fx.Int32(stride_o_seq))
 
+        # Q rows and the O store, for softmax.epilogue.
+        ctx.set_q_rows(varlen_bits=varlen_bits,
+                       q_batch=q_batch,
+                       q_row_off=q_row_off,
+                       sq=sq,
+                       max_seqlen_q=max_seqlen_q,
+                       seqinfo_q0=seqinfo_q0,
+                       seqinfo_q1=seqinfo_q1,
+                       num_seqlens=num_seqlens,
+                       num_head_q=num_head_q,
+                       head=head)
+        ctx.set_o_store(o_rsrc=o_rsrc,
+                        o_row_stride=o_row_stride,
+                        o_col_limit=row_vo,
+                        dropout_scale=dropout_scale)
+
         # Each wave owns 32 query rows; a lane holds one row (lm) and one half of
         # the 32x32x8 accumulator's columns (lh).
         q_start = q_tile * tr.block_m
@@ -438,25 +454,10 @@ def build_fmha_fwd_gfx942(head_dim,
         softmax.epilogue(ctx,
                          pv,
                          results,
-                         o_rsrc,
-                         o_row_stride,
-                         q_row,
-                         lh,
-                         row_vo,
-                         sq,
-                         elem,
-                         dropout_scale,
                          LSE,
-                         varlen_bits,
-                         q_batch,
-                         head,
-                         num_head_q,
-                         max_seqlen_q,
-                         seqinfo_q0,
-                         seqinfo_q1,
-                         num_seqlens,
-                         q_row_off,
-                         lambda: lh == fx.Index(0))
+                         row=q_row,
+                         lane=lh,
+                         lane_first=lambda: lh == fx.Index(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942(

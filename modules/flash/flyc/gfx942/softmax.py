@@ -188,26 +188,27 @@ def lse_of(m, l):
     return (l > fx.Float32(0.0)).select(lse, fx.Float32(float('inf')))
 
 
-def lse_rows(varlen_bits,
-             batch,
-             head,
-             num_head_q,
-             max_seqlen_q,
-             seqinfo_q0,
-             seqinfo_q1,
-             num_seqlens,
-             row_off):
-    """(first row, pitch) of one (batch, head)'s LSE or Delta rows."""
-    tokens = fmha.lse_token_pitch(varlen_bits,
-                                  0,
-                                  max_seqlen_q,
-                                  seqinfo_q0,
-                                  seqinfo_q1,
-                                  num_seqlens)
-    return fmha.lse_row_addressing(varlen_bits,
+def lse_tokens(ctx):
+    """Tokens per head in the LSE and Delta rows (fmha.lse_token_pitch)."""
+    return fmha.lse_token_pitch(ctx.varlen_bits,
+                                0,
+                                ctx.max_seqlen_q,
+                                ctx.seqinfo_q0,
+                                ctx.seqinfo_q1,
+                                ctx.num_seqlens)
+
+
+def lse_rows(ctx, *, head=None, tokens=None):
+    """(first row, pitch) of the (batch, head)'s LSE or Delta rows, from ctx.set_q_rows.
+    `head` defaults to ctx.head; `tokens` (lse_tokens) to computing it here."""
+    batch = fx.Index(ctx.q_batch)
+    row_off = fx.Index(ctx.q_row_off)
+    if tokens is None:
+        tokens = lse_tokens(ctx)
+    return fmha.lse_row_addressing(ctx.varlen_bits,
                                    batch,
-                                   head,
-                                   num_head_q,
+                                   ctx.head if head is None else head,
+                                   ctx.num_head_q,
                                    tokens,
                                    row_off)
 
@@ -232,28 +233,10 @@ def lse_delta_rsrcs(lse_ptr, delta_ptr, row0, pitch, rows):
             for ptr in (lse_ptr, delta_ptr)]
 
 
-def lse_rsrc(ptr,
-             rows,
-             varlen_bits,
-             batch,
-             head,
-             num_head_q,
-             max_seqlen_q,
-             seqinfo_q0,
-             seqinfo_q1,
-             num_seqlens,
-             row_off):
-    """(rsrc, pitch) of one (batch, head)'s LSE or Delta rows; a null `ptr` gets an empty range."""
-    row0, pitch = lse_rows(varlen_bits,
-                           batch,
-                           head,
-                           num_head_q,
-                           max_seqlen_q,
-                           seqinfo_q0,
-                           seqinfo_q1,
-                           num_seqlens,
-                           row_off)
-    return lse_rsrc_at(ptr, row0, pitch, rows), pitch
+def lse_rsrc(ctx, ptr):
+    """(rsrc, pitch) of the block's LSE or Delta rows; a null `ptr` gets an empty range."""
+    row0, pitch = lse_rows(ctx)
+    return lse_rsrc_at(ptr, row0, pitch, ctx.sq), pitch
 
 
 def lse_load(rsrc, pitch, row):
@@ -261,39 +244,19 @@ def lse_load(rsrc, pitch, row):
     return fx.Float32(buffer_ops.buffer_load(rsrc, row * pitch, vec_width=1, dtype=fx.Float32))
 
 
-def lse_store(rsrc, pitch, lse, row, row_ok, lane_first):
+def lse_store(rsrc, pitch, lse, row, row_ok, *, lane_first):
     """One lane of each row stores: `lane_first()` says which (built after the offset)."""
     off = row * pitch
     buffer_ops.buffer_store(lse, rsrc, off, mask=row_ok & lane_first())
 
 
-def epilogue(ctx,
-             pv,
-             results,
-             o_rsrc,
-             o_row_stride,
-             row,
-             lane,
-             col_limit,
-             rows,
-             elem,
-             dropout_scale,
-             lse_ptr,
-             varlen_bits,
-             batch,
-             head,
-             num_head_q,
-             max_seqlen_q,
-             seqinfo_q0,
-             seqinfo_q1,
-             num_seqlens,
-             row_off,
-             lane_first):
-    """The forward's end: O / l and LSE of `results` ([m, l] + O accumulators of `pv`).
+def epilogue(ctx, pv, results, lse_ptr, *, row, lane, lane_first):
+    """The forward's end: O / l and LSE of `results` ([m, l] + O accumulators of `pv`),
+    through ctx.set_q_rows and ctx.set_o_store.
 
     A fully masked row (l = 0) stores O = 0 and LSE = +inf; dropout's 1/(1-p)
-    folds into 1/l. `row` may be a function, called after 1/l; `lane` is
-    tensor_io.store_acc's `lh`, `lane_first` lse_store's.
+    folds into 1/l. `row` may be a function, called after 1/l; `lane` goes to
+    tensor_io.store_acc, `lane_first` to lse_store.
     """
     rocdl.s_waitcnt(0)
     m = results[0]
@@ -301,35 +264,25 @@ def epilogue(ctx,
     inv_l = fx.Float32(1.0) / l
     inv_l = (l > fx.Float32(0.0)).select(inv_l, fx.Float32(0.0))
     if ctx.traits.dropout:
-        inv_l = inv_l * fx.Float32(dropout_scale)
+        inv_l = inv_l * fx.Float32(ctx.dropout_scale)
     if callable(row):
         row = row()
-    row_ok = row < rows
+    row_ok = row < ctx.sq
     tensor_io.store_acc(pv,
                         results[2:2 + pv.out_tiles],
-                        o_rsrc,
+                        ctx.o_rsrc,
                         row,
-                        o_row_stride,
-                        lane,
-                        col_limit,
-                        row_ok,
-                        elem,
-                        ctx.traits.pad_floor,
+                        ctx.o_row_stride,
+                        lane=lane,
+                        col_limit=ctx.o_col_limit,
+                        row_ok=row_ok,
+                        elem=flex_gemm.elem_type(ctx.traits.dtype),
+                        pad_floor=ctx.traits.pad_floor,
                         scale=inv_l)
     # LSE before its resource: keeps the tuned ISA.
     lse = lse_of(m, l)
-    rsrc, pitch = lse_rsrc(lse_ptr,
-                           rows,
-                           varlen_bits,
-                           fx.Index(batch),
-                           head,
-                           num_head_q,
-                           max_seqlen_q,
-                           seqinfo_q0,
-                           seqinfo_q1,
-                           num_seqlens,
-                           fx.Index(row_off))
-    lse_store(rsrc, pitch, lse, row, row_ok, lane_first)
+    rsrc, pitch = lse_rsrc(ctx, lse_ptr)
+    lse_store(rsrc, pitch, lse, row, row_ok, lane_first=lane_first)
 
 
 # ---------------------------------------------------------------- backward
@@ -470,6 +423,7 @@ def p_ds_kv(ctx,
             dp_accs,
             lse_l2,
             delta,
+            *,
             bias_of,
             mask_of,
             keep_of,
@@ -515,7 +469,7 @@ def p_ds_kv(ctx,
     return p_packs, ds_packs
 
 
-def p_ds_elems(ctx, s, dp, lse_l2, delta, bias_of, mask_of, keep, c_scale=None):
+def p_ds_elems(ctx, s, dp, *, lse_l2, delta, bias_of, mask_of, keep, c_scale=None):
     """(P list, dS list) of the scaled scores `s`, item by item (the wide bodies'
     order): bias, mask (MASK_SCORE), exp2, mask (MASK_PROB), dropout, dS. `s`, `dp` are indexed per item (a vector
     is read where the item is used); `c_scale`, if given, scales raw `s` per item

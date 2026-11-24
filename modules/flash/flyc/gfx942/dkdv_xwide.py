@@ -415,10 +415,20 @@ def build_fmha_bwd_dkdv_gfx942_xwide(head_dim,
             # Lane (lc, gq) draws q row 4gq + lc % 4 for keys 4 (lc // 4) + [0, 4); its quad
             # holds a 4x4 block, and a DPP broadcast deals each lane its key's bits.
             quad_shift = fx.Int32(lc % 4)
-        lse_tokens = fmha.lse_token_pitch(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, num_seqlens)
 
         ctx = flex_gemm.Ctx(tr, carried=('acc', 'bias'))
         ctx.dropout_scale = dropout_scale
+        # Q rows, for softmax.lse_rows.
+        ctx.set_q_rows(varlen_bits=varlen_bits,
+                       q_batch=q_batch,
+                       q_row_off=q_row_off,
+                       sq=sq_i32,
+                       max_seqlen_q=max_seqlen_q,
+                       seqinfo_q0=seqinfo_q0,
+                       seqinfo_q1=seqinfo_q1,
+                       num_seqlens=num_seqlens,
+                       num_head_q=num_head_q)
+        lse_tokens = softmax.lse_tokens(ctx)
 
         def cluster_end():
             """LDS reads land before the next phase overwrites them (s_barrier does not wait)."""
@@ -438,12 +448,7 @@ def build_fmha_bwd_dkdv_gfx942_xwide(head_dim,
             q_rsrc = rocdl.get_buffer_rsrc(buffer_ops.create_buffer_resource_from_addr(q_base, num_records_bytes=q_span))
             do_rsrc = rocdl.get_buffer_rsrc(buffer_ops.create_buffer_resource_from_addr(do_base,
                                                                                         num_records_bytes=do_span))
-            lse_row0, lse_pitch = fmha.lse_row_addressing(varlen_bits,
-                                                          fx.Index(q_batch),
-                                                          head_q,
-                                                          num_head_q,
-                                                          lse_tokens,
-                                                          fx.Index(q_row_off))
+            lse_row0, lse_pitch = softmax.lse_rows(ctx, head=head_q, tokens=lse_tokens)
             pitch_b = fx.Int32(lse_pitch) * fx.Int32(4)
             side_bytes = fx.Int64(fx.Index(sq_i32) * lse_pitch) * fx.Int64(4)
             lse_rsrc = rocdl.get_buffer_rsrc(buffer_ops.create_buffer_resource_from_addr(
@@ -550,11 +555,11 @@ def build_fmha_bwd_dkdv_gfx942_xwide(head_dim,
                 ps, dss = softmax.p_ds_elems(ctx,
                                              sv,
                                              dpv,
-                                             lambda r: fx.Float32(lse[r]) * fx.Float32(LOG2E),
-                                             delta,
-                                             bias_of,
-                                             mask_of,
-                                             keep)
+                                             lse_l2=lambda r: fx.Float32(lse[r]) * fx.Float32(LOG2E),
+                                             delta=delta,
+                                             bias_of=bias_of,
+                                             mask_of=mask_of,
+                                             keep=keep)
                 return pack_operand(ps, elem), pack_operand(dss, elem)
 
             # ---- the team exchange: raw S/dP [sub][role] (xs), P/dS packs [sub][P, dS] (xp).

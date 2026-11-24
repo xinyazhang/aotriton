@@ -262,6 +262,22 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
         v_stride_b = fx.Int32(stride_v_seq) * fx.Int32(2)
         o_row_stride = fx.Index(fx.Int32(stride_o_seq))
 
+        # Q rows and the O store, for softmax.epilogue.
+        ctx.set_q_rows(varlen_bits=varlen_bits,
+                       q_batch=q_batch,
+                       q_row_off=q_row_off,
+                       sq=sq,
+                       max_seqlen_q=max_seqlen_q,
+                       seqinfo_q0=seqinfo_q0,
+                       seqinfo_q1=seqinfo_q1,
+                       num_seqlens=num_seqlens,
+                       num_head_q=num_head_q,
+                       head=head)
+        ctx.set_o_store(o_rsrc=o_rsrc,
+                        o_row_stride=o_row_stride,
+                        o_col_limit=row_vo,
+                        dropout_scale=dropout_scale)
+
         q_start = q_tile * tr.block_m
         q_row = q_start + wave * WAVE_M + lr
 
@@ -422,25 +438,10 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
         softmax.epilogue(ctx,
                          pv,
                          results,
-                         o_rsrc,
-                         o_row_stride,
-                         lambda: fx.Index(row_now()),
-                         lambda: lane_field(4, 2),
-                         row_vo,
-                         sq,
-                         elem,
-                         dropout_scale,
                          LSE,
-                         varlen_bits,
-                         q_batch,
-                         head,
-                         num_head_q,
-                         max_seqlen_q,
-                         seqinfo_q0,
-                         seqinfo_q1,
-                         num_seqlens,
-                         q_row_off,
-                         lambda: lane_field(4, 2) == fx.Int32(0))
+                         row=lambda: fx.Index(row_now()),
+                         lane=lambda: lane_field(4, 2),
+                         lane_first=lambda: lane_field(4, 2) == fx.Int32(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942_xwide(

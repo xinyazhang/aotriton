@@ -1509,6 +1509,38 @@ class Ctx:
         self.carried = carried
         self._sizes = None
 
+    def set_q_rows(self,
+                   *,
+                   varlen_bits,
+                   q_batch,
+                   q_row_off,
+                   sq,
+                   max_seqlen_q,
+                   seqinfo_q0,
+                   seqinfo_q1,
+                   num_seqlens,
+                   num_head_q,
+                   head=None):
+        """The Q rows' addressing as the prelude decoded it, raw: softmax's LSE
+        helpers derive from it where they are called. `head`: the block's q head."""
+        self.varlen_bits = varlen_bits
+        self.q_batch = q_batch
+        self.q_row_off = q_row_off
+        self.sq = sq
+        self.max_seqlen_q = max_seqlen_q
+        self.seqinfo_q0 = seqinfo_q0
+        self.seqinfo_q1 = seqinfo_q1
+        self.num_seqlens = num_seqlens
+        self.num_head_q = num_head_q
+        self.head = head
+
+    def set_o_store(self, *, o_rsrc, o_row_stride, o_col_limit, dropout_scale):
+        """The forward's O store, for softmax.epilogue."""
+        self.o_rsrc = o_rsrc
+        self.o_row_stride = o_row_stride
+        self.o_col_limit = o_col_limit
+        self.dropout_scale = dropout_scale
+
     def carry(self):
         out = []
         sizes = []

@@ -304,6 +304,21 @@ def build_fmha_fwd_gfx942_wide(head_dim,
             ctx = flex_gemm.Ctx(tr, carried=('m', 'corr', 'l', 's', 'o', 'k_regs', 'v_regs'))
             ctx.qk, ctx.pv = qk, pv
             ctx.lds = lds_io
+            # Q rows and the O store, for softmax.epilogue.
+            ctx.set_q_rows(varlen_bits=varlen_bits,
+                           q_batch=q_batch,
+                           q_row_off=q_row_off,
+                           sq=sq,
+                           max_seqlen_q=max_seqlen_q,
+                           seqinfo_q0=seqinfo_q0,
+                           seqinfo_q1=seqinfo_q1,
+                           num_seqlens=num_seqlens,
+                           num_head_q=num_head_q,
+                           head=head)
+            ctx.set_o_store(o_rsrc=o_rsrc,
+                            o_row_stride=o_row_stride,
+                            o_col_limit=row_vo,
+                            dropout_scale=dropout_scale)
             q_tile = q_tiles[q_pass]
             q_start = q_tile * tr.block_m
             q_wave = q_start + wave * WAVE_M
@@ -495,25 +510,10 @@ def build_fmha_fwd_gfx942_wide(head_dim,
             softmax.epilogue(ctx,
                              pv,
                              results,
-                             o_rsrc,
-                             o_row_stride,
-                             q_row,
-                             lh,
-                             row_vo,
-                             sq,
-                             elem,
-                             dropout_scale,
                              LSE,
-                             varlen_bits,
-                             q_batch,
-                             head,
-                             num_head_q,
-                             max_seqlen_q,
-                             seqinfo_q0,
-                             seqinfo_q1,
-                             num_seqlens,
-                             q_row_off,
-                             lambda: lh == fx.Index(0))
+                             row=q_row,
+                             lane=lh,
+                             lane_first=lambda: lh == fx.Index(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942_wide(

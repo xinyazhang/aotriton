@@ -272,6 +272,17 @@ def build_fmha_bwd_dq_gfx942(head_dim,
         sq_i32, q_row_off, q_batch = fmha.decode_addressing(varlen_bits, 0, max_seqlen_q, seqinfo_q0, seqinfo_q1, z_i32)
         sk_i32, k_row_off, k_batch = fmha.decode_addressing(varlen_bits, 8, max_seqlen_k, seqinfo_k0, seqinfo_k1, z_i32)
         sq = fx.Index(sq_i32)
+        # Q rows, for softmax.lse_rows.
+        ctx.set_q_rows(varlen_bits=varlen_bits,
+                       q_batch=q_batch,
+                       q_row_off=q_row_off,
+                       sq=sq,
+                       max_seqlen_q=max_seqlen_q,
+                       seqinfo_q0=seqinfo_q0,
+                       seqinfo_q1=seqinfo_q1,
+                       num_seqlens=num_seqlens,
+                       num_head_q=num_head_q,
+                       head=head)
 
         # LDS: K and V tiles, each cycling through NBUF buffers.
         lds = fx.SharedAllocator().allocate(Smem).peek()
@@ -311,15 +322,7 @@ def build_fmha_bwd_dq_gfx942(head_dim,
 
         # LSE (natural base, +inf on rows that see no key) and Delta share one row
         # layout. A row past seqlen_q gets lse2 = +inf, so its P, dS and dB are 0.
-        lse_row0, lse_pitch = softmax.lse_rows(varlen_bits,
-                                               fx.Index(q_batch),
-                                               head,
-                                               num_head_q,
-                                               max_seqlen_q,
-                                               seqinfo_q0,
-                                               seqinfo_q1,
-                                               num_seqlens,
-                                               fx.Index(q_row_off))
+        lse_row0, lse_pitch = softmax.lse_rows(ctx)
 
         def row_scalar(ptr):
             rsrc = softmax.lse_rsrc_at(ptr, lse_row0, lse_pitch, sq, nullable=False)
@@ -597,11 +600,11 @@ def build_fmha_bwd_dq_gfx942(head_dim,
                             dq_rsrc,
                             q_row,
                             dq_row_stride,
-                            lh,
-                            row_qk,
-                            q_ok,
-                            elem,
-                            tr.pad_floor,
+                            lane=lh,
+                            col_limit=row_qk,
+                            row_ok=q_ok,
+                            elem=elem,
+                            pad_floor=tr.pad_floor,
                             scale=sm_scale)
 
     @flyc.jit

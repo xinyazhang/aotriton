@@ -21,7 +21,8 @@ def store_acc(t,
               rsrc,
               row,
               row_stride,
-              lh,
+              *,
+              lane,
               col_limit,
               row_ok,
               elem,
@@ -30,20 +31,20 @@ def store_acc(t,
               offset_first=True):
     """Store accumulator tiles `accs` of GEMM `t` (acc^T: columns = the GEMM's output rows).
 
-    32x32x8: value group g of tile o holds columns t.group_coords[g] + 4*lh +
+    32x32x8: value group g of tile o holds columns t.group_coords[g] + 4*lane +
     [0, 4) of global row `row`. 16x16x16 (chunked A^T): accumulators 2p and 2p+1
-    hold columns 32p + 8*lh + 2i + e, so a lane stores 8 consecutive columns per
-    pair; `lh` may be a function, called after the scale vector is built.
+    hold columns 32p + 8*lane + 2i + e, so a lane stores 8 consecutive columns per
+    pair; `lane` (the column group) may be a function, called after the scale vector is built.
     `scale` (f32) multiplies each tile first; columns at or past `col_limit`
     are masked only where a padded build can reach them. `offset_first` builds a
     store's address before its mask (the order only moves instructions).
     """
     if isinstance(t.a, flex_gemm.DerivedA):
-        _store_derived(t, accs, rsrc, row, row_stride, lh, col_limit, row_ok, elem, pad_floor, scale)
+        _store_derived(t, accs, rsrc, row, row_stride, lane, col_limit, row_ok, elem, pad_floor, scale)
         return
     if t.mfma == '16x16x16' and t.a.layout == 'chunks':
         scale_v = fx.full(4, fx.Float32(scale), fx.Float32)
-        lane_g = lh() if callable(lh) else lh
+        lane_g = lane() if callable(lane) else lane
         for p in range_constexpr(t.reads):
             o0 = Vec(accs[2 * p]) * scale_v
             o1 = Vec(accs[2 * p + 1]) * scale_v
@@ -57,7 +58,7 @@ def store_acc(t,
                 ok = ok & (fx.Int32(d) < col_limit)
             buffer_ops.buffer_store(packed.ir_value(), rsrc, row * row_stride + d, mask=ok)
         return
-    # Value group i of tile o: columns m*o + 4*lane_groups*i + 4*lh + [0, 4).
+    # Value group i of tile o: columns m*o + 4*lane_groups*i + 4*lane + [0, 4).
     span = 4 * t.lane_groups
     for o in range_constexpr(t.out_tiles):
         acc = Vec(accs[o])
@@ -67,7 +68,7 @@ def store_acc(t,
             vals = [acc[4 * i + j] for j in range(4)]
             packed = Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem)
             col0 = t.m * o + span * i
-            d = fx.Index(col0) + lh * 4
+            d = fx.Index(col0) + lane * 4
             if const_expr(offset_first):
                 off = row * row_stride + d
             ok = row_ok
