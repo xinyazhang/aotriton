@@ -1,9 +1,9 @@
 # Copyright © 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""What the gfx942 JIT tests share: the import/skip bootstrap, the host Philox,
-NaN-slack operands, the A-2 keep masks, the principal-diagonal cases and the
-forward's fp64 reference.
+"""What the gfx942 JIT tests share: the import/skip bootstrap, the host Philox and
+the kernels' dropout keep, NaN-slack operands, the A-2 keep masks, the
+principal-diagonal cases and the forward's fp64 reference.
 
 A test module imports `torch`, `np` and `pytestmark` from here first; the
 kernel modules import after it, since it puts the FlyDSL kernel tree on sys.path.
@@ -30,6 +30,7 @@ if (not KERNEL_ROOT
 pytestmark = []
 
 import fmha_utils as fmha  # noqa: E402
+import philox  # noqa: E402
 
 TL = fmha.WINDOW_TOPLEFT
 BR = fmha.WINDOW_BOTRIGHT
@@ -102,6 +103,29 @@ def bottom_right(sq, sk, device="cuda"):
     return j <= i + (sk - sq)
 
 
+def band(causal_type, window, p, sq, sk, device="cuda"):
+    """`[sq, sk]` keep mask of a build's causal_type (1/2: the causal sentinels, 3:
+    `window` under principal diagonal `p`), or None when nothing is masked."""
+    if causal_type == 0:
+        return None
+    if causal_type in (1, 2):
+        s = TL if causal_type == 1 else BR
+        return keep_mask((s, s), 0, sq, sk, device)
+    return keep_mask(window, p, sq, sk, device)
+
+
+def dropout_keep(b, h, sq, sk, seed, offset, p):
+    """The kernels' dropout keep, `[b, h, sq, sk]` bool: Philox at offset + plane*sq*stride
+    + row*stride + col//4, `offset` being philox_offset1 + philox_offset2."""
+    stride = -(-sk // 4)
+    zh = np.arange(b * h, dtype=np.uint64)[:, None, None]
+    m = np.arange(sq, dtype=np.uint64)[None, :, None]
+    g = np.arange(stride, dtype=np.uint64)[None, None, :]
+    offs = np.uint64(offset) + zh * np.uint64(sq * stride) + m * np.uint64(stride) + g
+    rand = philox_4x32_10(seed, offs).reshape(b * h, sq, stride * 4)[:, :, :sk]
+    return torch.from_numpy(rand > philox.dropout_threshold(p)).cuda().view(b, h, sq, sk)
+
+
 def fwd_reference(q, k, v, scale, bias=None, keep=None, p=0.0, mask=None):
     """fp64 `(O, LSE)` over `[..., sq, D]`; a row that sees no key has O = 0, LSE = -inf.
     `mask` is a keep mask, `keep` dropout's."""
@@ -166,3 +190,31 @@ DENSE_SHAPES = {
 
 # One packed batch mixing all three relations, decode and a chunk.
 VARLEN_SEQS = ((1, 300), (64, 320), (130, 130), (300, 37), (37, 200))
+
+
+# The body tests' (test_*_bodies.py) principal_diagonal_choice cases (VarlenBits
+# bit 18): with d = seqlen_k - seqlen_q per sequence and p the bit, a numeric bound
+# becomes L = wl - p*d, R = wr + p*d; sentinels are not shifted. The windows put L
+# below 0, R past seqlen_k, a band off the diagonal and bands that miss every key of
+# some rows; the shapes are decode, chunked prefill, square and Sq > Sk, dense and
+# mixed in one varlen batch (PD_SEQS).
+PD_WINDOWS = ((BR, 0), (8, 0), (0, 8), (4, 4), (-1, 3))
+PD_SHAPES = ((1, 200), (48, 200), (150, 150), (200, 70), "varlen")
+PD_SEQS = ((1, 130), (37, 160), (96, 96), (150, 40), (20, 3))
+
+
+def varlen_batch(seqs, p=0):
+    """`(cu_q, cu_k, varlen)` of a compact HT batch of (seqlen_q, seqlen_k) `seqs`,
+    numeric windows measured from principal diagonal `p`; cu_* are Python lists."""
+    lq = [a for a, _ in seqs]
+    lk = [c for _, c in seqs]
+    cu_q = [0] + [int(x) for x in np.cumsum(lq)]
+    cu_k = [0] + [int(x) for x in np.cumsum(lk)]
+    varlen = fmha.varlen_compact(torch.tensor(cu_q, device="cuda", dtype=torch.int32),
+                                 torch.tensor(cu_k, device="cuda", dtype=torch.int32),
+                                 max(lq),
+                                 max(lk),
+                                 lse_tokens=sum(lq),
+                                 lse_layout=fmha.VARLEN_LSE_LAYOUT_HT)
+    varlen["bits"] = fmha.principal_diagonal_bits(varlen["bits"], PRINCIPAL_DIAGONAL[p])
+    return cu_q, cu_k, varlen
