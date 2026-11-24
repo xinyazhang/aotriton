@@ -42,6 +42,14 @@ blocks, so P and dS come out as the next GEMM's B with no repacking):
 - `TransA`: A^T built in LDS from a 'swz' tile by `gemm_transpose` (ds_read,
   v_perm, ds_write); q group g of A^T row d sits at g ^ ((d / 4) % 4).
 
+The wide dK/dV's 16-row Q/dO tiles (16x16x16, B the resident K/V in `b_tiles`
+blocks, S and dP streamed together by `gemm_stream_joint`, as are dV and dK):
+- `RowA` with `dma='rows'`: each wave copies whole rows, 256 B per issue, one
+  callable per row (`gemm_dma_rows`) for a schedule's hooks; padded odd-chunk rows.
+- `TransA` with `layout='padded'`: A^T built from the 'rows' tiles through VGPRs
+  (`gemm_transpose_read`: 4 rows x 8 columns, b128 reads; `gemm_transpose_write`:
+  v_perm, 16 B stores); group g of 4 rows of a 16-column block is a 144 B row.
+
 `trait_ab` and `trait_tb` are presets of these traits. A GEMM is frozen traits
 (Python values only) plus stateless phase functions. Phases take explicit tile offsets and a trace-time buffer index, and
 never wait, barrier or set priorities: the schedule places them in its
@@ -76,6 +84,7 @@ from .utils import (
     m0_at,
     mfma_16x16x16,
     mfma_32x32x8,
+    pin_values,
     pipelined,
     sched_spread,
     set_alias_scopes,
@@ -258,6 +267,11 @@ class DerivedA:
     lds_base: int
     scope: str
     buffers: int
+    buf_stride: int = 0  # bytes between buffers (0: tile_bytes)
+
+    @property
+    def buf_bytes(self):
+        return self.buf_stride or self.tile_bytes
 
     @property
     def groups(self):
@@ -288,15 +302,28 @@ class TransA:
     tensors: int = 2
     buffers: int = 2
     buf_stride: int = 0
+    layout: str = 'swz'  # or 'padded': [cols / 16][rows / 4] rows of _T_G_PAD bytes
 
     @property
     def tile_bytes(self):
+        if self.layout == 'padded':
+            return padded_t_bytes(self.rows, self.cols)
         return self.rows * self.cols * 2
 
     @property
+    def dts(self):
+        """'padded': bytes between 16-column blocks."""
+        return (self.rows // 4) * _T_G_PAD
+
+    @property
+    def unit_cols(self):
+        """'swz': 2 (one dword per row); 'padded': 8 (16 B per row)."""
+        return 8 if self.layout == 'padded' else 2
+
+    @property
     def units(self):
-        """Transpose units of all tensors: 4 rows x 2 columns, one dword per row."""
-        return self.tensors * (self.rows // 4) * (self.cols // 2)
+        """Transpose units of all tensors: 4 rows x unit_cols columns."""
+        return self.tensors * (self.rows // 4) * (self.cols // self.unit_cols)
 
     @property
     def units_per_thread(self):
@@ -304,6 +331,16 @@ class TransA:
 
     def scope_of(self, buf):
         return self.scope if self.buffers == 1 else f'{self.scope}{buf}'
+
+
+# 'padded' TransA: a row holds 4 rows (8 B) of 16 columns, plus 16 B so that a
+# 16-lane store hits 8 bank quads.
+_T_G_PAD = 144
+
+
+def padded_t_bytes(rows, cols):
+    """Bytes of one 'padded' TransA tile."""
+    return (cols // 16) * (rows // 4) * _T_G_PAD
 
 
 # ---------------------------------------------------------------- gemm traits
@@ -451,8 +488,9 @@ def trait_tb(dtype,
              b_tiles=1,
              buf_stride=0):
     """acc^T += A^T.B over `rows`: A^T by v_perm, or derived on read from the
-    `RowA` tile `derived_from`, or transposed in LDS from the 'swz' tile
-    `transposed_from` (`TransA`); B the previous GEMM's output."""
+    `RowA` tile `derived_from`, or transposed from the row tile `transposed_from`
+    (`TransA`: `layout` 'padded' through VGPRs from a 'rows' tile, else in LDS
+    from a 'swz' one); B the previous GEMM's output."""
     if transposed_from is not None:
         return GemmTraits(dtype,
                           TransA(rows,
@@ -462,7 +500,8 @@ def trait_tb(dtype,
                                  scope,
                                  transposed_from,
                                  buffers=buffers,
-                                 buf_stride=buf_stride),
+                                 buf_stride=buf_stride,
+                                 layout='padded' if layout == 'padded' else 'swz'),
                           mfma=mfma,
                           b_tiles=b_tiles)
     if derived_from is not None:
@@ -474,8 +513,10 @@ def trait_tb(dtype,
                                    src.tile_bytes,
                                    src.lds_base,
                                    src.scope,
-                                   src.buffers),
-                          mfma=mfma)
+                                   src.buffers,
+                                   buf_stride=src.buf_stride),
+                          mfma=mfma,
+                          b_tiles=b_tiles)
     return GemmTraits(dtype,
                       PermA(rows,
                             cols,
@@ -544,6 +585,10 @@ def gemm_dma_plan(t, wave, lane, row_stride_b, lds_addr, also=()):
         m0 = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(lds_addr + fx.Index(a.lds_base))))
         m0 = m0 + wave_s * fx.Int32(a.row_bytes)
         return wave_s, voff, lane_col, m0
+    if a.dma == 'rows' and t.mfma == '16x16x16':
+        # `wave` readfirstlane'd, `lds_addr` the M0 of LDS byte 0: (lane voffset, the
+        # wave's M0, wave) for `gemm_dma_rows`.
+        return fx.Int32(lane * 4), lds_addr + wave * fx.Int32(a.rows_per_wave * a.stride), wave
     if a.dma == 'rows':
         wave_s = fx.Index(rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(wave)))
         lane_off = fx.Int32(lane * 4)
@@ -623,6 +668,31 @@ def gemm_dma(t, plan, rsrc, scopes, row_start, row_stride_b, buf, hdim=None):
                                            fx.Int32(0),
                                            fx.Int32(0))
         set_alias_scopes(op, al, noal)
+
+
+def gemm_dma_rows(t, plan, rsrc, scopes, row_start, row_stride_b, buf, col_byte=None):
+    """'rows' on 16x16x16: global -> LDS buffer `buf` as one callable per row of
+    the wave's, for a schedule's hooks; each rebuilds its M0 in an SGPR (m0_at).
+    `col_byte`: the tile's first column (a column part of a wider row), in soffset."""
+    a = t.a
+    lane_off, m0_wave, wave = plan
+    al, noal = scopes(a.scope_of(buf))
+
+    def row(i):
+        soff = (row_start + (wave * fx.Int32(a.rows_per_wave) + fx.Int32(i))) * row_stride_b
+        if col_byte is not None:
+            soff = soff + fx.Int32(col_byte)
+        m0 = fx.Int64(m0_at(m0_wave, a.lds_base + buf * a.buf_bytes + i * a.stride))
+        for seg in a.segs:
+            op = rocdl.raw_ptr_buffer_load_lds(rsrc,
+                                               lds_ptr_at(m0),
+                                               fx.Int32(4),
+                                               lane_off,
+                                               soff,
+                                               fx.Int32(seg),
+                                               fx.Int32(0))
+            set_alias_scopes(op, al, noal)
+    return [lambda i=i: row(i) for i in range(a.rows_per_wave)]
 
 
 def gemm_fix_plan(t, lane, lr, wave, hdim):
@@ -925,11 +995,13 @@ def gemm_dma_m0(t, wave, lds_base_i32):
     return wave_u, _swz_m0(t, wave_u, lds_base_i32)
 
 
-def gemm_transpose_plan(t, tid, lds_base_i32):
+def gemm_transpose_plan(t, tid, lds_base_i32, wave=None):
     """TransA: per unit (4 source dword addresses, 2 A^T write addresses), absolute
     i32; unit u of tensor u // units: rows 4*g4 + [0, 4), columns 2*cp + [0, 2).
-    Threads past the last unit redo an earlier one."""
+    Threads past the last unit redo an earlier one. 'padded': see _padded_plan."""
     a = t.a
+    if a.layout == 'padded':
+        return _padded_plan(t, tid, wave)
     src = a.src
     per = a.units // a.tensors
     units = []
@@ -950,6 +1022,60 @@ def gemm_transpose_plan(t, tid, lds_base_i32):
             wr.append(lds_base_i32 + fx.Int32(region + d * 32 + (g4 ^ ((d // 4) % 4)) * 8))
         units.append((rd, wr))
     return units
+
+
+def _padded_plan(t, tid, wave):
+    """'padded' TransA: the waves split by tensor (`wave` readfirstlane'd); unit i of
+    a tensor = (g = i % (rows / 4), c8 = i // (rows / 4)): rows 4g + [0, 4), columns
+    8 c8 + [0, 8). (source row offsets of the first unit, write offset per unit), Index."""
+    a = t.a
+    src = a.src
+    per = a.threads // a.tensors
+    groups = a.rows // 4
+    tensor = wave // fx.Int32(per // WAVE)
+    units = [(tid % per + fx.Index(per * u)) % (a.units // a.tensors) for u in range(a.units_per_thread)]
+    u_g = [x % groups for x in units]
+    u_c8 = [x // groups for x in units]
+    wr = [fx.Index(a.lds_base) + fx.Index(tensor) * a.tile_bytes + (c8 // 2) * a.dts + g * _T_G_PAD + (c8 % 2) * 64
+          for g, c8 in zip(u_g, u_c8)]
+    rd = [fx.Index(src.lds_base) + fx.Index(tensor) * src.tile_bytes + (u_g[0] * 4 + r) * src.stride + u_c8[0] * 16
+          for r in range(4)]
+    return rd, wr
+
+
+def gemm_transpose_read(t, plan, lds, src_buf):
+    """'padded' TransA: this thread's unit of the row tiles in buffer `src_buf`,
+    4 rows x 8 columns as 16 dwords (row-major)."""
+    a = t.a
+    out = []
+    for r in range_constexpr(4):
+        w4 = Vec(lds.load(plan[0][r] + src_buf * a.src.buf_bytes,
+                          Vec.make_type(4, fx.Int32),
+                          16,
+                          a.src.scope_of(src_buf)))
+        out.extend(w4[i] for i in range(4))
+    return out
+
+
+def gemm_transpose_write(t, plan, lds, scopes, regs, buf):
+    """'padded' TransA: `regs` (from gemm_transpose_read) into A^T buffer `buf`:
+    per column pair, v_perm 4x2 transposes and one 16 B store."""
+    a = t.a
+    sel_lo = fx.Int32(_SEL_LO)
+    sel_hi = fx.Int32(_SEL_HI)
+    al, noal = scopes(a.scope_of(buf))
+    for u in range_constexpr(len(regs) // 16):
+        for k in range_constexpr(4):
+            dw = []
+            for e in (2 * k, 2 * k + 1):
+                w = [regs[16 * u + 4 * r + e // 2] for r in range(4)]
+                sel = sel_hi if e % 2 else sel_lo
+                dw += [fx.Int32(rocdl.perm_b32(w[1], w[0], sel)), fx.Int32(rocdl.perm_b32(w[3], w[2], sel))]
+            llvm.StoreOp(raw(Vec.from_elements(dw, fx.Int32)),
+                         lds.view(plan[1][u] + (buf * a.buf_stride + 16 * k), fx.Int32, 16).llvm_ptr,
+                         alignment=16,
+                         alias_scopes=al,
+                         noalias_scopes=noal)
 
 
 def gemm_transpose(t, plan, scopes, src_buf, buf):
@@ -1035,11 +1161,28 @@ def _opaque(x):
     return fx.Index(fx.Int32(llvm.inline_asm(T.i32, [raw(fx.Int32(x))], 'v_mov_b32 $0, $1', '=v,v')))
 
 
-def gemm_read_plan(t, lm, lh, lane=None, lds_addr=None):
+def gemm_read_plan(t, lm, lh, lane=None, lds_addr=None, tensor=None):
     """Per-thread LDS byte offsets of `gemm_read` / `gemm_stream`. On 16x16x16,
     `lm`, `lh` are the lane's row (lane % 16) and 4-key group (lane // 16).
-    'swz' and TransA: absolute i32 bases, from the LDS base `lds_addr`."""
+    'swz' and TransA: absolute i32 bases, from the LDS base `lds_addr`.
+    'rows' and 16x16x16 DerivedA: `tensor` (run time) picks the tile `tensor`
+    tiles after the GEMM's own (xwide: each wave reads its role's tensor)."""
     a = t.a
+    if isinstance(a, DerivedA) and t.mfma == '16x16x16':
+        # (base, lds_base): rows 4lh + [0, 4), dword lm (columns 2lm, 2lm + 1) of read u's 32.
+        base = fx.Index(a.lds_base)
+        if tensor is not None:
+            base = base + fx.Index(tensor) * a.tile_bytes
+        return base + lh * (4 * a.stride) + lm * 4, a.lds_base
+    if isinstance(a, TransA) and a.layout == 'padded':
+        # (base, its tensor's lds_base): A^T row 16o + lm, q group lh; every tensor's reads add to it.
+        return fx.Index(a.lds_base) + lh * _T_G_PAD + lm * 8, a.lds_base
+    if isinstance(a, RowA) and a.dma == 'rows' and t.mfma == '16x16x16':
+        # (base, its tensor's lds_base): row lm, chunk 4i + lh at read i.
+        base = fx.Index(a.lds_base)
+        if tensor is not None:
+            base = base + fx.Index(tensor) * a.tile_bytes
+        return base + lm * a.stride + lh * 16, a.lds_base
     if isinstance(a, TransA):
         # A^T row 16o + lm, q group lh.
         return lds_addr + fx.Int32(lm * 32 + (lh ^ ((lm // 4) % 4)) * 8)
@@ -1139,10 +1282,58 @@ def gemm_mma(t, a_reads, b_packs, accs=None, a_masks=None, order='a_outer'):
     return out
 
 
+def gemm_plan_at(t, plan, buf):
+    """A (base, origin) plan moved to buffer `buf` through an opaque copy: hoisted,
+    every buffer's base would stay live in VGPRs. Reads then add only immediates."""
+    base, origin = plan
+    off = buf * t.a.buf_bytes
+    v = fx.Int32(base + off)
+    return fx.Index(fx.Int32(pin_values([v])[0])), origin + off
+
+
+def gemm_derived_load(t, plan, lds, buf, i):
+    """16x16x16 DerivedA, read `i`'s LDS half: columns 32i + 2lm, +1 of rows
+    4lh + [0, 4) as four dwords. A schedule may issue it early and keep the dwords.
+    (gfx942's SRAMECC zeroes the other half of a d16 load, so u16 reads pack no cheaper.)"""
+    a = t.a
+    base, origin = plan
+    al, noal = lds.scope(a.scope_of(buf))
+    w = []
+    for r in range_constexpr(4):
+        off = base + (a.lds_base - origin + buf * a.buf_bytes + r * a.stride + 64 * i)
+        w.append(fx.Int32(llvm.LoadOp(T.i32,
+                                      lds.view(off, fx.Int32, 4).llvm_ptr,
+                                      alignment=4,
+                                      alias_scopes=al,
+                                      noalias_scopes=noal).result))
+    return w
+
+
+def gemm_derived_ops(t, w):
+    """`gemm_derived_load`'s dwords -> the A operands of output tiles 2i, 2i+1: four v_perm."""
+    out = []
+    for sel in (fx.Int32(_SEL_LO), fx.Int32(_SEL_HI)):
+        dw = [fx.Int32(rocdl.perm_b32(w[1], w[0], sel)), fx.Int32(rocdl.perm_b32(w[3], w[2], sel))]
+        out.append(Vec.from_elements(dw, fx.Int32).bitcast(elem_type(t.dtype)).ir_value())
+    return out
+
+
 def gemm_read_at(t, plan, lds, buf, i):
-    """Read `i` of a streamed GEMM: 16 B from LDS buffer `buf`."""
+    """Read `i` of a streamed GEMM: 16 B from LDS buffer `buf` ('padded' TransA:
+    8 B of output tile `i`)."""
     a = t.a
     v8 = Vec.make_type(8, elem_type(t.dtype))
+    if isinstance(a, DerivedA):
+        return gemm_derived_ops(t, gemm_derived_load(t, plan, lds, buf, i))
+    if isinstance(a, TransA):
+        base, origin = plan
+        return lds.load(base + (a.lds_base - origin + buf * a.buf_stride + i * a.dts),
+                        Vec.make_type(4, elem_type(t.dtype)),
+                        8,
+                        a.scope_of(buf))
+    if isinstance(a, RowA) and a.dma == 'rows':
+        base, origin = plan
+        return lds.load(base + (a.lds_base - origin + buf * a.buf_bytes + 64 * i), v8, 16, a.scope_of(buf))
     if isinstance(a, RowA):
         return lds.load(plan[i % 2] + (buf * a.tile_bytes + 128 * (i // 2)), v8, 16, a.scope_of(buf))
     return lds.load(plan + (buf * a.tile_bytes + 1024 * i), v8, 16, a.scope_of(buf))
@@ -1159,6 +1350,73 @@ def gemm_mma_at(t, i, a8, b, accs):
     else:
         accs[2 * i] = mfma_16x16x16(a8.shuffle(a8, [0, 1, 2, 3]).ir_value(), b, accs[2 * i], elem)
         accs[2 * i + 1] = mfma_16x16x16(a8.shuffle(a8, [4, 5, 6, 7]).ir_value(), b, accs[2 * i + 1], elem)
+
+
+def gemm_mma_joint_at(ts, i, a_ops, b_ops, accs):
+    """One step of GEMMs `ts` that share a loop (S with dP, dV with dK): each MFMA
+    of one GEMM followed by the others'. 'rows' RowA, 16 B read `i` (k-steps 2i,
+    2i+1): per k-step, per B block; b_ops[g][b][i] a v8 pack, accs[g][b].
+    TransA, output tile `i`: per B block; b_ops[g][b] one pack, accs[g][i * b_tiles + b].
+    16x16x16 DerivedA, read `i` (output tiles 2i, 2i+1): per tile, per B block.
+    Updates `accs` in place."""
+    elem = elem_type(ts[0].dtype)
+    nb = ts[0].b_tiles
+    if isinstance(ts[0].a, DerivedA):
+        for e in range_constexpr(2):
+            for b in range_constexpr(nb):
+                for g in range_constexpr(len(ts)):
+                    k = (2 * i + e) * nb + b
+                    accs[g][k] = mfma_16x16x16(a_ops[g][e], b_ops[g][b], accs[g][k], elem)
+        return
+    if isinstance(ts[0].a, TransA):
+        for b in range_constexpr(nb):
+            for g in range_constexpr(len(ts)):
+                k = i * nb + b
+                accs[g][k] = mfma_16x16x16(a_ops[g], b_ops[g][b], accs[g][k], elem)
+        return
+    for e in range_constexpr(2):
+        sl = [4 * e, 4 * e + 1, 4 * e + 2, 4 * e + 3]
+        for b in range_constexpr(nb):
+            for g in range_constexpr(len(ts)):
+                a8 = Vec(a_ops[g])
+                b8 = Vec(b_ops[g][b][i])
+                accs[g][b] = mfma_16x16x16(a8.shuffle(a8, sl).ir_value(), b8.shuffle(b8, sl).ir_value(), accs[g][b], elem)
+
+
+def gemm_stream_joint(ts, plan, lds, buf, b_ops, accs, ahead, hooks=(), per_step=1, a_mod=None, a_vgpr=False):
+    """GEMMs `ts` on one read plan, software-pipelined together (utils.pipelined):
+    step u reads `per_step` reads of each GEMM in turn ('padded' TransA: output
+    tiles; 16x16x16 DerivedA: output tile pairs), `ahead` steps before its MFMAs
+    (`gemm_mma_joint_at`); `hooks` (other work) run spread over the steps.
+    `a_mod(g, i, a8)` may fix read `i` of GEMM `g` before its MFMAs (slack
+    columns); `a_vgpr` keeps RowA reads in VGPRs (out of the accumulators' AGPRs).
+    Returns the accumulators, one list per GEMM."""
+    accs = [list(x) for x in accs]
+    if isinstance(ts[0].a, TransA):
+        n_reads = ts[0].out_tiles
+    elif isinstance(ts[0].a, DerivedA):
+        n_reads = ts[0].out_tiles // 2
+    else:
+        n_reads = ts[0].reads
+
+    def read_one(t, i):
+        x = gemm_read_at(t, plan, lds, buf, i)
+        if a_vgpr:
+            x = llvm.inline_asm(x.type, [x], '', '=v,0', has_side_effects=False)
+        return x
+
+    def read(u):
+        return [[read_one(t, i) for t in ts] for i in range(per_step * u, min(per_step * u + per_step, n_reads))]
+
+    def use(u, ops):
+        for k, a_ops in enumerate(ops):
+            i = per_step * u + k
+            if a_mod is not None:
+                a_ops = [a_mod(g, i, a) for g, a in enumerate(a_ops)]
+            gemm_mma_joint_at(ts, i, a_ops, b_ops, accs)
+
+    pipelined(-(-n_reads // per_step), ahead, read, use, hooks)
+    return accs
 
 
 _SEL_LO = 0x05040100     # v_perm: low halves of two dwords

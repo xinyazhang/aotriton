@@ -75,6 +75,7 @@ class DkdvTraits:
     bias: bool
     dropout: bool
     dropout_scale_at: str       # softmax.P_DROP_AT_STORE or P_DROP_PER_ELEM
+    mask_at: str                # softmax.MASK_SCORE or MASK_PROB
 
     # make_dkdv_launch's names
     @property
@@ -170,9 +171,11 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                                     grid_axis_order=None,
                                     interleave_valu=None,
                                     padded_head=False,
-                                    dropout_scale_at=None):
+                                    dropout_scale_at=None,
+                                    mask_at=None):
     """`dkdv.build_fmha_bwd_dkdv_gfx942`'s interface and kernel, on flex_gemm.
-    `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV (softmax.P_DROP_*)."""
+    `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV (softmax.P_DROP_*);
+    `mask_at`: where the band mask lands (softmax.MASK_*). None: this body's default."""
     assert head_dim in tuning.LADDER and head_dim <= 128, head_dim
     host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
     if num_waves is None:
@@ -196,7 +199,8 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                     grid_axis_order=grid_axis_order,
                     bias=bias,
                     dropout=dropout,
-                    dropout_scale_at=dropout_scale_at or softmax.P_DROP_AT_STORE)
+                    dropout_scale_at=dropout_scale_at or softmax.P_DROP_AT_STORE,
+                    mask_at=mask_at or softmax.MASK_SCORE)
     qs, dops, dvt, dkt = tr.gemms()
     lds_bytes = 4 * tr.slot_bytes
     assert lds_bytes <= 65536, lds_bytes
@@ -390,7 +394,6 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
         ctx = flex_gemm.Ctx(tr, carried=('dk', 'dv', 'sd', 'rows', 'nibs'))
         ctx.c_scale = fx.Float32(sm_scale) * fx.Float32(LOG2E)
         ctx.dropout_scale = dropout_scale
-        c_neg_inf = fx.Float32(float('-inf'))
 
         # ---- the q range: row i keeps key j iff 0 <= j < sk and i - win_l <= j <= i + win_r
         # (gSWA, docs/Generalized Sliding Window Attention.md, A-2), resolved per sequence.
@@ -429,12 +432,12 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
         band_lane = _empty.select(fx.Int32(-(1 << 30)),
                                   fx.Int32(kv_wave + lc) - fx.Int32(lg * 4) + win_l)
 
-        def mask_scores(s_vals, q_start, b):
+        def mask_scores(s_vals, q_start, b, fill):
             rel0 = band_lane - fx.Int32(q_start) + fx.Int32(16 * b)
             out = []
             for r in range_constexpr(4):
                 rel = rel0 - fx.Int32(r)
-                out.append((fx.Uint32(rel) > fx.Uint32(band_span)).select(c_neg_inf, s_vals[r]))
+                out.append((fx.Uint32(rel) > fx.Uint32(band_span)).select(fill, s_vals[r]))
             return out
 
         if const_expr(bias):
@@ -536,7 +539,7 @@ def build_fmha_bwd_dkdv_gfx942_flex(head_dim,
                                     lse_l2,
                                     delta,
                                     lambda kb: bias_load(hs['b_rsrc'], q_j, kb),
-                                    lambda s_vals, kb: mask_scores(s_vals, q_j, kb),
+                                    lambda vals, kb, fill: mask_scores(vals, q_j, kb, fill),
                                     lambda kb: dropout_keep(nibs[kb]),
                                     masked)
             interleave(n_mfma_a, sched_valu, 0x002 | 0x400)

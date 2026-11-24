@@ -379,10 +379,16 @@ def ds_packs(ctx, p_vals, dp_raw, keep, exponent=P_EXP_TWO_ROUNDINGS):
 # ---------------------------------------------------------------- dK/dV P and dS
 # A dK/dV S tile (16x16x16, Q rows streamed, K resident) holds one kv column and
 # four consecutive q rows per lane, so LSE and Delta are per value and P, dS
-# come out as the dV/dK GEMMs' B operand. The band mask sets S to -inf before
-# exp, as the Triton reference does (bwd_inner_dk_dv.py) for every body. Where
-# dropout's 1/(1-p) meets P for dV is the traits field `dropout_scale_at`; with
-# P_DROP_AT_STORE the body scales dV by it at the store.
+# come out as the dV/dK GEMMs' B operand. Two choices are traits fields:
+# - `mask_at`: the band mask sets the score to -inf before exp2 (MASK_SCORE, as the
+#   Triton reference, bwd_inner_dk_dv.py) or P to 0 after it (MASK_PROB). Both give
+#   P = 0 outside the band; under f16 the compiler rounds P and dS differently
+#   around each (it fuses the f16 conversion on one side of the select or the other).
+# - `dropout_scale_at`: where dropout's 1/(1-p) meets P for dV; with
+#   P_DROP_AT_STORE the body scales dV by it at the store.
+# A body's `mask_of(v, i, fill)` puts `fill` where item (or block) i is outside the band.
+MASK_SCORE = 'score'        # score -> -inf before exp2
+MASK_PROB = 'prob'          # P -> 0 after exp2
 P_DROP_AT_STORE = 'store'   # dropout zeroes P; its 1/(1-p) joins dV at the store
 P_DROP_PER_ELEM = 'elem'    # P scaled by 1/(1-p) per element
 
@@ -405,9 +411,11 @@ def p_ds_kv(ctx,
             keep_of,
             masked):
     """(P packs, dS packs), one each per kv block, a block's values as vectors (the
-    narrow body's order). `bias_of(b)` gives block b's bias, `mask_of(s_vals, b)`
-    its masked scores, `keep_of(b)` its dropout keep flags; each is called where
-    the block needs it."""
+    narrow body's order). `bias_of(b)` gives block b's bias, `mask_of(vals, b, fill)`
+    its values with `fill` outside the band, `keep_of(b)` its dropout keep flags;
+    each is called where the block needs it."""
+    at_score = ctx.traits.mask_at == MASK_SCORE
+    assert at_score or ctx.traits.mask_at == MASK_PROB, ctx.traits.mask_at
     elem = flex_gemm.elem_type(ctx.traits.dtype)
     c_scale_v = fx.full(4, fx.Float32(ctx.c_scale), fx.Float32)
     lse_v = Vec.from_elements(lse_l2, fx.Float32)
@@ -421,10 +429,12 @@ def p_ds_kv(ctx,
         if ctx.traits.bias:
             bv = bias_of(b)
             s_vals = [s_vals[r] + bv[r] * fx.Float32(LOG2E) for r in range(4)]
-        if masked and ctx.traits.causal:
-            s_vals = mask_of(s_vals, b)
+        if masked and ctx.traits.causal and at_score:
+            s_vals = mask_of(s_vals, b, fx.Float32(float('-inf')))
         e = Vec.from_elements(s_vals, fx.Float32) - lse_v
         p = [exp2(e[r]) for r in range(4)]
+        if masked and ctx.traits.causal and not at_score:
+            p = mask_of(p, b, fx.Float32(0.0))
         dp = Vec(dp_accs[b])
         if ctx.traits.dropout:
             keep = keep_of(b)
@@ -440,3 +450,33 @@ def p_ds_kv(ctx,
         ds_packs.append(pack_operand([ds[r] for r in range(4)], elem))
     return p_packs, ds_packs
 
+
+def p_ds_elems(ctx, s, dp, lse_l2, delta, bias_of, mask_of, keep, c_scale=None):
+    """(P list, dS list) of the scaled scores `s`, item by item (the wide bodies'
+    order): bias, mask (MASK_SCORE), exp2, mask (MASK_PROB), dropout, dS. `s`, `dp` are indexed per item (a vector
+    is read where the item is used); `c_scale`, if given, scales raw `s` per item
+    (xxwide's scalar items); `lse_l2` is a list or a function of the item.
+    `bias_of(r)` gives item r's bias (f32), `mask_of(v, r, fill)` (None: unmasked)
+    item r's value, or `fill` outside the band, `keep` the dropout keep flags."""
+    at_score = ctx.traits.mask_at == MASK_SCORE
+    assert at_score or ctx.traits.mask_at == MASK_PROB, ctx.traits.mask_at
+    ps = []
+    dss = []
+    for r in range_constexpr(len(delta)):
+        x = s[r] if c_scale is None else fx.Float32(s[r]) * fx.Float32(c_scale)
+        if ctx.traits.bias:
+            # Upcast first: log2(e) in the input dtype would differ from the forward's.
+            x = x + bias_of(r) * fx.Float32(LOG2E)
+        if mask_of is not None and at_score:
+            x = mask_of(x, r, fx.Float32(float('-inf')))
+        p = exp2(x - (lse_l2(r) if callable(lse_l2) else lse_l2[r]))
+        if mask_of is not None and not at_score:
+            p = mask_of(p, r, fx.Float32(0.0))
+        dpr = fx.Float32(dp[r])
+        p_drop = p
+        if ctx.traits.dropout:
+            p_drop = _p_drop(ctx, keep[r], p)
+            dpr = keep[r].select(dpr * fx.Float32(ctx.dropout_scale), fx.Float32(0.0))
+        ps.append(p_drop)
+        dss.append(p * (dpr - fx.Float32(delta[r])))
+    return ps, dss

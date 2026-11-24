@@ -118,3 +118,51 @@ def store_acc_t(t, outs, row0, lc, lg, row_lim, elem, pad_floor):
             packed = [Vec.from_elements([fx.Float32(v[r]).to(elem) for r in range(4)], elem) for v in vals]
             for e, ok, (_, rsrc, row_stride, _, _) in zip(packed, oks, outs):
                 buffer_ops.buffer_store(e.ir_value(), rsrc, row * row_stride + d, mask=ok)
+
+
+def store_acc_t_by_tensor(t, outs, row0, lc, lg, row_lim, elem):
+    """Store TransA accumulators one tensor after the other (the wide dK/dV's
+    order), in i32 coordinates, every column checked against its limit. `outs`
+    lists (accs, rsrc, row_stride, col_limit, scale) per tensor; `rsrc` and
+    `row_stride` are functions, called as that tensor's stores begin, and
+    `scale` None or a function building the vector at each use."""
+    for accs, rsrc_of, stride_of, col_limit, scale in outs:
+        rsrc = rsrc_of()
+        row_stride = stride_of()
+        for o in range_constexpr(t.out_tiles):
+            for b in range_constexpr(t.b_tiles):
+                v = Vec(accs[o * t.b_tiles + b])
+                if scale is not None:
+                    v = v * scale()
+                packed = Vec.from_elements([fx.Float32(v[r]).to(elem) for r in range(4)], elem)
+                row = row0 + fx.Int32(16 * b) + fx.Int32(lc)
+                d = fx.Int32(16 * o) + fx.Int32(lg * 4)
+                ok = (row < row_lim) & (d < col_limit)
+                buffer_ops.buffer_store(packed.ir_value(), rsrc, fx.Index(row) * row_stride + fx.Index(d), mask=ok)
+
+
+def store_acc_derived16(t, accs, parts, rsrc, row_stride, row0, lc, lg, row_lim, col_limit, scale_v, elem, col0=None):
+    """16x16x16 DerivedA accumulators of `parts` column parts, one after the other:
+    accumulator (2u + e) * b_tiles + b holds column (col0 +) 32u + 8lg + 2r + e (r < 4)
+    of row row0 + 16b + lc, so a lane stores 8 consecutive columns as two 8 B halves;
+    i32 coordinates, every column checked against `col_limit`. `col0`: a function
+    giving the wave's first column (xxwide's contraction shard) at each store."""
+    nb = t.b_tiles
+    for u in range_constexpr(parts * t.out_tiles // 2):
+        for b in range_constexpr(nb):
+            ev = Vec(accs[(2 * u) * nb + b]) * scale_v
+            od = Vec(accs[(2 * u + 1) * nb + b]) * scale_v
+            vals = [x for r in range(4) for x in (ev[r], od[r])]
+            packed = Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem)
+            row = row0 + fx.Int32(16 * b) + fx.Int32(lc)
+            d = fx.Int32(32 * u)
+            if col0 is not None:
+                d = d + col0()
+            d = d + fx.Int32(lg * 8)
+            for hh in range_constexpr(2):
+                ok = (row < row_lim) & (d + fx.Int32(4 * hh) < col_limit)
+                half = packed.shuffle(packed, [4 * hh + x for x in range(4)])
+                buffer_ops.buffer_store(half.ir_value(),
+                                        rsrc,
+                                        fx.Index(row) * row_stride + fx.Index(d + fx.Int32(4 * hh)),
+                                        mask=ok)
