@@ -37,8 +37,10 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_dkdv as tuning
 from .flex_gemm import (
     gemm_derived_load,
@@ -166,7 +168,7 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
                                            mask_at=None):
     """build_fmha_bwd_dkdv_gfx942's interface and kernel ABI, for head dims 384 and 512."""
     assert head_dim % 64 == 0 and 128 <= head_dim <= 512, head_dim
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if kv_subs is None:
         kv_subs = tuning.body_kv_subs('xxwide', head_dim)
     assert kv_subs in (2, 3, 4), kv_subs
@@ -196,7 +198,7 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
     lds_xp = lds_xs + NI * XS_SUB
     lds_bytes = lds_xp + NI * XP_SUB
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'dkdv_xxwide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'dkdv_xxwide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
 
@@ -803,7 +805,7 @@ def build_fmha_bwd_dkdv_gfx942_xxwide(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    _launch = fmha.make_dkdv_launch(launch_fmha_bwd_dkdv_gfx942_xxwide,
+    _launch = host.make_dkdv_launch(launch_fmha_bwd_dkdv_gfx942_xxwide,
                                     tr,
                                     causal_type,
                                     host_causal_type,

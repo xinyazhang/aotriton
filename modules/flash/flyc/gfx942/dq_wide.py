@@ -30,8 +30,10 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_dq as tuning
 from .flex_gemm import (
     gemm_load,
@@ -184,7 +186,7 @@ def build_fmha_bwd_dq_gfx942_wide(head_dim,
                                        padded_head=False,
                                        wave_m=None):
     """build_fmha_bwd_dq_gfx942's interface and kernel ABI, for wide heads."""
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     wave_m = (32 if head_dim <= 256 else 16) if wave_m is None else wave_m
     assert wave_m in (16, 32), wave_m
     assert head_dim % 32 == 0 and 64 <= head_dim <= (256 if wave_m == 32 else 512), head_dim
@@ -204,7 +206,7 @@ def build_fmha_bwd_dq_gfx942_wide(head_dim,
     qk, vdo, kt = tr.gemms()
     lds_bytes = 2 * qk.a.tile_bytes + kt.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'dq_wide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'dq_wide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
@@ -762,7 +764,7 @@ def build_fmha_bwd_dq_gfx942_wide(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    _launch = fmha.make_dq_launch(launch_fmha_bwd_dq_gfx942_wide,
+    _launch = host.make_dq_launch(launch_fmha_bwd_dq_gfx942_wide,
                                   tr,
                                   causal_type,
                                   host_causal_type,

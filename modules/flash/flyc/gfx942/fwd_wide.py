@@ -20,8 +20,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_fwd as tuning
 from .flex_gemm import (
     gemm_dma,
@@ -145,7 +147,7 @@ def build_fmha_fwd_gfx942_wide(head_dim,
                                     padded_head=False):
     """build_fmha_fwd_gfx942's interface and kernel ABI, for wide heads."""
     assert head_dim % 32 == 0 and 128 <= head_dim <= 256, head_dim
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if block_n is None:
         block_n = 32
     assert block_n == 32, block_n
@@ -169,7 +171,7 @@ def build_fmha_fwd_gfx942_wide(head_dim,
     assert block_n % num_waves == 0 and qk.a.row_bytes >= 256
     lds_bytes = 2 * qk.a.tile_bytes + pv.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'fwd_wide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'fwd_wide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
@@ -614,7 +616,7 @@ def build_fmha_fwd_gfx942_wide(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    return fmha.make_fwd_launch(launch_fmha_fwd_gfx942_wide,
+    return host.make_fwd_launch(launch_fmha_fwd_gfx942_wide,
                                 tr,
                                 causal_type,
                                 host_causal_type,

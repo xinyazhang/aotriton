@@ -29,8 +29,10 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_dq as tuning
 from .flex_gemm import (
     gemm_dma,
@@ -156,7 +158,7 @@ def build_fmha_bwd_dq_gfx942(head_dim,
     `causal_type` as gfx1201's: 1/2 are host sentinels, 3 is gSWA; all compile to 3.
     """
     assert head_dim in tuning.LADDER and head_dim <= 128, head_dim
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if block_n is None:
         block_n = tuning.default_block_n(head_dim)
     assert block_n in (32, 64), block_n
@@ -178,7 +180,7 @@ def build_fmha_bwd_dq_gfx942(head_dim,
     qk, vdo, kds = tr.gemms()
     lds_bytes = 2 * NBUF * qk.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'dq_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'dq_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
@@ -720,7 +722,7 @@ def build_fmha_bwd_dq_gfx942(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    _launch = fmha.make_dq_launch(launch_fmha_bwd_dq_gfx942,
+    _launch = host.make_dq_launch(launch_fmha_bwd_dq_gfx942,
                                   tr,
                                   causal_type,
                                   host_causal_type,

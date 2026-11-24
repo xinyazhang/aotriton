@@ -22,8 +22,10 @@ from flydsl.expr import const_expr, gpu, rocdl
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_fwd as tuning
 from .flex_gemm import (
     gemm_dma,
@@ -135,7 +137,7 @@ def build_fmha_fwd_gfx942(head_dim,
     numerical lessons, #17): the max may lag that many log2 units.
     """
     assert head_dim <= 128, head_dim
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if block_n is None:
         block_n = tuning.default_block_n(head_dim)
     if grid_axis_order is None:
@@ -154,7 +156,7 @@ def build_fmha_fwd_gfx942(head_dim,
     qk, pv = tr.gemms()
     lds_bytes = 2 * qk.a.tile_bytes + 2 * pv.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'fwd_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'fwd_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     block_n = tr.block_n
@@ -558,7 +560,7 @@ def build_fmha_fwd_gfx942(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    return fmha.make_fwd_launch(launch_fmha_fwd_gfx942,
+    return host.make_fwd_launch(launch_fmha_fwd_gfx942,
                                 tr,
                                 causal_type,
                                 host_causal_type,

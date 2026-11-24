@@ -23,8 +23,10 @@ from flydsl.expr.utils.arith import _to_raw as raw
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_fwd as tuning
 from .flex_gemm import (
     gemm_dma,
@@ -134,7 +136,7 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
     A causal build runs q tiles longest first."""
     assert head_dim % 128 == 0 and 256 <= head_dim <= 512, head_dim
     assert num_waves == 8, num_waves
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if block_n not in (None, BLOCK_N):
         raise ValueError(f'the xwide forward runs {BLOCK_N}-key tiles, got block_n={block_n}')
     if grid_axis_order is None:
@@ -153,7 +155,7 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
     lds_bytes = 2 * qk.a.tile_bytes + 2 * pv.a.tile_bytes
     assert lds_bytes <= 65536, lds_bytes
     assert qk.a.tile_bytes * 2 % 1024 == 0
-    tag = 'fwd_xwide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'fwd_xwide_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     n_kdma = qk.a.n_dma
@@ -542,7 +544,7 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    return fmha.make_fwd_launch(launch_fmha_fwd_gfx942_xwide,
+    return host.make_fwd_launch(launch_fmha_fwd_gfx942_xwide,
                                 tr,
                                 causal_type,
                                 host_causal_type,

@@ -33,8 +33,10 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import host
 from . import softmax
 from . import tensor_io
+from . import utils
 from . import tuning_dkdv as tuning
 from .flex_gemm import (
     gemm_dma_m0,
@@ -186,7 +188,7 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
     `mask_at`: where the band mask lands (softmax.MASK_*). None: the policy's (tuning_dkdv).
     """
     assert head_dim in tuning.LADDER and head_dim <= 128, head_dim
-    host_causal_type, causal_type = fmha.builder_causal_types(causal, causal_type, bias)
+    host_causal_type, causal_type = host.builder_causal_types(causal, causal_type, bias)
     if num_waves is None:
         num_waves = tuning.default_num_waves(head_dim)
     if kv_blocks is None:
@@ -213,7 +215,7 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
     qs, dops, dvt, dkt = tr.gemms()
     lds_bytes = 4 * tr.slot_bytes
     assert lds_bytes <= 65536, lds_bytes
-    tag = 'dkdv_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io)
+    tag = 'dkdv_' + flex_gemm.cache_tag(tr, flex_gemm, softmax, tensor_io, utils)
     tile_fastest = grid_axis_order == tuning.GRID_AXIS_TILE_FASTEST
     elem = flex_gemm.elem_type(dtype_str)
     KVB = tr.kv_blocks
@@ -746,7 +748,7 @@ def build_fmha_bwd_dkdv_gfx942(head_dim,
             block=(tr.block_size, 1, 1),
             stream=stream)
 
-    return fmha.make_dkdv_launch(launch_fmha_bwd_dkdv_gfx942,
+    return host.make_dkdv_launch(launch_fmha_bwd_dkdv_gfx942,
                                  tr,
                                  causal_type,
                                  host_causal_type,

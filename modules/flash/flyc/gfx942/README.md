@@ -18,7 +18,8 @@ a short loop (its schedule) that calls them and the feature hooks.
 | `flex_gemm.py` | one `gemm` template: operand sources, phases, `GemmTraits`, the `Ctx`, loop runners, `ClusterOps` | `gemm_*` phases by name; the rest `flex_gemm.X` |
 | `softmax.py` | feature hooks: forward `head`/`tail`/`rescale`/`epilogue`, backward `p_from_lse`/`ds_packs`/`p_ds_kv`/`p_ds_elems`, LSE/Delta rows | `softmax.X` |
 | `tensor_io.py` | accumulator stores through the GEMM's lane map (O, dQ, dK, dV) | `tensor_io.X` |
-| `utils.py` | small device helpers (MFMA wrappers, masks, Philox planes, barriers) | by name |
+| `utils.py` | small device helpers (MFMA wrappers, P rounding, masks, Philox planes, barriers) | by name |
+| `host.py` | host-side launch glue: causal types, argument checks, the `_launch` callables in gfx1201's ABI (gfx942-only for now; to be shared once every arch settles) | `host.X` |
 | `fwd*.py`, `dq*.py`, `dkdv*.py` | one body each: traits, kernel signature, prelude, the tile loop, epilogue | entry builders |
 
 ### One GEMM template, two presets
@@ -86,8 +87,9 @@ applied with `flex_gemm.spread`.
   them.
 - **Cache tag.** FlyDSL's JIT cache does not hash objects or module-prefixed
   calls, so every kernel references
-  `flex_gemm.cache_tag(traits, flex_gemm, softmax, tensor_io)`: all traits
-  fields plus a digest of those modules' source.
+  `flex_gemm.cache_tag(traits, flex_gemm, softmax, tensor_io, utils)`: all
+  traits fields plus a digest of those modules' source (`utils` too: helpers
+  reached through a module-prefixed call are not walked).
 
 ## Conventions
 

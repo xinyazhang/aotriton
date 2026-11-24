@@ -31,6 +31,7 @@ pytestmark = []
 
 import fmha_utils as fmha  # noqa: E402
 import philox  # noqa: E402
+from . import host  # noqa: E402
 
 TL = fmha.WINDOW_TOPLEFT
 BR = fmha.WINDOW_BOTRIGHT
@@ -216,5 +217,5 @@ def varlen_batch(seqs, p=0):
                                  max(lk),
                                  lse_tokens=sum(lq),
                                  lse_layout=fmha.VARLEN_LSE_LAYOUT_HT)
-    varlen["bits"] = fmha.principal_diagonal_bits(varlen["bits"], PRINCIPAL_DIAGONAL[p])
+    varlen["bits"] = host.principal_diagonal_bits(varlen["bits"], PRINCIPAL_DIAGONAL[p])
     return cu_q, cu_k, varlen

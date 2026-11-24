@@ -22,7 +22,7 @@ from flydsl.expr.utils.arith import _to_raw as raw
 from kernels.common import buffer_ops
 
 import fmha_utils as fmha
-from fmha_utils import bf16_round_nonan_pack
+from fmha_utils import bitcast_i32
 from philox import Philox
 
 LOG2E = 1.4426950408889634
@@ -65,10 +65,24 @@ def mfma_16x16x16(a, b, c, elem):
 def exp2(x):
     return fx.Float32(rocdl.exp2(T.f32, raw(x)))
 
+def bf16_round_nonan_pack(f32_vals, elem_dtype):
+    """Pack an even count of f32 values into bf16, rounding to nearest, ties away.
+
+    `gfx1201.utils.bf16_round_nonan_pack_v8` for any length: same rounding, same
+    caveat (a NaN may come out as a zero, so only for values that cannot be NaN,
+    such as P).
+    """
+    pairs = []
+    for j in range(len(f32_vals) // 2):
+        lo = bitcast_i32(f32_vals[j * 2]) + fx.Int32(0x8000)
+        hi = bitcast_i32(f32_vals[j * 2 + 1]) + fx.Int32(0x8000)
+        pairs.append(fx.Int32(rocdl.perm_b32(hi, lo, fx.Int32(0x07060302))))
+    return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+
 
 def pack_operand(vals, elem):
     """f32 values -> one MFMA operand. bf16 rounds to nearest, ties away, NaN-unsafe
-    (fmha_utils.bf16_round_nonan_pack; numerical lessons, #16); never truncate."""
+    (bf16_round_nonan_pack; numerical lessons, #16); never truncate."""
     if elem is fx.BFloat16:
         return bf16_round_nonan_pack(vals, elem)
     return Vec.from_elements([fx.Float32(x).to(elem) for x in vals], elem).ir_value()
