@@ -417,49 +417,30 @@ def build_fmha_fwd_gfx942_xwide(head_dim,
         ctx.tile_pairs(iteration, j_clean, j_clean_end, n_iter)
         results = finish(kv(n_iter))
 
-        # ---- epilogue: O / l, LSE
-        # The row sum l is split over four lane groups; a fully masked row (l = 0)
-        # stores O = 0 and LSE = +inf. Dropout's 1/(1-p) folds into 1/l.
-        rocdl.s_waitcnt(0)
-        m_fin = results[0]
-        l_fin = results[1]
-        l_fin = softmax.row_sum(ctx, l_fin)
-        inv_l = fx.Float32(1.0) / l_fin
-        inv_l = (l_fin > fx.Float32(0.0)).select(inv_l, fx.Float32(0.0))
-        if const_expr(dropout):
-            inv_l = inv_l * fx.Float32(dropout_scale)
-        q_row = fx.Index(row_now())
-        q_ok = q_row < sq
-        tensor_io.store_acc(pv,
-                            results[2:2 + n_o],
-                            o_rsrc,
-                            q_row,
-                            o_row_stride,
-                            lambda: lane_field(4, 2),
-                            row_vo,
-                            q_ok,
-                            elem,
-                            tr.pad_floor,
-                            scale=inv_l)
-        # LSE before its resource: keeps the tuned ISA.
-        lse = softmax.lse_of(m_fin, l_fin)
-        lse_rsrc, lse_pitch = softmax.lse_rsrc(LSE,
-                                               sq,
-                                               varlen_bits,
-                                               fx.Index(q_batch),
-                                               head,
-                                               num_head_q,
-                                               max_seqlen_q,
-                                               seqinfo_q0,
-                                               seqinfo_q1,
-                                               num_seqlens,
-                                               fx.Index(q_row_off))
-        softmax.lse_store(lse_rsrc,
-                          lse_pitch,
-                          lse,
-                          q_row,
-                          q_ok,
-                          lambda: lane_field(4, 2) == fx.Int32(0))
+        # ---- epilogue: O / l, LSE (l split over four lane groups)
+        # q_row and the lane group are rebuilt where used, not kept live.
+        softmax.epilogue(ctx,
+                         pv,
+                         results,
+                         o_rsrc,
+                         o_row_stride,
+                         lambda: fx.Index(row_now()),
+                         lambda: lane_field(4, 2),
+                         row_vo,
+                         sq,
+                         elem,
+                         dropout_scale,
+                         LSE,
+                         varlen_bits,
+                         q_batch,
+                         head,
+                         num_head_q,
+                         max_seqlen_q,
+                         seqinfo_q0,
+                         seqinfo_q1,
+                         num_seqlens,
+                         q_row_off,
+                         lambda: lane_field(4, 2) == fx.Int32(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942_xwide(

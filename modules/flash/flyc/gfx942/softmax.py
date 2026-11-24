@@ -33,6 +33,7 @@ from kernels.common import buffer_ops
 
 import fmha_utils as fmha
 from . import flex_gemm
+from . import tensor_io
 from .knobs import MASK_PROB, MASK_SCORE, P_DROP_AT_STORE, P_DROP_PER_ELEM  # noqa: F401  (bodies read them here)
 from .utils import LN2, LOG2E, bias_load4, exp2, mask_band, pack_operand
 
@@ -264,6 +265,71 @@ def lse_store(rsrc, pitch, lse, row, row_ok, lane_first):
     """One lane of each row stores: `lane_first()` says which (built after the offset)."""
     off = row * pitch
     buffer_ops.buffer_store(lse, rsrc, off, mask=row_ok & lane_first())
+
+
+def epilogue(ctx,
+             pv,
+             results,
+             o_rsrc,
+             o_row_stride,
+             row,
+             lane,
+             col_limit,
+             rows,
+             elem,
+             dropout_scale,
+             lse_ptr,
+             varlen_bits,
+             batch,
+             head,
+             num_head_q,
+             max_seqlen_q,
+             seqinfo_q0,
+             seqinfo_q1,
+             num_seqlens,
+             row_off,
+             lane_first):
+    """The forward's end: O / l and LSE of `results` ([m, l] + O accumulators of `pv`).
+
+    A fully masked row (l = 0) stores O = 0 and LSE = +inf; dropout's 1/(1-p)
+    folds into 1/l. `row` may be a function, called after 1/l; `lane` is
+    tensor_io.store_acc's `lh`, `lane_first` lse_store's.
+    """
+    rocdl.s_waitcnt(0)
+    m = results[0]
+    l = row_sum(ctx, results[1])  # noqa: E741
+    inv_l = fx.Float32(1.0) / l
+    inv_l = (l > fx.Float32(0.0)).select(inv_l, fx.Float32(0.0))
+    if ctx.traits.dropout:
+        inv_l = inv_l * fx.Float32(dropout_scale)
+    if callable(row):
+        row = row()
+    row_ok = row < rows
+    tensor_io.store_acc(pv,
+                        results[2:2 + pv.out_tiles],
+                        o_rsrc,
+                        row,
+                        o_row_stride,
+                        lane,
+                        col_limit,
+                        row_ok,
+                        elem,
+                        ctx.traits.pad_floor,
+                        scale=inv_l)
+    # LSE before its resource: keeps the tuned ISA.
+    lse = lse_of(m, l)
+    rsrc, pitch = lse_rsrc(lse_ptr,
+                           rows,
+                           varlen_bits,
+                           fx.Index(batch),
+                           head,
+                           num_head_q,
+                           max_seqlen_q,
+                           seqinfo_q0,
+                           seqinfo_q1,
+                           num_seqlens,
+                           fx.Index(row_off))
+    lse_store(rsrc, pitch, lse, row, row_ok, lane_first)
 
 
 # ---------------------------------------------------------------- backward

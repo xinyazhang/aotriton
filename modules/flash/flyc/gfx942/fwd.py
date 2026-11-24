@@ -434,48 +434,29 @@ def build_fmha_fwd_gfx942(head_dim,
         results = drain(n_loop)
         barrier_if(fx.Int32(1) - group_b)         # close the stagger
 
-        # ---- epilogue: O / l, LSE
-        # The row sum l is split over the two lane halves; a fully masked row
-        # (l = 0) stores O = 0 and LSE = +inf. Dropout's 1/(1-p) folds into 1/l.
-        rocdl.s_waitcnt(0)
-        m_fin = results[0]
-        l_fin = results[1]
-        l_fin = softmax.row_sum(ctx, l_fin)
-        inv_l = fx.Float32(1.0) / l_fin
-        inv_l = (l_fin > fx.Float32(0.0)).select(inv_l, fx.Float32(0.0))
-        if const_expr(dropout):
-            inv_l = inv_l * fx.Float32(dropout_scale)
-        q_ok = q_row < sq
-        tensor_io.store_acc(pv,
-                            results[2:2 + pv.out_tiles],
-                            o_rsrc,
-                            q_row,
-                            o_row_stride,
-                            lh,
-                            row_vo,
-                            q_ok,
-                            elem,
-                            tr.pad_floor,
-                            scale=inv_l)
-        # LSE before its resource: keeps the tuned ISA.
-        lse = softmax.lse_of(m_fin, l_fin)
-        lse_rsrc, lse_pitch = softmax.lse_rsrc(LSE,
-                                               sq,
-                                               varlen_bits,
-                                               fx.Index(q_batch),
-                                               head,
-                                               num_head_q,
-                                               max_seqlen_q,
-                                               seqinfo_q0,
-                                               seqinfo_q1,
-                                               num_seqlens,
-                                               fx.Index(q_row_off))
-        softmax.lse_store(lse_rsrc,
-                          lse_pitch,
-                          lse,
-                          q_row,
-                          q_ok,
-                          lambda: lh == fx.Index(0))
+        # ---- epilogue: O / l, LSE (l split over two lane halves)
+        softmax.epilogue(ctx,
+                         pv,
+                         results,
+                         o_rsrc,
+                         o_row_stride,
+                         q_row,
+                         lh,
+                         row_vo,
+                         sq,
+                         elem,
+                         dropout_scale,
+                         LSE,
+                         varlen_bits,
+                         q_batch,
+                         head,
+                         num_head_q,
+                         max_seqlen_q,
+                         seqinfo_q0,
+                         seqinfo_q1,
+                         num_seqlens,
+                         q_row_off,
+                         lambda: lh == fx.Index(0))
 
     @flyc.jit
     def launch_fmha_fwd_gfx942(
